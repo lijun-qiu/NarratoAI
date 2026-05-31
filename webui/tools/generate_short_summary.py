@@ -20,10 +20,7 @@ from app.services.subtitle_text import read_subtitle_text
 from app.utils.script_json_parser import parse_narration_script_items
 from app.utils.media_duration import get_video_duration_seconds
 from app.utils.enhanced_mix_duration import (
-    MIN_OUTPUT_RATIO,
-    MAX_OUTPUT_RATIO,
     build_enhanced_mix_duration_plan,
-    cap_enhanced_mix_script_playback,
     estimate_script_playback_seconds,
 )
 from app.utils.utils import format_time
@@ -201,33 +198,14 @@ def generate_script_short_sunmmary(
             script = json.dumps(script_items, ensure_ascii=False, indent=2)
 
             if enhanced_mix and video_duration_sec:
-                script_items, cap_note = cap_enhanced_mix_script_playback(
-                    script_items, video_duration_sec
-                )
-                if cap_note:
-                    logger.info(f"脚本时长校正：{cap_note}")
-                    st.warning(f"已自动校正脚本：{cap_note}")
-                    script = json.dumps(script_items, ensure_ascii=False, indent=2)
-
                 estimated = estimate_script_playback_seconds(script_items)
-                min_sec = video_duration_sec * MIN_OUTPUT_RATIO
-                max_sec = video_duration_sec * MAX_OUTPUT_RATIO
                 plan = build_enhanced_mix_duration_plan(video_duration_sec)
                 span_msg = (
                     f"预计成片约 {format_time(estimated)}（{len(script_items)} 段）；"
                     f"{plan.plan_summary}"
                 )
                 logger.info(span_msg)
-                if estimated > max_sec * 1.02:
-                    st.warning(
-                        f"{span_msg}。仍偏长，请重新生成或手动删减片段。"
-                    )
-                elif estimated < min_sec * 0.85:
-                    st.warning(
-                        f"{span_msg}。偏短，可适当增加片段后重新生成。"
-                    )
-                else:
-                    st.info(span_msg)
+                st.info(span_msg)
 
             if script is None:
                 st.error("生成脚本失败，请检查日志")

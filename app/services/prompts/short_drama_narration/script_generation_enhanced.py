@@ -15,7 +15,7 @@ class ScriptGenerationEnhancedPrompt(ParameterizedPrompt):
         metadata = PromptMetadata(
             name="script_generation_enhanced",
             category="short_drama_narration",
-            version="v1.1",
+            version="v1.0",
             description="智能混剪解说：根据原片秒数动态计算成片目标时长与片段数量",
             model_type=ModelType.TEXT,
             output_format=OutputFormat.JSON,
@@ -47,8 +47,8 @@ class ScriptGenerationEnhancedPrompt(ParameterizedPrompt):
             ],
         )
         self._system_prompt = (
-            "你是智能混剪解说导演。你必须根据「时长计划」生成**精简**混剪脚本："
-            "成片约为原片一半、片段数受限、严禁超时，并严格输出 JSON，不得包含说明或代码块。"
+            "你是智能混剪解说导演。你必须根据系统给出的「时长计划」（由上传视频长度自动计算）"
+            "生成足够长的混剪脚本，并严格输出 JSON，不得包含任何说明或代码块。"
         )
 
     def get_template(self) -> str:
@@ -62,17 +62,16 @@ ${duration_plan_summary}
 | 上传原视频时长 | **${video_duration}**（${video_duration_sec} 秒） |
 | 成片最短时长（硬底线） | **≥ ${min_duration}** |
 | 目标成片时长 | **${target_duration}** |
-| 成片硬性上限 | **≤ ${max_duration}**（超过无效） |
+| 成片上限参考 | ≤ ${max_duration}（+20% 容差） |
 | 建议片段数量 | **${min_segment_count}–${max_segment_count}** 个 |
 | 解说段单段画面跨度 | **${narration_span_range}** 秒 |
 | 原声段单段跨度 | **${ost_span_range}** 秒 |
 
 ## 核心目标
-为《${drama_name}》生成**精简混剪**脚本（不是原片复述）：
-- 最终成片播放时长之和：**约 ${target_duration}**（原片约一半）
-- **严禁超过 ${max_duration}**（超过即失败）
-- 可略低于 ${min_duration}，但**绝不可**接近原片全长
-- **片段数不得超过 ${max_segment_count}**，宁可少选精华，不要堆砌过多片段
+为《${drama_name}》生成混剪脚本，使**最终成片播放时长之和**：
+- **不得少于 ${min_duration}**
+- **尽量接近 ${target_duration}**
+- 禁止做成远短于上表的「精华短视频」
 
 ## 素材
 
@@ -89,14 +88,13 @@ ${subtitle_content}
 ## 成片时长计算方式（生成前自检）
 - **原声 OST=1**：播放时长 = 该段 `timestamp` 跨度（对齐字幕句界，播完整句）
 - **解说 OST=0**：播放时长 ≈ max(TTS 朗读时长, 该段 `timestamp` 跨度)
-- **自检**：所有片段播放时长之和 **≈ ${target_duration}**，且 **≤ ${max_duration}**（最重要）
-- **自检**：`items` 数量 **≤ ${max_segment_count}**（宁少勿多）
-- 单段跨度不得超过上表「解说/原声跨度」上限，禁止用超长 timestamp 凑时长
+- **自检**：所有片段 `timestamp` 跨度相加 ≥ **${min_duration}**，并尽量达到 **${target_duration}**
+- **自检**：`items` 数量在 **${min_segment_count}–${max_segment_count}** 之间
 
-## 时间轴选段（跳剪精华，非全片堆砌）
-- 在片头、片中、片尾**各选若干**关键情节即可，**不要**为覆盖全片而增加片段数
-- 允许跳过次要过场；各段 timestamp 跨度之和必须 **≤ ${max_duration}**
-- 按时间顺序排列，**不得重叠**
+## 时间轴覆盖
+- 片段从片头到 **${video_duration}** 前 1 分钟内均须有选段，**贯穿全片**
+- 禁止 90% 片段挤在原片前 1/3 时间段
+- timestamp 按时间顺序排列，**不得重叠**
 
 ## 片段结构（解说 : 原声 ≈ 1 : 1）
 - 每 1–2 段解说后接 1 段原声
@@ -117,9 +115,9 @@ ${subtitle_content}
 }
 
 ## 生成前最后检查
-1. 片段数是否 **≤ ${max_segment_count}**？
-2. 预计成片总时长是否在 **${min_duration}–${max_duration}** 之间（以 **${target_duration}** 为首选）？
-3. 是否避免为「铺满时间轴」而增加无关片段？
+1. 片段数是否在 **${min_segment_count}–${max_segment_count}**？
+2. 跨度总和是否 ≥ **${min_duration}**？
+3. 是否覆盖到接近 **${video_duration}** 的片尾？
 4. 是否只输出 JSON？
 
 现在请为《${drama_name}》生成脚本："""

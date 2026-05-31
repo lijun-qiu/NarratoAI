@@ -175,10 +175,16 @@ def render_generate_button():
 
         def run_task():
             try:
-                tm.start_subclip_unified(
-                    task_id=task_id,
-                    params=params
-                )
+                if getattr(params, "processing_mode", "standard") == "enhanced":
+                    tm.start_subclip_enhanced(
+                        task_id=task_id,
+                        params=params
+                    )
+                else:
+                    tm.start_subclip_unified(
+                        task_id=task_id,
+                        params=params
+                    )
             except Exception as e:
                 logger.error(f"任务执行失败: {e}")
                 sm.state.update_task(task_id, state=const.TASK_STATE_FAILED, message=str(e))

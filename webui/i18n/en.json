@@ -86,6 +86,20 @@
     "Hide Log": "Hide Log",
     "Upload Local Files": "Upload Local Files",
     "File Uploaded Successfully": "File Uploaded Successfully",
-    "Frame Interval (seconds)": "Frame Interval (seconds) (More keyframes consume more tokens)"
+    "Frame Interval (seconds)": "Frame Interval (seconds) (More keyframes consume more tokens)",
+    "Short Generate": "Short Drama Mix",
+    "Short Drama Summary": "Short Drama Narration",
+    "Enhanced Mix Narration": "Enhanced Mix Narration",
+    "Generate Enhanced Mix Script": "Generate Enhanced Mix Script",
+    "Enhanced Mix Mode Description": "Adds BGM automatically. Narration segments (OST=0) show TTS subtitles; original-audio segments (OST=1) use dialogue clipped from the source SRT. Upload the full source subtitle first.",
+    "BGM Mood": "BGM Mood",
+    "BGM Mood Help": "Random pick from resource/songs/<mood>/; falls back to resource/songs if empty",
+    "BGM Mood Auto": "Auto (root folder)",
+    "BGM Mood Suspense": "Suspense",
+    "BGM Mood Emotional": "Emotional",
+    "BGM Mood Action": "Action",
+    "BGM Mood Comedy": "Comedy",
+    "Video Type": "Video Type",
+    "Select/Upload Script": "Select/Upload Script"
   }
 }

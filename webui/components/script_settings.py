@@ -13,6 +13,7 @@ from app.utils import utils, check_script
 from webui.tools.generate_script_docu import generate_script_docu
 from webui.tools.generate_script_short import generate_script_short
 from webui.tools.generate_short_summary import generate_script_short_sunmmary
+from webui.tools.generate_script_enhanced import generate_script_enhanced
 
 
 def render_script_panel(tr):
@@ -40,6 +41,9 @@ def render_script_panel(tr):
         elif script_path == "summary":
             # 短剧解说
             short_drama_summary(tr)
+        elif script_path == "enhanced":
+            # 智能混剪解说
+            render_enhanced_mix_options(tr)
         else:
             # 默认为空
             pass
@@ -55,6 +59,7 @@ def render_script_file(tr, params):
     MODE_AUTO = "auto"
     MODE_SHORT = "short"
     MODE_SUMMARY = "summary"
+    MODE_ENHANCED = "enhanced"
 
     # 处理保存脚本后的模式切换（必须在 widget 实例化之前）
     if st.session_state.get('_switch_to_file_mode'):
@@ -67,6 +72,7 @@ def render_script_file(tr, params):
         tr("Auto Generate"): MODE_AUTO,
         tr("Short Generate"): MODE_SHORT,
         tr("Short Drama Summary"): MODE_SUMMARY,
+        tr("Enhanced Mix Narration"): MODE_ENHANCED,
     }
     
     # 获取当前状态
@@ -82,6 +88,8 @@ def render_script_file(tr, params):
         default_index = mode_keys.index(tr("Short Generate"))
     elif current_path == "summary":
         default_index = mode_keys.index(tr("Short Drama Summary"))
+    elif current_path == "enhanced":
+        default_index = mode_keys.index(tr("Enhanced Mix Narration"))
     else:
         default_index = mode_keys.index(tr("Select/Upload Script"))
 
@@ -146,7 +154,7 @@ def render_script_file(tr, params):
 
         # 找到保存的脚本文件在列表中的索引
         # 如果当前path是特殊值(auto/short/summary)，则重置为空
-        saved_script_path = current_path if current_path not in [MODE_AUTO, MODE_SHORT, MODE_SUMMARY] else ""
+        saved_script_path = current_path if current_path not in [MODE_AUTO, MODE_SHORT, MODE_SUMMARY, MODE_ENHANCED] else ""
         
         selected_index = 0
         for i, (_, path) in enumerate(script_list):
@@ -220,6 +228,10 @@ def render_script_file(tr, params):
         # --- 功能生成模式 ---
         st.session_state['video_clip_json_path'] = selected_mode
         params.video_clip_json_path = selected_mode
+        if selected_mode == MODE_ENHANCED:
+            st.session_state['processing_mode'] = 'enhanced'
+        elif selected_mode in (MODE_AUTO, MODE_SHORT, MODE_SUMMARY):
+            st.session_state['processing_mode'] = 'standard'
 
 
 def render_video_file(tr, params):
@@ -286,6 +298,39 @@ def render_short_generate_options(tr):
         key="custom_clips_input"
     )
     st.session_state['custom_clips'] = custom_clips
+
+
+def render_enhanced_mix_options(tr):
+    """智能混剪解说：解说+原声混合、BGM、分段字幕"""
+    st.info(
+        tr("Enhanced Mix Mode Description")
+    )
+    short_drama_summary(tr)
+
+    if st.session_state.get("subtitle_path"):
+        st.session_state["source_subtitle_path"] = st.session_state["subtitle_path"]
+        st.session_state["processing_mode"] = "enhanced"
+
+    mood_options = {
+        tr("BGM Mood Auto"): "",
+        tr("BGM Mood Suspense"): "suspense",
+        tr("BGM Mood Emotional"): "emotional",
+        tr("BGM Mood Action"): "action",
+        tr("BGM Mood Comedy"): "comedy",
+    }
+    mood_labels = list(mood_options.keys())
+    current_mood = st.session_state.get("bgm_mood", "")
+    default_mood_index = next(
+        (index for index, label in enumerate(mood_labels) if mood_options[label] == current_mood),
+        0,
+    )
+    selected_mood_label = st.selectbox(
+        tr("BGM Mood"),
+        options=mood_labels,
+        index=default_mood_index,
+        help=tr("BGM Mood Help"),
+    )
+    st.session_state["bgm_mood"] = mood_options[selected_mood_label]
 
 
 def render_video_details(tr):
@@ -734,6 +779,8 @@ def render_script_buttons(tr, params):
         button_name = tr("Generate Short Video Script")
     elif script_path == "summary":
         button_name = tr("生成短剧解说脚本")
+    elif script_path == "enhanced":
+        button_name = tr("Generate Enhanced Mix Script")
     elif script_path.endswith("json"):
         button_name = tr("Load Video Script")
     else:
@@ -753,6 +800,11 @@ def render_script_buttons(tr, params):
             video_theme = st.session_state.get('video_theme')
             temperature = st.session_state.get('temperature')
             generate_script_short_sunmmary(params, subtitle_path, video_theme, temperature)
+        elif script_path == "enhanced":
+            subtitle_path = st.session_state.get('subtitle_path')
+            video_theme = st.session_state.get('video_theme')
+            temperature = st.session_state.get('temperature')
+            generate_script_enhanced(params, subtitle_path, video_theme, temperature)
         else:
             load_script(tr, script_path)
 
@@ -868,5 +920,8 @@ def get_script_params():
         'video_clip_json_path': st.session_state.get('video_clip_json_path', ''),
         'video_origin_path': st.session_state.get('video_origin_path', ''),
         'video_name': st.session_state.get('video_name', ''),
-        'video_plot': st.session_state.get('video_plot', '')
+        'video_plot': st.session_state.get('video_plot', ''),
+        'processing_mode': st.session_state.get('processing_mode', 'standard'),
+        'source_subtitle_path': st.session_state.get('source_subtitle_path', ''),
+        'bgm_mood': st.session_state.get('bgm_mood', ''),
     }

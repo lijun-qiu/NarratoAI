@@ -117,12 +117,13 @@ def song_dir(sub_dir: str = ""):
     return d
 
 
-def get_bgm_file(bgm_type: str = "random", bgm_file: str = ""):
+def get_bgm_file(bgm_type: str = "random", bgm_file: str = "", bgm_mood: str = ""):
     """
     获取背景音乐文件路径
     Args:
-        bgm_type: 背景音乐类型，可选值: random(随机), ""(无背景音乐)
+        bgm_type: 背景音乐类型，可选值: random(随机), custom(自定义), ""(无背景音乐)
         bgm_file: 指定的背景音乐文件路径
+        bgm_mood: 情绪分类目录名（resource/songs 下的子目录）
 
     Returns:
         str: 背景音乐文件路径
@@ -138,17 +139,24 @@ def get_bgm_file(bgm_type: str = "random", bgm_file: str = ""):
     if bgm_type == "random":
         song_dir_path = song_dir()
 
-        # 检查目录是否存在
         if not os.path.exists(song_dir_path):
             logger.warning(f"背景音乐目录不存在: {song_dir_path}")
             return ""
 
-        # 支持 mp3 和 flac 格式
-        mp3_files = glob.glob(os.path.join(song_dir_path, "*.mp3"))
-        flac_files = glob.glob(os.path.join(song_dir_path, "*.flac"))
-        files = mp3_files + flac_files
+        def collect_audio_files(directory: str) -> list[str]:
+            mp3_files = glob.glob(os.path.join(directory, "*.mp3"))
+            flac_files = glob.glob(os.path.join(directory, "*.flac"))
+            return mp3_files + flac_files
 
-        # 检查是否找到音乐文件
+        mood = (bgm_mood or "").strip()
+        if mood:
+            mood_dir = os.path.join(song_dir_path, mood)
+            mood_files = collect_audio_files(mood_dir) if os.path.isdir(mood_dir) else []
+            if mood_files:
+                return random.choice(mood_files)
+            logger.warning(f"BGM 分类目录为空或不存在: {mood_dir}，回退到默认歌曲目录")
+
+        files = collect_audio_files(song_dir_path)
         if not files:
             logger.warning(f"在目录 {song_dir_path} 中没有找到 MP3 或 FLAC 文件")
             return ""

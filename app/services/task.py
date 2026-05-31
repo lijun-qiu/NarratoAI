@@ -1,5 +1,6 @@
 import math
 import json
+import os
 import os.path
 import re
 import traceback
@@ -11,8 +12,147 @@ from app.config.audio_config import AudioConfig, get_recommended_volumes_for_con
 from app.models import const
 from app.models.schema import VideoClipParams
 from app.services import (voice, audio_merger, subtitle_merger, clip_video, merger_video, update_script, generate_video)
+from app.services.subtitle_clipper import enrich_native_subtitles
 from app.services import state as sm
 from app.utils import utils
+
+
+def _resolve_bgm_path(params: VideoClipParams) -> str:
+    bgm_type = getattr(params, "bgm_type", "") or config.ui.get("bgm_type", "random")
+    bgm_file = getattr(params, "bgm_file", "") or config.ui.get("bgm_file", "")
+    bgm_mood = getattr(params, "bgm_mood", "") or ""
+    return utils.get_bgm_file(bgm_type=bgm_type, bgm_file=bgm_file, bgm_mood=bgm_mood)
+
+
+def _merge_audio_and_subtitles(task_id: str, new_script_list: list, tts_segments: list) -> tuple[str, str]:
+    """Merge TTS audio and per-segment subtitles when available."""
+    total_duration = sum(script.get("duration", 0) or 0 for script in new_script_list)
+    merged_audio_path = ""
+    merged_subtitle_path = ""
+
+    has_tts_audio = bool(tts_segments)
+    has_any_subtitle = any(
+        script.get("subtitle") and os.path.exists(script.get("subtitle", ""))
+        for script in new_script_list
+    )
+
+    if not has_tts_audio and not has_any_subtitle:
+        logger.warning("没有需要合并的音频/字幕")
+        return merged_audio_path, merged_subtitle_path
+
+    try:
+        if has_tts_audio:
+            merged_audio_path = audio_merger.merge_audio_files(
+                task_id=task_id,
+                total_duration=total_duration,
+                list_script=new_script_list,
+            )
+            logger.info(f"音频文件合并成功->{merged_audio_path}")
+
+        if has_any_subtitle:
+            merged_subtitle_path = subtitle_merger.merge_subtitle_files(new_script_list)
+            if merged_subtitle_path:
+                logger.info(f"字幕文件合并成功->{merged_subtitle_path}")
+            else:
+                logger.warning("没有有效的字幕内容，将生成无字幕视频")
+                merged_subtitle_path = ""
+    except Exception as exc:
+        logger.error(f"合并音频/字幕文件失败: {str(exc)}")
+
+    return merged_audio_path or "", merged_subtitle_path or ""
+
+
+def _finalize_combined_video(
+    task_id: str,
+    params: VideoClipParams,
+    list_script: list,
+    new_script_list: list,
+    video_ost: list,
+    merged_audio_path: str,
+    merged_subtitle_path: str,
+) -> dict:
+    combined_video_path = path.join(utils.task_dir(task_id), "merger.mp4")
+    logger.info(f"\n\n## 5. 合并视频: => {combined_video_path}")
+
+    video_clips = []
+    for new_script in new_script_list:
+        video_path = new_script.get("video")
+        if video_path and os.path.exists(video_path):
+            video_clips.append(video_path)
+        else:
+            logger.error(f"片段 {new_script.get('_id')} 的视频文件不存在: {video_path}")
+
+    logger.info(f"准备合并 {len(video_clips)} 个视频片段")
+    merger_video.combine_clip_videos(
+        output_video_path=combined_video_path,
+        video_paths=video_clips,
+        video_ost_list=video_ost,
+        video_aspect=params.video_aspect,
+        threads=params.n_threads,
+    )
+    sm.state.update_task(task_id, state=const.TASK_STATE_PROCESSING, progress=80)
+
+    output_video_path = path.join(utils.task_dir(task_id), "combined.mp4")
+    logger.info(f"\n\n## 6. 最后一步: 合并字幕/BGM/配音/视频 -> {output_video_path}")
+
+    bgm_path = _resolve_bgm_path(params)
+    if bgm_path:
+        logger.info(f"使用背景音乐: {bgm_path}")
+    else:
+        logger.warning("未找到可用背景音乐，将跳过 BGM")
+
+    optimized_volumes = get_recommended_volumes_for_content("mixed")
+    has_original_audio_segments = any(segment.get("OST") == 1 for segment in list_script)
+
+    final_tts_volume = (
+        params.tts_volume
+        if hasattr(params, "tts_volume") and params.tts_volume != 1.0
+        else optimized_volumes["tts_volume"]
+    )
+    if has_original_audio_segments:
+        final_original_volume = 1.0
+        logger.info("检测到原声片段，原声音量设置为1.0以保持与原视频一致")
+    else:
+        final_original_volume = (
+            params.original_volume
+            if hasattr(params, "original_volume") and params.original_volume != 0.7
+            else optimized_volumes["original_volume"]
+        )
+
+    final_bgm_volume = (
+        params.bgm_volume
+        if hasattr(params, "bgm_volume") and params.bgm_volume != 0.3
+        else optimized_volumes["bgm_volume"]
+    )
+    logger.info(f"音量配置 - TTS: {final_tts_volume}, 原声: {final_original_volume}, BGM: {final_bgm_volume}")
+
+    options = {
+        "voice_volume": final_tts_volume,
+        "bgm_volume": final_bgm_volume,
+        "original_audio_volume": final_original_volume,
+        "keep_original_audio": True,
+        "subtitle_enabled": params.subtitle_enabled,
+        "subtitle_font": params.font_name,
+        "subtitle_font_size": params.font_size,
+        "subtitle_color": params.text_fore_color,
+        "subtitle_bg_color": None,
+        "subtitle_position": params.subtitle_position,
+        "custom_position": params.custom_position,
+        "threads": params.n_threads,
+    }
+    generate_video.merge_materials(
+        video_path=combined_video_path,
+        audio_path=merged_audio_path,
+        subtitle_path=merged_subtitle_path,
+        bgm_path=bgm_path,
+        output_path=output_video_path,
+        options=options,
+    )
+
+    return {
+        "videos": [output_video_path],
+        "combined_videos": [combined_video_path],
+    }
 
 
 def start_subclip(task_id: str, params: VideoClipParams, subclip_path_videos: dict = None):
@@ -203,7 +343,7 @@ def start_subclip(task_id: str, params: VideoClipParams, subclip_path_videos: di
     logger.info(f"\n\n## 6. 最后一步: 合并字幕/BGM/配音/视频 -> {output_video_path}")
 
     # bgm_path = '/Users/apple/Desktop/home/NarratoAI/resource/songs/bgm.mp3'
-    bgm_path = utils.get_bgm_file()
+    bgm_path = _resolve_bgm_path(params)
 
     # 获取优化的音量配置
     optimized_volumes = get_recommended_volumes_for_content('mixed')
@@ -418,7 +558,7 @@ def start_subclip_unified(task_id: str, params: VideoClipParams):
     output_video_path = path.join(utils.task_dir(task_id), f"combined.mp4")
     logger.info(f"\n\n## 6. 最后一步: 合并字幕/BGM/配音/视频 -> {output_video_path}")
 
-    bgm_path = utils.get_bgm_file()
+    bgm_path = _resolve_bgm_path(params)
 
     # 获取优化的音量配置
     optimized_volumes = get_recommended_volumes_for_content('mixed')
@@ -473,6 +613,82 @@ def start_subclip_unified(task_id: str, params: VideoClipParams):
         "videos": final_video_paths,
         "combined_videos": combined_video_paths
     }
+    sm.state.update_task(task_id, state=const.TASK_STATE_COMPLETE, progress=100, **kwargs)
+    return kwargs
+
+
+def start_subclip_enhanced(task_id: str, params: VideoClipParams):
+    """
+    智能混剪解说模式：
+    - 解说段（OST=0/2）使用 TTS 解说字幕
+    - 原声段（OST=1）从原片 SRT 提取原生对白字幕
+    - 合并 BGM + 新字幕（不依赖原片硬字幕）
+    """
+    logger.info(f"\n\n## 开始智能混剪解说任务: {task_id}")
+    sm.state.update_task(task_id, state=const.TASK_STATE_PROCESSING, progress=0)
+
+    logger.info("\n\n## 1. 加载视频脚本")
+    video_script_path = path.join(params.video_clip_json_path)
+    if not path.exists(video_script_path):
+        raise ValueError("解说脚本文件不存在！请先点击【保存脚本】按钮保存脚本后再生成视频。")
+
+    with open(video_script_path, "r", encoding="utf-8") as file_obj:
+        list_script = json.load(file_obj)
+    video_ost = [item["OST"] for item in list_script]
+
+    source_subtitle_path = getattr(params, "source_subtitle_path", "") or ""
+    if not source_subtitle_path or not os.path.exists(source_subtitle_path):
+        raise ValueError(
+            "智能混剪解说模式需要原片字幕文件。"
+            "请在本模式下上传/转写字幕后重新生成脚本，或确认 source_subtitle_path 有效。"
+        )
+
+    logger.info("\n\n## 2. 根据OST设置生成音频列表")
+    tts_segments = [segment for segment in list_script if segment["OST"] in [0, 2]]
+    tts_results = voice.tts_multiple(
+        task_id=task_id,
+        list_script=tts_segments,
+        tts_engine=params.tts_engine,
+        voice_name=params.voice_name,
+        voice_rate=params.voice_rate,
+        voice_pitch=params.voice_pitch,
+    )
+    sm.state.update_task(task_id, state=const.TASK_STATE_PROCESSING, progress=20)
+
+    logger.info("\n\n## 3. 统一视频裁剪（基于OST类型）")
+    video_clip_result = clip_video.clip_video_unified(
+        video_origin_path=params.video_origin_path,
+        script_list=list_script,
+        tts_results=tts_results,
+    )
+    tts_clip_result = {tts_result["_id"]: tts_result["audio_file"] for tts_result in tts_results}
+    subclip_clip_result = {tts_result["_id"]: tts_result["subtitle_file"] for tts_result in tts_results}
+    new_script_list = update_script.update_script_timestamps(
+        list_script, video_clip_result, tts_clip_result, subclip_clip_result
+    )
+    logger.info(f"统一裁剪完成，处理了 {len(video_clip_result)} 个视频片段")
+    sm.state.update_task(task_id, state=const.TASK_STATE_PROCESSING, progress=55)
+
+    logger.info("\n\n## 4. 生成原声片段原生字幕")
+    new_script_list = enrich_native_subtitles(new_script_list, source_subtitle_path, task_id)
+    sm.state.update_task(task_id, state=const.TASK_STATE_PROCESSING, progress=60)
+
+    logger.info("\n\n## 5. 合并音频和字幕")
+    merged_audio_path, merged_subtitle_path = _merge_audio_and_subtitles(
+        task_id, new_script_list, tts_segments
+    )
+    sm.state.update_task(task_id, state=const.TASK_STATE_PROCESSING, progress=70)
+
+    kwargs = _finalize_combined_video(
+        task_id=task_id,
+        params=params,
+        list_script=list_script,
+        new_script_list=new_script_list,
+        video_ost=video_ost,
+        merged_audio_path=merged_audio_path,
+        merged_subtitle_path=merged_subtitle_path,
+    )
+    logger.success(f"智能混剪解说任务 {task_id} 已完成, 生成 {len(kwargs['videos'])} 个视频.")
     sm.state.update_task(task_id, state=const.TASK_STATE_COMPLETE, progress=100, **kwargs)
     return kwargs
 

@@ -23,14 +23,8 @@ node_modules
 # 模型目录
 /models/
 ./models/*
-resource/scripts/*.json
-resource/videos/*.mp4
-resource/songs/*.mp3
-resource/songs/*.flac
-resource/fonts/*.ttc
-resource/fonts/*.ttf
-resource/fonts/*.otf
-resource/srt/*.srt
+# 用户素材目录（视频/字幕/脚本/BGM 等，不提交）
+/resource/
 app/models/faster-whisper-large-v2/*
 app/models/faster-whisper-large-v3/*
 app/models/bert/*

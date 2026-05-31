@@ -295,6 +295,7 @@ class SubtitleAnalyzerAdapter:
                 provider=self.provider,
                 temperature=temperature,
                 response_format="json",
+                max_tokens=8192,
                 api_key=self.api_key,
                 api_base=self.base_url
             )

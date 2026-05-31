@@ -17,122 +17,10 @@ from loguru import logger
 from app.config import config
 from app.services.SDE.short_drama_explanation import analyze_subtitle, generate_narration_script
 from app.services.subtitle_text import read_subtitle_text
+from app.utils.script_json_parser import parse_narration_script_items
 # 导入新的LLM服务模块 - 确保提供商被注册
 import app.services.llm  # 这会触发提供商注册
 from app.services.llm.migration_adapter import SubtitleAnalyzerAdapter
-import re
-
-
-def parse_and_fix_json(json_string):
-    """
-    解析并修复JSON字符串
-
-    Args:
-        json_string: 待解析的JSON字符串
-
-    Returns:
-        dict: 解析后的字典，如果解析失败返回None
-    """
-    if not json_string or not json_string.strip():
-        logger.error("JSON字符串为空")
-        return None
-
-    # 清理字符串
-    json_string = json_string.strip()
-
-    # 尝试直接解析
-    try:
-        return json.loads(json_string)
-    except json.JSONDecodeError as e:
-        logger.warning(f"直接JSON解析失败: {e}")
-
-    # 尝试修复双大括号问题（LLM生成的常见问题）
-    try:
-        # 将双大括号替换为单大括号
-        fixed_braces = json_string.replace('{{', '{').replace('}}', '}')
-        logger.info("修复双大括号格式")
-        return json.loads(fixed_braces)
-    except json.JSONDecodeError:
-        pass
-
-    # 尝试提取JSON部分
-    try:
-        # 查找JSON代码块
-        json_match = re.search(r'```json\s*(.*?)\s*```', json_string, re.DOTALL)
-        if json_match:
-            json_content = json_match.group(1).strip()
-            logger.info("从代码块中提取JSON内容")
-            return json.loads(json_content)
-    except json.JSONDecodeError:
-        pass
-
-    # 尝试查找大括号包围的内容
-    try:
-        # 查找第一个 { 到最后一个 } 的内容
-        start_idx = json_string.find('{')
-        end_idx = json_string.rfind('}')
-        if start_idx != -1 and end_idx != -1 and end_idx > start_idx:
-            json_content = json_string[start_idx:end_idx+1]
-            logger.info("提取大括号包围的JSON内容")
-            return json.loads(json_content)
-    except json.JSONDecodeError:
-        pass
-
-    # 尝试综合修复JSON格式问题
-    try:
-        fixed_json = json_string
-
-        # 1. 修复双大括号问题
-        fixed_json = fixed_json.replace('{{', '{').replace('}}', '}')
-
-        # 2. 提取JSON内容（如果有其他文本包围）
-        start_idx = fixed_json.find('{')
-        end_idx = fixed_json.rfind('}')
-        if start_idx != -1 and end_idx != -1 and end_idx > start_idx:
-            fixed_json = fixed_json[start_idx:end_idx+1]
-
-        # 3. 移除注释
-        fixed_json = re.sub(r'#.*', '', fixed_json)
-        fixed_json = re.sub(r'//.*', '', fixed_json)
-
-        # 4. 移除多余的逗号
-        fixed_json = re.sub(r',\s*}', '}', fixed_json)
-        fixed_json = re.sub(r',\s*]', ']', fixed_json)
-
-        # 5. 修复单引号
-        fixed_json = re.sub(r"'([^']*)':", r'"\1":', fixed_json)
-
-        # 6. 修复没有引号的属性名
-        fixed_json = re.sub(r'(\w+)(\s*):', r'"\1"\2:', fixed_json)
-
-        # 7. 修复重复的引号
-        fixed_json = re.sub(r'""([^"]*?)""', r'"\1"', fixed_json)
-
-        logger.info("尝试综合修复JSON格式问题后解析")
-        return json.loads(fixed_json)
-    except json.JSONDecodeError as e:
-        logger.debug(f"综合修复失败: {e}")
-        pass
-
-    # 如果所有方法都失败，尝试创建一个基本的结构
-    logger.error(f"所有JSON解析方法都失败，原始内容: {json_string[:200]}...")
-
-    # 尝试从文本中提取关键信息创建基本结构
-    try:
-        # 这是一个简单的回退方案
-        return {
-            "items": [
-                {
-                    "_id": 1,
-                    "timestamp": "00:00:00,000-00:00:10,000",
-                    "picture": "解析失败，使用默认内容",
-                    "narration": json_string[:100] + "..." if len(json_string) > 100 else json_string,
-                    "OST": 0
-                }
-            ]
-        }
-    except Exception:
-        return None
 
 
 def generate_script_short_sunmmary(params, subtitle_path, video_theme, temperature):
@@ -250,20 +138,15 @@ def generate_script_short_sunmmary(params, subtitle_path, video_theme, temperatu
             # 结果转换为JSON字符串
             narration_script = narration_result["narration_script"]
 
-            # 增强JSON解析，包含错误处理和修复
-            narration_dict = parse_and_fix_json(narration_script)
-            if narration_dict is None:
-                st.error("生成的解说文案格式错误，无法解析为JSON")
-                logger.error(f"JSON解析失败，原始内容: {narration_script}")
+            script_items = parse_narration_script_items(narration_script)
+            if not script_items:
+                st.error("生成的解说文案格式错误，无法解析为有效脚本。请降低 temperature 后重试，或检查模型输出是否被截断。")
+                with st.expander("查看模型原始输出"):
+                    st.code(str(narration_script)[:8000])
+                logger.error(f"JSON解析失败，原始内容: {str(narration_script)[:1000]}")
                 st.stop()
 
-            # 验证JSON结构
-            if 'items' not in narration_dict:
-                st.error("生成的解说文案缺少必要的'items'字段")
-                logger.error(f"JSON结构错误，缺少items字段: {narration_dict}")
-                st.stop()
-
-            script = json.dumps(narration_dict['items'], ensure_ascii=False, indent=2)
+            script = json.dumps(script_items, ensure_ascii=False, indent=2)
 
             if script is None:
                 st.error("生成脚本失败，请检查日志")

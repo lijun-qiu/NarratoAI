@@ -11,6 +11,7 @@
 
 from .plot_analysis import PlotAnalysisPrompt
 from .script_generation import ScriptGenerationPrompt
+from .script_generation_enhanced import ScriptGenerationEnhancedPrompt
 from ..manager import PromptManager
 
 
@@ -25,9 +26,13 @@ def register_prompts():
     script_generation_prompt = ScriptGenerationPrompt()
     PromptManager.register_prompt(script_generation_prompt, is_default=True)
 
+    enhanced_prompt = ScriptGenerationEnhancedPrompt()
+    PromptManager.register_prompt(enhanced_prompt, is_default=False)
+
 
 __all__ = [
     "PlotAnalysisPrompt",
     "ScriptGenerationPrompt",
-    "register_prompts"
+    "ScriptGenerationEnhancedPrompt",
+    "register_prompts",
 ]

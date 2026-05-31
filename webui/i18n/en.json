@@ -92,7 +92,7 @@
     "Subtitle Transcription": "Subtitle Transcription",
     "Enhanced Mix Narration": "Enhanced Mix Narration",
     "Generate Enhanced Mix Script": "Generate Enhanced Mix Script",
-    "Enhanced Mix Mode Description": "Adds BGM automatically. Narration segments (OST=0) show TTS subtitles; original-audio segments (OST=1) use dialogue clipped from the source SRT. Upload the full source subtitle first.",
+    "Enhanced Mix Mode Description": "Long-form mode: target output is at least 50% of source length. Adds BGM; OST=0 uses TTS subtitles; OST=1 uses dialogue from source SRT. Upload full subtitles first. Regenerate if the estimate is too short.",
     "BGM Mood": "BGM Mood",
     "BGM Mood Help": "Random pick from resource/songs/<mood>/; falls back to resource/songs if empty",
     "BGM Mood Auto": "Auto (root folder)",

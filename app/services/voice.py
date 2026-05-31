@@ -1,13 +1,14 @@
 import os
 import re
 import json
+import io
 import traceback
 import edge_tts
 import asyncio
 import requests
 import uuid
 from loguru import logger
-from typing import List, Union, Tuple
+from typing import List, Union, Tuple, Optional
 from datetime import datetime
 from xml.sax.saxutils import unescape
 from edge_tts import submaker, SubMaker
@@ -23,6 +24,23 @@ import time
 
 from app.config import config
 from app.utils import utils
+
+try:
+    from edge_tts.exceptions import NoAudioReceived
+except ImportError:
+    class NoAudioReceived(Exception):
+        """edge-tts unavailable: treat stream failures like NoAudioReceived."""
+
+try:
+    from pydub import AudioSegment
+    PYDUB_AVAILABLE = True
+except ImportError:
+    PYDUB_AVAILABLE = False
+
+EDGE_TTS_MAX_CHUNK_CHARS = 280
+EDGE_TTS_MAX_ATTEMPTS = 5
+EDGE_TTS_CHUNK_PAUSE_SEC = 0.6
+EDGE_TTS_SEGMENT_PAUSE_SEC = 0.5
 
 
 def mktimestamp(time_seconds: float) -> str:
@@ -1306,65 +1324,226 @@ def get_edge_tts_proxy() -> str | None:
     return proxy_url or None
 
 
+def _edge_tts_failure_hint() -> str:
+    proxy = get_edge_tts_proxy()
+    if proxy:
+        return f"已配置代理 {proxy}，请确认代理可用。"
+    return (
+        "可在 config.toml 的 [proxy] 中启用 HTTP/HTTPS 代理，"
+        "或安装 Cloudflare WARP；亦可改用豆包/Azure 等 TTS 引擎。"
+    )
+
+
+def _split_text_for_edge_tts(text: str, max_chars: int = EDGE_TTS_MAX_CHUNK_CHARS) -> List[str]:
+    """Split long narration to reduce Edge TTS silent failures / rate limits."""
+    cleaned = text.strip()
+    if not cleaned:
+        return []
+    if len(cleaned) <= max_chars:
+        return [cleaned]
+
+    parts: List[str] = []
+    buffer = ""
+    for segment in re.split(r"(?<=[。！？；\n])", cleaned):
+        piece = segment.strip()
+        if not piece:
+            continue
+        if len(piece) > max_chars:
+            if buffer:
+                parts.append(buffer)
+                buffer = ""
+            for offset in range(0, len(piece), max_chars):
+                parts.append(piece[offset: offset + max_chars])
+            continue
+        if len(buffer) + len(piece) <= max_chars:
+            buffer += piece
+        else:
+            if buffer:
+                parts.append(buffer)
+            buffer = piece
+    if buffer:
+        parts.append(buffer)
+    return parts or [cleaned[:max_chars]]
+
+
+def _merge_edge_tts_chunks(chunk_results: List[Tuple[SubMaker, bytes]]) -> Tuple[SubMaker, bytes]:
+    """Merge chunked audio and shift subtitle offsets."""
+    if len(chunk_results) == 1:
+        return chunk_results[0]
+
+    if not PYDUB_AVAILABLE:
+        combined_audio = b"".join(audio for _, audio in chunk_results if audio)
+        combined_sub = new_sub_maker()
+        for sub_maker, _ in chunk_results:
+            for (start, end), sub_text in zip(sub_maker.offset, sub_maker.subs):
+                add_subtitle_event(combined_sub, start, end, sub_text)
+        return combined_sub, combined_audio
+
+    merged_sub = new_sub_maker()
+    offset_100ns = 0
+    audio_segments: List[AudioSegment] = []
+    for sub_maker, audio_data in chunk_results:
+        if not audio_data:
+            continue
+        segment = AudioSegment.from_file(io.BytesIO(audio_data), format="mp3")
+        audio_segments.append(segment)
+        for (start, end), sub_text in zip(sub_maker.offset, sub_maker.subs):
+            add_subtitle_event(
+                merged_sub,
+                start + offset_100ns,
+                end + offset_100ns,
+                sub_text,
+            )
+        offset_100ns += int(len(segment) * 10000)
+
+    if not audio_segments:
+        return new_sub_maker(), b""
+
+    merged_audio = audio_segments[0]
+    for segment in audio_segments[1:]:
+        merged_audio += segment
+    out_buf = io.BytesIO()
+    merged_audio.export(out_buf, format="mp3")
+    return merged_sub, out_buf.getvalue()
+
+
+async def _edge_tts_stream_once(
+    text: str,
+    voice_name: str,
+    rate_str: str,
+    pitch_str: str,
+) -> Tuple[SubMaker, bytes]:
+    communicate = edge_tts.Communicate(
+        text,
+        voice_name,
+        rate=rate_str,
+        pitch=pitch_str,
+        boundary="WordBoundary",
+        proxy=get_edge_tts_proxy(),
+        connect_timeout=15,
+        receive_timeout=120,
+    )
+    sub_maker = new_sub_maker()
+    audio_data = b""
+    async for chunk in communicate.stream():
+        if chunk["type"] == "audio":
+            audio_data += chunk["data"]
+        elif chunk["type"] in {"WordBoundary", "SentenceBoundary"}:
+            add_subtitle_event(
+                sub_maker,
+                start_offset=chunk["offset"],
+                end_offset=chunk["offset"] + chunk["duration"],
+                text=chunk["text"],
+                boundary_type=chunk["type"],
+            )
+    return sub_maker, audio_data
+
+
+async def _edge_tts_save_once(
+    text: str,
+    voice_name: str,
+    rate_str: str,
+    pitch_str: str,
+) -> bytes:
+    """Fallback when stream() returns no audio (intermittent upstream issue)."""
+    communicate = edge_tts.Communicate(
+        text,
+        voice_name,
+        rate=rate_str,
+        pitch=pitch_str,
+        proxy=get_edge_tts_proxy(),
+        connect_timeout=15,
+        receive_timeout=120,
+    )
+    temp_path = os.path.join(utils.storage_dir(), "temp", f"edge_tts_{uuid.uuid4().hex}.mp3")
+    os.makedirs(os.path.dirname(temp_path), exist_ok=True)
+    try:
+        await communicate.save(temp_path)
+        with open(temp_path, "rb") as file_obj:
+            return file_obj.read()
+    finally:
+        if os.path.exists(temp_path):
+            try:
+                os.remove(temp_path)
+            except OSError:
+                pass
+
+
+async def _edge_tts_synthesize_text(
+    text: str,
+    voice_name: str,
+    rate_str: str,
+    pitch_str: str,
+) -> Tuple[SubMaker, bytes]:
+    chunks = _split_text_for_edge_tts(text)
+    chunk_results: List[Tuple[SubMaker, bytes]] = []
+
+    for index, chunk_text in enumerate(chunks):
+        if index > 0:
+            await asyncio.sleep(EDGE_TTS_CHUNK_PAUSE_SEC)
+
+        sub_maker, audio_data = await _edge_tts_stream_once(
+            chunk_text, voice_name, rate_str, pitch_str
+        )
+        if not audio_data:
+            logger.warning(f"edge_tts stream 无音频，尝试 save 回退（段 {index + 1}/{len(chunks)}）")
+            audio_data = await _edge_tts_save_once(chunk_text, voice_name, rate_str, pitch_str)
+            if audio_data and not sub_maker.subs:
+                logger.warning("save 回退成功但未获得字幕时间轴，后续将按文案估算字幕")
+
+        if not audio_data:
+            raise NoAudioReceived(
+                "No audio was received. Please verify that your parameters are correct."
+            )
+        chunk_results.append((sub_maker, audio_data))
+
+    return _merge_edge_tts_chunks(chunk_results)
+
+
 def azure_tts_v1(
     text: str, voice_name: str, voice_rate: float, voice_pitch: float, voice_file: str
 ) -> Union[SubMaker, None]:
     voice_name = parse_voice_name(voice_name)
     text = text.strip()
+    if not text:
+        logger.error("edge_tts 文本为空，跳过合成")
+        return None
+
     rate_str = convert_rate_to_percent(voice_rate)
     pitch_str = convert_pitch_to_percent(voice_pitch)
-    for i in range(3):
+    last_error: Optional[Exception] = None
+
+    for attempt in range(EDGE_TTS_MAX_ATTEMPTS):
         try:
-            logger.info(f"第 {i+1} 次使用 edge_tts 生成音频")
+            logger.info(f"第 {attempt + 1}/{EDGE_TTS_MAX_ATTEMPTS} 次使用 edge_tts 生成音频")
+            sub_maker, audio_data = asyncio.run(
+                _edge_tts_synthesize_text(text, voice_name, rate_str, pitch_str)
+            )
 
-            async def _do() -> tuple[SubMaker, bytes]:
-                communicate = edge_tts.Communicate(
-                    text,
-                    voice_name,
-                    rate=rate_str,
-                    pitch=pitch_str,
-                    boundary="WordBoundary",
-                    proxy=get_edge_tts_proxy(),
-                    connect_timeout=10,
-                    receive_timeout=60,
-                )
-                sub_maker = new_sub_maker()
-                audio_data = bytes()  # 用于存储音频数据
-                
-                async for chunk in communicate.stream():
-                    if chunk["type"] == "audio":
-                        audio_data += chunk["data"]
-                    elif chunk["type"] in {"WordBoundary", "SentenceBoundary"}:
-                        add_subtitle_event(
-                            sub_maker,
-                            start_offset=chunk["offset"],
-                            end_offset=chunk["offset"] + chunk["duration"],
-                            text=chunk["text"],
-                            boundary_type=chunk["type"],
-                        )
-                return sub_maker, audio_data
-
-            # 获取音频数据和字幕信息
-            sub_maker, audio_data = asyncio.run(_do())
-            
-            # 验证数据是否有效
             if not audio_data:
-                logger.warning("failed, no audio data generated")
-                if i < 2:
-                    time.sleep(1)
-                continue
+                raise NoAudioReceived("stream completed without audio data")
 
             if not sub_maker.subs:
-                logger.warning("edge_tts returned audio without boundary events; subtitle timing may be unavailable")
+                logger.warning("edge_tts 未返回字幕时间轴，将按文案估算字幕")
 
-            # 数据有效，写入文件
             with open(voice_file, "wb") as file:
                 file.write(audio_data)
             return sub_maker
-        except Exception as e:
-            logger.exception(f"生成音频文件时出错: {type(e).__name__}: {str(e)}")
-            if i < 2:
-                time.sleep(1)
+        except (NoAudioReceived, asyncio.TimeoutError, ConnectionError, OSError) as exc:
+            last_error = exc
+            logger.error(
+                f"edge_tts 合成失败 ({type(exc).__name__}): {exc}. {_edge_tts_failure_hint()}"
+            )
+        except Exception as exc:
+            last_error = exc
+            logger.error(f"edge_tts 合成异常: {type(exc).__name__}: {exc}", exc_info=True)
+
+        if attempt < EDGE_TTS_MAX_ATTEMPTS - 1:
+            backoff = min(2 ** attempt + 1, 16)
+            time.sleep(backoff)
+
+    if last_error:
+        logger.error(f"edge_tts 在 {EDGE_TTS_MAX_ATTEMPTS} 次尝试后仍失败: {last_error}")
     return None
 
 
@@ -1690,6 +1869,66 @@ def get_audio_duration(sub_maker: submaker.SubMaker):
     return sub_maker.offset[-1][1] / 10000000
 
 
+def tts_supports_generated_subtitles(tts_engine: str, voice_name: str) -> bool:
+    """Whether the TTS engine can produce word-timed subtitle files."""
+    if is_soulvoice_voice(voice_name) or is_qwen_engine(tts_engine):
+        return False
+    if tts_engine in ("indextts2", "doubaotts"):
+        return False
+    return True
+
+
+def generate_subtitle_file_only(
+    task_id: str,
+    segment_id,
+    text: str,
+    subtitle_file: str,
+    voice_name: str,
+    voice_rate: float,
+    voice_pitch: float,
+    tts_engine: str,
+) -> Union[str, None]:
+    """
+    Generate a TTS-timed SRT for overlay (e.g. OST=1 segments) without using the clip audio.
+    """
+    cleaned = (text or "").strip()
+    if not cleaned:
+        return None
+    if not tts_supports_generated_subtitles(tts_engine, voice_name):
+        return None
+
+    voice_name = parse_voice_name(voice_name)
+    output_dir = utils.task_dir(task_id)
+    os.makedirs(output_dir, exist_ok=True)
+    temp_audio = os.path.join(output_dir, f"_subtitle_only_{segment_id}.mp3")
+
+    sub_maker = tts(
+        text=cleaned,
+        voice_name=voice_name,
+        voice_rate=voice_rate,
+        voice_pitch=voice_pitch,
+        voice_file=temp_audio,
+        tts_engine=tts_engine,
+    )
+    if sub_maker is None:
+        logger.warning(f"片段 {segment_id} TTS 字幕生成失败")
+        return None
+
+    result_path, _ = create_subtitle(
+        sub_maker=sub_maker,
+        text=cleaned,
+        subtitle_file=subtitle_file,
+    )
+    if os.path.exists(temp_audio):
+        try:
+            os.remove(temp_audio)
+        except OSError:
+            pass
+    if result_path and os.path.exists(result_path) and os.path.getsize(result_path) > 0:
+        return result_path
+    return None
+
+
 def tts_multiple(task_id: str, list_script: list, voice_name: str, voice_rate: float, voice_pitch: float, tts_engine: str = "azure"):
     """
     根据JSON文件中的多段文本进行TTS转换
@@ -1724,45 +1963,31 @@ def tts_multiple(task_id: str, list_script: list, voice_name: str, voice_rate: f
             )
 
             if sub_maker is None:
-                logger.error(f"无法为时间戳 {timestamp} 生成音频; "
-                             f"如果您在中国，请使用VPN; "
-                             f"或者使用其他 tts 引擎")
+                logger.error(
+                    f"无法为时间戳 {timestamp} 生成音频。{_edge_tts_failure_hint()}"
+                )
                 continue
-            else:
-                # SoulVoice、Qwen3、IndexTTS2、豆包语音 引擎不生成字幕文件
-                if is_soulvoice_voice(voice_name) or is_qwen_engine(tts_engine) or tts_engine == "indextts2" or tts_engine == "doubaotts":
-                    # 获取实际音频文件的时长
-                    duration = get_audio_duration_from_file(audio_file)
+
+            # SoulVoice、Qwen3、IndexTTS2、豆包语音 引擎不生成字幕文件
+            if is_soulvoice_voice(voice_name) or is_qwen_engine(tts_engine) or tts_engine == "indextts2" or tts_engine == "doubaotts":
+                duration = get_audio_duration_from_file(audio_file)
+                if duration <= 0:
+                    duration = get_audio_duration(sub_maker)
                     if duration <= 0:
-                        # 如果无法获取文件时长，尝试从 SubMaker 获取
-                        duration = get_audio_duration(sub_maker)
-                        if duration <= 0:
-                            # 最后的 fallback，基于文本长度估算
-                            # 对于英文文本，使用更准确的估算方法
-                            # 英文平均语速约为每分钟150-180个单词，即每秒2.5-3个单词
-                            # 对于中文文本，约为每秒3-4字
-                            import re
-                            # 计算英文单词数
-                            english_words = len(re.findall(r'\b\w+\b', text))
-                            # 计算中文字符数
-                            chinese_chars = len(re.findall(r'[\u4e00-\u9fa5]', text))
-                            
-                            if english_words > chinese_chars:
-                                # 主要是英文文本
-                                # 假设平均每个单词需要0.35秒
-                                estimated_duration = max(1.0, english_words * 0.35)
-                            else:
-                                # 主要是中文文本
-                                # 假设平均每个汉字需要0.3秒
-                                estimated_duration = max(1.0, chinese_chars * 0.3)
-                            
-                            # 确保估算时长合理
-                            duration = max(1.0, estimated_duration)
-                            logger.warning(f"无法获取音频时长，使用文本估算: {duration:.2f}秒 (英文单词: {english_words}, 中文字符: {chinese_chars})")
-                    # 不创建字幕文件
-                    subtitle_file = ""
-                else:
-                    _, duration = create_subtitle(sub_maker=sub_maker, text=text, subtitle_file=subtitle_file)
+                        english_words = len(re.findall(r"\b\w+\b", text))
+                        chinese_chars = len(re.findall(r"[\u4e00-\u9fa5]", text))
+                        if english_words > chinese_chars:
+                            estimated_duration = max(1.0, english_words * 0.35)
+                        else:
+                            estimated_duration = max(1.0, chinese_chars * 0.3)
+                        duration = max(1.0, estimated_duration)
+                        logger.warning(
+                            f"无法获取音频时长，使用文本估算: {duration:.2f}秒 "
+                            f"(英文单词: {english_words}, 中文字符: {chinese_chars})"
+                        )
+                subtitle_file = ""
+            else:
+                _, duration = create_subtitle(sub_maker=sub_maker, text=text, subtitle_file=subtitle_file)
 
             tts_results.append({
                 "_id": item['_id'],
@@ -1773,6 +1998,9 @@ def tts_multiple(task_id: str, list_script: list, voice_name: str, voice_rate: f
                 "text": text,
             })
             logger.info(f"已生成音频文件: {audio_file}")
+
+            if tts_engine in ("edge_tts", "azure_speech"):
+                time.sleep(EDGE_TTS_SEGMENT_PAUSE_SEC)
 
     return tts_results
 

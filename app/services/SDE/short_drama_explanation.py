@@ -369,7 +369,19 @@ class SubtitleAnalyzer:
             logger.error(f"保存分析结果时发生错误: {str(e)}")
             return ""
 
-    def generate_narration_script(self, short_name: str, plot_analysis: str, subtitle_content: str = "", temperature: float = 0.7) -> Dict[str, Any]:
+    def generate_narration_script(
+        self,
+        short_name: str,
+        plot_analysis: str,
+        subtitle_content: str = "",
+        temperature: float = 0.7,
+        *,
+        prompt_name: str = "script_generation",
+        video_duration: str = "未知",
+        target_duration: str = "未知",
+        min_duration: str = "未知",
+        duration_params: Optional[dict] = None,
+    ) -> Dict[str, Any]:
         """
         根据剧情分析生成解说文案
 
@@ -378,20 +390,42 @@ class SubtitleAnalyzer:
             plot_analysis: 剧情分析内容
             subtitle_content: 原始字幕内容，用于提供准确的时间戳信息
             temperature: 生成温度，控制创造性，默认0.7
+            prompt_name: script_generation 或 script_generation_enhanced
+            video_duration: 原视频时长
+            target_duration: 目标成片时长
+            min_duration: 成片最短时长
 
         Returns:
             Dict[str, Any]: 包含生成结果的字典
         """
         try:
-            # 使用新的提示词管理系统构建提示词
+            parameters = {
+                "drama_name": short_name,
+                "plot_analysis": plot_analysis,
+                "subtitle_content": subtitle_content,
+            }
+            if prompt_name == "script_generation_enhanced":
+                if duration_params:
+                    parameters.update(duration_params)
+                else:
+                    parameters.update(
+                        {
+                            "video_duration": video_duration,
+                            "target_duration": target_duration,
+                            "min_duration": min_duration,
+                            "max_duration": target_duration,
+                            "video_duration_sec": "0",
+                            "min_segment_count": "15",
+                            "max_segment_count": "25",
+                            "narration_span_range": "8-20",
+                            "ost_span_range": "4-12",
+                            "duration_plan_summary": "未检测到视频时长，请上传视频后重新生成",
+                        }
+                    )
             prompt = PromptManager.get_prompt(
                 category="short_drama_narration",
-                name="script_generation",
-                parameters={
-                    "drama_name": short_name,
-                    "plot_analysis": plot_analysis,
-                    "subtitle_content": subtitle_content
-                }
+                name=prompt_name,
+                parameters=parameters,
             )
 
             if self.is_native_gemini:
@@ -699,7 +733,13 @@ def generate_narration_script(
     temperature: float = 1.0,
     save_result: bool = False,
     output_path: Optional[str] = None,
-    provider: Optional[str] = None
+    provider: Optional[str] = None,
+    *,
+    prompt_name: str = "script_generation",
+    video_duration: str = "未知",
+    target_duration: str = "未知",
+    min_duration: str = "未知",
+    duration_params: Optional[dict] = None,
 ) -> Dict[str, Any]:
     """
     根据剧情分析生成解说文案的便捷函数
@@ -728,8 +768,17 @@ def generate_narration_script(
         provider=provider
     )
     
-    # 生成解说文案
-    result = analyzer.generate_narration_script(short_name, plot_analysis, subtitle_content or "", temperature)
+    result = analyzer.generate_narration_script(
+        short_name,
+        plot_analysis,
+        subtitle_content or "",
+        temperature,
+        prompt_name=prompt_name,
+        video_duration=video_duration,
+        target_duration=target_duration,
+        min_duration=min_duration,
+        duration_params=duration_params,
+    )
     
     # 保存结果
     if save_result and result["status"] == "success":

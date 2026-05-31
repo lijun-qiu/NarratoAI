@@ -261,7 +261,7 @@ def get_jianying_export_params() -> VideoClipParams:
         video_aspect=VideoAspect.landscape,
         subtitle_enabled=st.session_state.get('subtitle_enabled', False),
         font_name=st.session_state.get('font_name', 'Microsoft YaHei'),
-        font_size=st.session_state.get('font_size', 24),
+        font_size=st.session_state.get('font_size', 40),
         text_fore_color=st.session_state.get('text_fore_color', '#FFFFFF'),
         subtitle_position=st.session_state.get(
             'subtitle_position', config.ui.get('subtitle_position', 'custom')

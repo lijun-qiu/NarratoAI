@@ -264,7 +264,19 @@ class SubtitleAnalyzerAdapter:
                 "temperature": 1.0
             }
     
-    def generate_narration_script(self, short_name: str, plot_analysis: str, subtitle_content: str = "", temperature: float = 0.7) -> Dict[str, Any]:
+    def generate_narration_script(
+        self,
+        short_name: str,
+        plot_analysis: str,
+        subtitle_content: str = "",
+        temperature: float = 0.7,
+        *,
+        prompt_name: str = "script_generation",
+        video_duration: str = "未知",
+        target_duration: str = "未知",
+        min_duration: str = "未知",
+        duration_params: Optional[dict] = None,
+    ) -> Dict[str, Any]:
         """
         生成解说文案 - 兼容原有接口
 
@@ -273,20 +285,42 @@ class SubtitleAnalyzerAdapter:
             plot_analysis: 剧情分析内容
             subtitle_content: 原始字幕内容，用于提供准确的时间戳信息
             temperature: 生成温度
+            prompt_name: script_generation 或 script_generation_enhanced（智能混剪）
+            video_duration: 原视频时长标签
+            target_duration: 目标成片时长标签
+            min_duration: 成片最短时长标签（智能混剪 ≥50% 原片）
 
         Returns:
             生成结果字典
         """
         try:
-            # 使用新的提示词管理系统构建提示词
+            parameters = {
+                "drama_name": short_name,
+                "plot_analysis": plot_analysis,
+                "subtitle_content": subtitle_content,
+            }
+            if prompt_name == "script_generation_enhanced":
+                if duration_params:
+                    parameters.update(duration_params)
+                else:
+                    parameters.update(
+                        {
+                            "video_duration": video_duration,
+                            "target_duration": target_duration,
+                            "min_duration": min_duration,
+                            "max_duration": target_duration,
+                            "video_duration_sec": "0",
+                            "min_segment_count": "15",
+                            "max_segment_count": "25",
+                            "narration_span_range": "8-20",
+                            "ost_span_range": "4-12",
+                            "duration_plan_summary": "未检测到视频时长，请上传视频后重新生成",
+                        }
+                    )
             prompt = PromptManager.get_prompt(
                 category="short_drama_narration",
-                name="script_generation",
-                parameters={
-                    "drama_name": short_name,
-                    "plot_analysis": plot_analysis,
-                    "subtitle_content": subtitle_content
-                }
+                name=prompt_name,
+                parameters=parameters,
             )
             
             # 使用统一服务生成文案
@@ -297,7 +331,7 @@ class SubtitleAnalyzerAdapter:
                 provider=self.provider,
                 temperature=temperature,
                 response_format="json",
-                max_tokens=8192,
+                max_tokens=16384,
                 api_key=self.api_key,
                 api_base=self.base_url
             )

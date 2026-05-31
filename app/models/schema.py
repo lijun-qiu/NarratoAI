@@ -183,7 +183,7 @@ class VideoClipParams(BaseModel):
 
     subtitle_enabled: bool = True
     font_name: str = "SimHei"  # 默认使用黑体
-    font_size: int = 36
+    font_size: int = 40
     text_fore_color: str = "white"              # 文本前景色
     text_back_color: Optional[str] = None       # 文本背景色
     stroke_color: str = "black"                 # 描边颜色
@@ -198,7 +198,11 @@ class VideoClipParams(BaseModel):
     bgm_volume: Optional[float] = Field(default=AudioVolumeDefaults.BGM_VOLUME, description="背景音乐音量")
     draft_name: Optional[str] = Field(default="", description="剪映草稿名称")
     processing_mode: Optional[str] = Field(default="standard", description="成片处理模式: standard / enhanced")
-    source_subtitle_path: Optional[str] = Field(default="", description="原片完整字幕路径，用于原声片段字幕提取")
+    source_subtitle_path: Optional[str] = Field(default="", description="原片完整字幕路径，用于原声片段对白文本提取")
+    mask_hardcoded_subtitles: bool = Field(
+        default=True,
+        description="裁剪时用白条遮住画面底部原片硬字幕",
+    )
     bgm_mood: Optional[str] = Field(default="", description="BGM 情绪分类目录名")
 
 

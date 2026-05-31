@@ -12,7 +12,7 @@ from app.config.audio_config import AudioConfig, get_recommended_volumes_for_con
 from app.models import const
 from app.models.schema import VideoClipParams
 from app.services import (voice, audio_merger, subtitle_merger, clip_video, merger_video, update_script, generate_video)
-from app.services.subtitle_clipper import enrich_native_subtitles
+from app.services.subtitle_clipper import enrich_generated_subtitles
 from app.services import state as sm
 from app.utils import utils
 
@@ -246,10 +246,13 @@ def start_subclip(task_id: str, params: VideoClipParams, subclip_path_videos: di
     logger.info("\n\n## 3. 统一视频裁剪（基于OST类型）")
 
     # 使用新的统一裁剪策略
+    mask_hardcoded = getattr(params, "mask_hardcoded_subtitles", True)
     video_clip_result = clip_video.clip_video_unified(
         video_origin_path=params.video_origin_path,
         script_list=list_script,
-        tts_results=tts_results
+        tts_results=tts_results,
+        task_id=task_id,
+        mask_hardcoded_subtitles=mask_hardcoded,
     )
 
     # 更新 list_script 中的时间戳和路径信息
@@ -408,7 +411,7 @@ def start_subclip_unified(task_id: str, params: VideoClipParams):
     统一视频裁剪处理函数 - 完全基于OST类型的新实现
 
     这是优化后的版本，完全移除了对预裁剪视频的依赖，
-    实现真正的统一裁剪策略。
+    实现真正的统一裁剪策略。原声段使用 TTS 生成叠加字幕，并遮罩原片硬字幕。
 
     Args:
         task_id: 任务ID
@@ -472,10 +475,13 @@ def start_subclip_unified(task_id: str, params: VideoClipParams):
     logger.info("\n\n## 3. 统一视频裁剪（基于OST类型）")
 
     # 使用新的统一裁剪策略
+    mask_hardcoded = getattr(params, "mask_hardcoded_subtitles", True)
     video_clip_result = clip_video.clip_video_unified(
         video_origin_path=params.video_origin_path,
         script_list=list_script,
-        tts_results=tts_results
+        tts_results=tts_results,
+        task_id=task_id,
+        mask_hardcoded_subtitles=mask_hardcoded,
     )
 
     # 更新 list_script 中的时间戳和路径信息
@@ -486,6 +492,22 @@ def start_subclip_unified(task_id: str, params: VideoClipParams):
     new_script_list = update_script.update_script_timestamps(list_script, video_clip_result, tts_clip_result, subclip_clip_result)
 
     logger.info(f"统一裁剪完成，处理了 {len(video_clip_result)} 个视频片段")
+
+    has_ost1 = any(segment.get("OST") == 1 for segment in new_script_list)
+    if params.subtitle_enabled and has_ost1:
+        source_subtitle_path = getattr(params, "source_subtitle_path", "") or ""
+        logger.info("\n\n## 3b. 生成原声片段叠加字幕（TTS 字幕）")
+        new_script_list = enrich_generated_subtitles(
+            new_script_list,
+            source_subtitle_path,
+            task_id,
+            tts_config={
+                "tts_engine": params.tts_engine,
+                "voice_name": params.voice_name,
+                "voice_rate": params.voice_rate,
+                "voice_pitch": params.voice_pitch,
+            },
+        )
 
     sm.state.update_task(task_id, state=const.TASK_STATE_PROCESSING, progress=60)
 
@@ -518,6 +540,18 @@ def start_subclip_unified(task_id: str, params: VideoClipParams):
                 merged_audio_path = ""
             if 'merged_subtitle_path' not in locals():
                 merged_subtitle_path = ""
+    elif params.subtitle_enabled and has_ost1:
+        try:
+            merged_subtitle_path = subtitle_merger.merge_subtitle_files(new_script_list)
+            if merged_subtitle_path:
+                logger.info(f"字幕文件合并成功->{merged_subtitle_path}")
+            else:
+                merged_subtitle_path = ""
+            merged_audio_path = ""
+        except Exception as e:
+            logger.error(f"合并字幕文件失败: {str(e)}")
+            merged_audio_path = ""
+            merged_subtitle_path = ""
     else:
         logger.warning("没有需要合并的音频/字幕")
         merged_audio_path = ""
@@ -620,9 +654,9 @@ def start_subclip_unified(task_id: str, params: VideoClipParams):
 def start_subclip_enhanced(task_id: str, params: VideoClipParams):
     """
     智能混剪解说模式：
-    - 解说段（OST=0/2）使用 TTS 解说字幕
-    - 原声段（OST=1）从原片 SRT 提取原生对白字幕
-    - 合并 BGM + 新字幕（不依赖原片硬字幕）
+    - 解说/原声段均使用 TTS 生成的叠加字幕（edge-tts 等）
+    - 裁剪时用白条遮住画面底部原片硬字幕
+    - 最终成片仅烧录生成字幕，不保留原片硬字幕
     """
     logger.info(f"\n\n## 开始智能混剪解说任务: {task_id}")
     sm.state.update_task(task_id, state=const.TASK_STATE_PROCESSING, progress=0)
@@ -656,10 +690,13 @@ def start_subclip_enhanced(task_id: str, params: VideoClipParams):
     sm.state.update_task(task_id, state=const.TASK_STATE_PROCESSING, progress=20)
 
     logger.info("\n\n## 3. 统一视频裁剪（基于OST类型）")
+    mask_hardcoded = getattr(params, "mask_hardcoded_subtitles", True)
     video_clip_result = clip_video.clip_video_unified(
         video_origin_path=params.video_origin_path,
         script_list=list_script,
         tts_results=tts_results,
+        task_id=task_id,
+        mask_hardcoded_subtitles=mask_hardcoded,
     )
     tts_clip_result = {tts_result["_id"]: tts_result["audio_file"] for tts_result in tts_results}
     subclip_clip_result = {tts_result["_id"]: tts_result["subtitle_file"] for tts_result in tts_results}
@@ -669,8 +706,21 @@ def start_subclip_enhanced(task_id: str, params: VideoClipParams):
     logger.info(f"统一裁剪完成，处理了 {len(video_clip_result)} 个视频片段")
     sm.state.update_task(task_id, state=const.TASK_STATE_PROCESSING, progress=55)
 
-    logger.info("\n\n## 4. 生成原声片段原生字幕")
-    new_script_list = enrich_native_subtitles(new_script_list, source_subtitle_path, task_id)
+    logger.info("\n\n## 4. 生成原声片段叠加字幕（TTS 字幕）")
+    tts_subtitle_config = None
+    if params.subtitle_enabled:
+        tts_subtitle_config = {
+            "tts_engine": params.tts_engine,
+            "voice_name": params.voice_name,
+            "voice_rate": params.voice_rate,
+            "voice_pitch": params.voice_pitch,
+        }
+    new_script_list = enrich_generated_subtitles(
+        new_script_list,
+        source_subtitle_path,
+        task_id,
+        tts_config=tts_subtitle_config,
+    )
     sm.state.update_task(task_id, state=const.TASK_STATE_PROCESSING, progress=60)
 
     logger.info("\n\n## 5. 合并音频和字幕")

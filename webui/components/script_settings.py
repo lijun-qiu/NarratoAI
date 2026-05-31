@@ -329,6 +329,19 @@ def render_enhanced_mix_options(tr):
     short_drama_summary(tr, script_mode="enhanced")
 
     with st.expander(tr("Enhanced Mix Narration"), expanded=False):
+        from app.utils.media_duration import get_video_duration_seconds
+        from app.utils.enhanced_mix_duration import build_enhanced_mix_duration_plan
+
+        video_path = st.session_state.get("video_origin_path")
+        if video_path:
+            video_sec = get_video_duration_seconds(video_path)
+            if video_sec:
+                plan = build_enhanced_mix_duration_plan(video_sec)
+                st.caption(f"当前上传视频：{plan.plan_summary}")
+        elif st.session_state.get("enhanced_mix_duration_plan"):
+            st.caption(st.session_state["enhanced_mix_duration_plan"])
+        else:
+            st.caption("上传视频后将根据原片时长自动计算成片目标与片段数量。")
         st.info(tr("Enhanced Mix Mode Description"))
 
         if st.session_state.get("subtitle_path"):

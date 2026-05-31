@@ -18,6 +18,27 @@ from pathlib import Path
 
 from app.utils import ffmpeg_utils
 
+
+def resolve_narration_clip_duration(timestamp: str, tts_duration: float) -> float:
+    """Use max(TTS length, script timestamp span) so long-form scripts keep enough screen time."""
+    from app.services.subtitle_clipper import time_str_to_seconds
+
+    try:
+        start_str, end_str = timestamp.split("-", 1)
+        span = max(
+            0.0,
+            time_str_to_seconds(end_str.strip()) - time_str_to_seconds(start_str.strip()),
+        )
+    except (ValueError, IndexError):
+        span = 0.0
+    duration = max(float(tts_duration), span)
+    if span > float(tts_duration) + 0.05:
+        logger.info(
+            f"解说段画面按脚本跨度 {span:.1f}s 裁剪（TTS {tts_duration:.1f}s）"
+        )
+    return duration
+
+
 def parse_timestamp(timestamp: str) -> tuple:
     """
     解析时间戳字符串，返回开始和结束时间
@@ -545,13 +566,18 @@ def try_fallback_encoding(
     return execute_simple_command(fallback_cmd, timestamp, "通用Fallback")
 
 
+# 遮住画面底部硬字幕区域（白条），最终仅显示生成的叠加字幕
+HARD_SUBTITLE_MASK_VF = "drawbox=x=0:y=ih*0.76:w=iw:h=ih*0.24:color=white@1:t=fill"
+
+
 def _process_narration_only_segment(
     video_origin_path: str,
     script_item: Dict,
     tts_map: Dict,
     output_dir: str,
     encoder_config: Dict,
-    hwaccel_args: List[str]
+    hwaccel_args: List[str],
+    mask_hardcoded_subtitles: bool = True,
 ) -> Optional[str]:
     """
     处理OST=0的纯解说片段
@@ -569,14 +595,12 @@ def _process_narration_only_segment(
 
     # 解析起始时间，使用TTS音频时长计算结束时间
     start_time, _ = parse_timestamp(timestamp)
-    duration = tts_item["duration"]
+    duration = resolve_narration_clip_duration(timestamp, tts_item["duration"])
     calculated_end_time = calculate_end_time(start_time, duration, extra_seconds=0)
 
-    # 转换为FFmpeg兼容的时间格式
     ffmpeg_start_time = start_time.replace(',', '.')
     ffmpeg_end_time = calculated_end_time.replace(',', '.')
 
-    # 生成输出文件名
     safe_start_time = start_time.replace(':', '-').replace(',', '-')
     safe_end_time = calculated_end_time.replace(':', '-').replace(',', '-')
     output_filename = f"ost0_vid_{safe_start_time}@{safe_end_time}.mp4"
@@ -585,7 +609,8 @@ def _process_narration_only_segment(
     # 构建FFmpeg命令 - 移除音频
     cmd = _build_ffmpeg_command_with_audio_control(
         video_origin_path, output_path, ffmpeg_start_time, ffmpeg_end_time,
-        encoder_config, hwaccel_args, remove_audio=True
+        encoder_config, hwaccel_args, remove_audio=True,
+        mask_hardcoded_subtitles=mask_hardcoded_subtitles,
     )
 
     # 执行命令
@@ -602,7 +627,8 @@ def _process_original_audio_segment(
     script_item: Dict,
     output_dir: str,
     encoder_config: Dict,
-    hwaccel_args: List[str]
+    hwaccel_args: List[str],
+    mask_hardcoded_subtitles: bool = True,
 ) -> Optional[str]:
     """
     处理OST=1的纯原声片段
@@ -628,7 +654,8 @@ def _process_original_audio_segment(
     # 构建FFmpeg命令 - 保持原声
     cmd = _build_ffmpeg_command_with_audio_control(
         video_origin_path, output_path, ffmpeg_start_time, ffmpeg_end_time,
-        encoder_config, hwaccel_args, remove_audio=False
+        encoder_config, hwaccel_args, remove_audio=False,
+        mask_hardcoded_subtitles=mask_hardcoded_subtitles,
     )
 
     # 执行命令
@@ -646,7 +673,8 @@ def _process_mixed_segment(
     tts_map: Dict,
     output_dir: str,
     encoder_config: Dict,
-    hwaccel_args: List[str]
+    hwaccel_args: List[str],
+    mask_hardcoded_subtitles: bool = True,
 ) -> Optional[str]:
     """
     处理OST=2的解说+原声混合片段
@@ -662,16 +690,13 @@ def _process_mixed_segment(
         logger.error(f"未找到片段 {_id} 的TTS结果")
         return None
 
-    # 解析起始时间，使用TTS音频时长计算结束时间
     start_time, _ = parse_timestamp(timestamp)
-    duration = tts_item["duration"]
+    duration = resolve_narration_clip_duration(timestamp, tts_item["duration"])
     calculated_end_time = calculate_end_time(start_time, duration, extra_seconds=0)
 
-    # 转换为FFmpeg兼容的时间格式
     ffmpeg_start_time = start_time.replace(',', '.')
     ffmpeg_end_time = calculated_end_time.replace(',', '.')
 
-    # 生成输出文件名
     safe_start_time = start_time.replace(':', '-').replace(',', '-')
     safe_end_time = calculated_end_time.replace(':', '-').replace(',', '-')
     output_filename = f"ost2_vid_{safe_start_time}@{safe_end_time}.mp4"
@@ -680,7 +705,8 @@ def _process_mixed_segment(
     # 构建FFmpeg命令 - 保持原声
     cmd = _build_ffmpeg_command_with_audio_control(
         video_origin_path, output_path, ffmpeg_start_time, ffmpeg_end_time,
-        encoder_config, hwaccel_args, remove_audio=False
+        encoder_config, hwaccel_args, remove_audio=False,
+        mask_hardcoded_subtitles=mask_hardcoded_subtitles,
     )
 
     # 执行命令
@@ -699,7 +725,8 @@ def _build_ffmpeg_command_with_audio_control(
     end_time: str,
     encoder_config: Dict[str, str],
     hwaccel_args: List[str] = None,
-    remove_audio: bool = False
+    remove_audio: bool = False,
+    mask_hardcoded_subtitles: bool = False,
 ) -> List[str]:
     """
     构建支持音频控制的FFmpeg命令
@@ -733,6 +760,10 @@ def _build_ffmpeg_command_with_audio_control(
 
     # 视频编码器设置
     cmd.extend(["-c:v", encoder_config["video_codec"]])
+
+    if mask_hardcoded_subtitles:
+        cmd.extend(["-vf", HARD_SUBTITLE_MASK_VF])
+        logger.debug("已启用底部硬字幕白条遮罩")
 
     # 音频处理
     if remove_audio:
@@ -782,7 +813,8 @@ def clip_video_unified(
         script_list: List[Dict],
         tts_results: List[Dict],
         output_dir: Optional[str] = None,
-        task_id: Optional[str] = None
+        task_id: Optional[str] = None,
+        mask_hardcoded_subtitles: bool = True,
 ) -> Dict[str, str]:
     """
     基于OST类型的统一视频裁剪策略 - 消除双重裁剪问题
@@ -853,17 +885,17 @@ def clip_video_unified(
             if ost == 0:  # 纯解说片段
                 output_path = _process_narration_only_segment(
                     video_origin_path, script_item, tts_map, output_dir,
-                    encoder_config, hwaccel_args
+                    encoder_config, hwaccel_args, mask_hardcoded_subtitles
                 )
             elif ost == 1:  # 纯原声片段
                 output_path = _process_original_audio_segment(
                     video_origin_path, script_item, output_dir,
-                    encoder_config, hwaccel_args
+                    encoder_config, hwaccel_args, mask_hardcoded_subtitles
                 )
             elif ost == 2:  # 解说+原声混合片段
                 output_path = _process_mixed_segment(
                     video_origin_path, script_item, tts_map, output_dir,
-                    encoder_config, hwaccel_args
+                    encoder_config, hwaccel_args, mask_hardcoded_subtitles
                 )
             else:
                 logger.warning(f"未知的OST类型: {ost}，跳过片段 {_id}")

@@ -10,7 +10,10 @@ def render_subtitle_panel(tr):
     """渲染字幕设置面板"""
     with st.container(border=True):
         st.write(tr("Subtitle Settings"))
-        st.info("💡 提示：目前仅 **edge-tts** 引擎支持自动生成字幕，其他 TTS 引擎暂不支持。")
+        st.info(
+            "💡 提示：解说与原声片段均烧录 **TTS 生成字幕**；裁剪时会用白条遮住原片硬字幕。"
+            "目前仅 **edge-tts / azure** 等引擎支持自动生成字幕。"
+        )
 
         # 检查是否选择了 SoulVoice qwen3_tts引擎
         from app.services import voice
@@ -77,7 +80,7 @@ def render_font_settings(tr):
         st.session_state['text_fore_color'] = text_fore_color
 
     with font_cols[1]:
-        saved_font_size = config.ui.get("font_size", 60)
+        saved_font_size = config.ui.get("font_size", 40)
         font_size = st.slider(
             tr("Font Size"),
             min_value=20,
@@ -164,7 +167,7 @@ def get_subtitle_params():
     return {
         'subtitle_enabled': st.session_state.get('subtitle_enabled', True),
         'font_name': font_name,
-        'font_size': st.session_state.get('font_size', 60),
+        'font_size': st.session_state.get('font_size', 40),
         'text_fore_color': st.session_state.get('text_fore_color', '#FFFFFF'),
         'subtitle_position': st.session_state.get(
             'subtitle_position', config.ui.get('subtitle_position', 'custom')

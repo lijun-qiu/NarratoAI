@@ -19,12 +19,20 @@ def generate_script_enhanced(params, subtitle_path: str, video_theme: str, tempe
     st.session_state["processing_mode"] = "enhanced"
     st.session_state["source_subtitle_path"] = subtitle_path
 
-    generate_script_short_sunmmary(params, subtitle_path, video_theme, temperature, require_media_name=True)
+    generate_script_short_sunmmary(
+        params,
+        subtitle_path,
+        video_theme,
+        temperature,
+        require_media_name=True,
+        enhanced_mix=True,
+    )
 
     if st.session_state.get("video_clip_json"):
         st.session_state["processing_mode"] = "enhanced"
         st.session_state["source_subtitle_path"] = subtitle_path
         st.info(
-            "脚本已按「智能混剪解说」模式生成："
-            "成片将自动混入 BGM，解说段显示解说字幕，原声段显示原片对白字幕。"
+            "脚本已按「智能混剪解说·长成片」规则生成："
+            "目标成片时长 ≥ 原片 50%；自动混入 BGM；"
+            "解说段显示 TTS 字幕，原声段显示原片对白字幕。"
         )

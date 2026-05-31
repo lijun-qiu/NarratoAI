@@ -99,7 +99,22 @@
     # 访问 https://bailian.console.aliyun.com/?tab=model#/api-key 获取你的 API 密钥
     api_key = ""
     model = "fun-asr"
-    
+
+[gemini_asr]
+    # Gemini 音频转写字幕（留空则复用 [app] 视觉模型配置）
+    # provider: auto / rest / openai / sdk
+    api_key = ""
+    model = "gemini-2.0-flash"
+    base_url = ""
+    provider = "auto"
+    fallback_whisper = true
+
+[whisper_asr]
+    api_key = ""
+    base_url = ""
+    model = "whisper-1"
+    language = "zh"
+
 [indextts2]
     # IndexTTS2 语音克隆配置
     # 这是一个开源的零样本语音克隆项目，需要自行部署

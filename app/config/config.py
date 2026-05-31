@@ -82,6 +82,8 @@ def save_config():
         _cfg["ui"] = ui
         _cfg["tts_qwen"] = tts_qwen
         _cfg["fun_asr"] = fun_asr
+        _cfg["gemini_asr"] = gemini_asr
+        _cfg["whisper_asr"] = whisper_asr
         _cfg["indextts2"] = indextts2
         _cfg["doubaotts"] = doubaotts
         f.write(toml.dumps(_cfg))
@@ -98,6 +100,8 @@ ui = _cfg.get("ui", {})
 frames = _cfg.get("frames", {})
 tts_qwen = _cfg.get("tts_qwen", {})
 fun_asr = _cfg.get("fun_asr", {})
+gemini_asr = _cfg.get("gemini_asr", {})
+whisper_asr = _cfg.get("whisper_asr", {})
 indextts2 = _cfg.get("indextts2", {})
 doubaotts = _cfg.get("doubaotts", {})
 

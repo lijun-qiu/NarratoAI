@@ -345,35 +345,27 @@ def correct(subtitle_file, video_script):
         logger.success("Subtitle is correct")
 
 
-def create_with_gemini(audio_file: str, subtitle_file: str = "", api_key: Optional[str] = None) -> Optional[str]:
-    if not api_key:
-        logger.error("Gemini API key is not provided")
-        return None
-
-    genai.configure(api_key=api_key)
-
-    logger.info(f"开始使用Gemini模型处理音频文件: {audio_file}")
-    
-    model = genai.GenerativeModel(model_name="gemini-1.5-flash")
-    prompt = "生成这段语音的转录文本。请以SRT格式输出，包含时间戳。"
+def create_with_gemini(
+    audio_file: str,
+    subtitle_file: str = "",
+    api_key: Optional[str] = None,
+    model_name: str = "",
+    base_url: str = "",
+    provider: str = "auto",
+) -> Optional[str]:
+    from app.services.gemini_subtitle import GeminiSubtitleError, create_with_gemini as _create_with_gemini
 
     try:
-        with open(audio_file, "rb") as f:
-            audio_data = f.read()
-        
-        response = model.generate_content([prompt, audio_data])
-        transcript = response.text
-
-        if not subtitle_file:
-            subtitle_file = f"{audio_file}.srt"
-
-        with open(subtitle_file, "w", encoding="utf-8") as f:
-            f.write(transcript)
-
-        logger.info(f"Gemini生成的字幕文件已保存: {subtitle_file}")
-        return subtitle_file
-    except Exception as e:
-        logger.error(f"使用Gemini处理音频时出错: {e}")
+        return _create_with_gemini(
+            local_file=audio_file,
+            subtitle_file=subtitle_file,
+            api_key=api_key or "",
+            model_name=model_name,
+            base_url=base_url,
+            provider=provider,
+        )
+    except GeminiSubtitleError as exc:
+        logger.error(f"使用 Gemini 处理音频时出错: {exc}")
         return None
 
 

@@ -328,6 +328,8 @@ def short_drama_summary(tr):
     if 'subtitle_file_processed' not in st.session_state:
         st.session_state['subtitle_file_processed'] = False
 
+    render_whisper_transcription(tr)
+    render_gemini_transcription(tr)
     render_fun_asr_transcription(tr)
     
     subtitle_file = st.file_uploader(
@@ -490,6 +492,234 @@ def render_fun_asr_transcription(tr):
                 clear_fun_asr_subtitle_state()
                 logger.error(f"Fun-ASR 字幕转写失败: {traceback.format_exc()}")
                 st.error(f"Fun-ASR 字幕转写失败: {str(e)}")
+
+
+def render_gemini_transcription(tr):
+    """使用 Gemini 从本地音视频转写生成字幕。"""
+    def clear_gemini_subtitle_state():
+        st.session_state['subtitle_path'] = None
+        st.session_state['subtitle_content'] = None
+        st.session_state['subtitle_file_processed'] = False
+
+    default_api_key = (
+        config.gemini_asr.get("api_key", "")
+        or config.app.get("vision_openai_api_key", "")
+    )
+    default_model = (
+        config.gemini_asr.get("model", "")
+        or config.app.get("vision_openai_model_name", "gemini-2.0-flash")
+    )
+    default_base_url = (
+        config.gemini_asr.get("base_url", "")
+        or config.app.get("vision_openai_base_url", "")
+    )
+    default_provider = config.gemini_asr.get("provider", "auto") or "auto"
+
+    with st.expander("Gemini 字幕转录", expanded=True):
+        st.caption(
+            "上传本地音频/视频，使用 Gemini 多模态模型转写为 SRT 字幕。"
+            "若代理返回 502，将自动重试并回退到 Whisper API。"
+        )
+        st.warning("请确认视频含音轨。纯画面素材无法转写。")
+        fallback_whisper = st.checkbox(
+            "Gemini 失败时自动切换 Whisper",
+            value=bool(config.gemini_asr.get("fallback_whisper", True)),
+            key="gemini_asr_fallback_whisper",
+        )
+
+        api_key = st.text_input(
+            "Gemini API Key",
+            value=default_api_key,
+            type="password",
+            key="gemini_asr_api_key",
+        )
+        model_name = st.text_input(
+            "Gemini 模型",
+            value=default_model,
+            help="如 gemini-2.0-flash、gemini-1.5-flash",
+            key="gemini_asr_model_name",
+        )
+        base_url = st.text_input(
+            "API Base URL（可选）",
+            value=default_base_url,
+            help="代理填写如 https://api.example.com/v1",
+            key="gemini_asr_base_url",
+        )
+        provider = st.selectbox(
+            "调用方式",
+            options=["auto", "rest", "openai", "sdk"],
+            index=["auto", "rest", "openai", "sdk"].index(default_provider)
+            if default_provider in {"auto", "rest", "openai", "sdk"}
+            else 0,
+            help="国内 Gemini 代理通常选 auto 或 rest",
+            key="gemini_asr_provider",
+        )
+        uploaded_media = st.file_uploader(
+            "上传需要转录的音频/视频",
+            type=[
+                "aac", "amr", "avi", "flac", "flv", "m4a", "mkv", "mov",
+                "mp3", "mp4", "mpeg", "ogg", "opus", "wav", "webm", "wma", "wmv",
+            ],
+            accept_multiple_files=False,
+            key="gemini_asr_media_uploader",
+        )
+
+        if st.button("Gemini 转写生成字幕", key="gemini_asr_transcribe"):
+            if not api_key.strip():
+                clear_gemini_subtitle_state()
+                st.error("请先输入 Gemini API Key")
+                return
+            if uploaded_media is None:
+                clear_gemini_subtitle_state()
+                st.error("请先上传需要转录的音频或视频文件")
+                return
+
+            try:
+                clear_gemini_subtitle_state()
+                from app.services import gemini_subtitle
+
+                config.gemini_asr["api_key"] = api_key.strip()
+                config.gemini_asr["model"] = model_name.strip() or "gemini-2.0-flash"
+                config.gemini_asr["base_url"] = base_url.strip()
+                config.gemini_asr["provider"] = provider
+                config.gemini_asr["fallback_whisper"] = fallback_whisper
+                config.save_config()
+
+                temp_dir = utils.temp_dir("gemini_asr")
+                safe_filename = os.path.basename(uploaded_media.name)
+                media_path = os.path.join(temp_dir, safe_filename)
+                file_name, file_extension = os.path.splitext(safe_filename)
+                if os.path.exists(media_path):
+                    timestamp = time.strftime("%Y%m%d%H%M%S")
+                    media_path = os.path.join(temp_dir, f"{file_name}_{timestamp}{file_extension}")
+
+                with open(media_path, "wb") as f:
+                    f.write(uploaded_media.getbuffer())
+
+                subtitle_name = f"{os.path.splitext(os.path.basename(media_path))[0]}_gemini.srt"
+                subtitle_path = os.path.join(utils.subtitle_dir(), subtitle_name)
+
+                with st.spinner("正在使用 Gemini 转写字幕，请稍候..."):
+                    generated_path = gemini_subtitle.create_with_gemini(
+                        local_file=media_path,
+                        subtitle_file=subtitle_path,
+                        api_key=api_key.strip(),
+                        model_name=model_name.strip(),
+                        base_url=base_url.strip(),
+                        provider=provider,
+                    )
+
+                if not generated_path or not os.path.exists(generated_path):
+                    clear_gemini_subtitle_state()
+                    st.error("Gemini 转写失败：未生成字幕文件")
+                    return
+
+                with open(generated_path, "r", encoding="utf-8") as f:
+                    subtitle_content = f.read()
+
+                st.session_state['subtitle_path'] = generated_path
+                st.session_state['subtitle_content'] = subtitle_content
+                st.session_state['subtitle_file_processed'] = True
+                st.success(f"字幕转写成功: {os.path.basename(generated_path)}")
+            except Exception as e:
+                clear_gemini_subtitle_state()
+                logger.error(f"Gemini 字幕转写失败: {traceback.format_exc()}")
+                st.error(f"Gemini 字幕转写失败: {str(e)}")
+
+
+def render_whisper_transcription(tr):
+    """使用 OpenAI Whisper API 转写字幕。"""
+    def clear_whisper_subtitle_state():
+        st.session_state['subtitle_path'] = None
+        st.session_state['subtitle_content'] = None
+        st.session_state['subtitle_file_processed'] = False
+
+    default_api_key = (
+        config.whisper_asr.get("api_key", "")
+        or config.app.get("vision_openai_api_key", "")
+    )
+    default_base_url = (
+        config.whisper_asr.get("base_url", "")
+        or config.app.get("vision_openai_base_url", "")
+    )
+
+    with st.expander("Whisper 字幕转录（推荐）", expanded=False):
+        st.caption("OpenAI Whisper 转写，中文稳定，适合代理网关不稳定时使用。")
+        api_key = st.text_input(
+            "API Key",
+            value=default_api_key,
+            type="password",
+            key="whisper_asr_api_key",
+        )
+        base_url = st.text_input(
+            "API Base URL",
+            value=default_base_url,
+            key="whisper_asr_base_url",
+        )
+        uploaded_media = st.file_uploader(
+            "上传需要转录的音频/视频",
+            type=[
+                "aac", "amr", "avi", "flac", "flv", "m4a", "mkv", "mov",
+                "mp3", "mp4", "mpeg", "ogg", "opus", "wav", "webm", "wma", "wmv",
+            ],
+            accept_multiple_files=False,
+            key="whisper_asr_media_uploader",
+        )
+        if st.button("Whisper 转写生成字幕", key="whisper_asr_transcribe"):
+            if not api_key.strip():
+                clear_whisper_subtitle_state()
+                st.error("请先输入 API Key")
+                return
+            if uploaded_media is None:
+                clear_whisper_subtitle_state()
+                st.error("请先上传需要转录的音频或视频文件")
+                return
+            try:
+                clear_whisper_subtitle_state()
+                from app.services import whisper_subtitle
+
+                config.whisper_asr["api_key"] = api_key.strip()
+                config.whisper_asr["base_url"] = base_url.strip()
+                config.save_config()
+
+                temp_dir = utils.temp_dir("whisper_asr")
+                safe_filename = os.path.basename(uploaded_media.name)
+                media_path = os.path.join(temp_dir, safe_filename)
+                file_name, file_extension = os.path.splitext(safe_filename)
+                if os.path.exists(media_path):
+                    timestamp = time.strftime("%Y%m%d%H%M%S")
+                    media_path = os.path.join(temp_dir, f"{file_name}_{timestamp}{file_extension}")
+
+                with open(media_path, "wb") as f:
+                    f.write(uploaded_media.getbuffer())
+
+                subtitle_name = f"{os.path.splitext(os.path.basename(media_path))[0]}_whisper.srt"
+                subtitle_path = os.path.join(utils.subtitle_dir(), subtitle_name)
+
+                with st.spinner("正在使用 Whisper 转写字幕，请稍候..."):
+                    generated_path = whisper_subtitle.create_with_whisper(
+                        local_file=media_path,
+                        subtitle_file=subtitle_path,
+                        api_key=api_key.strip(),
+                        base_url=base_url.strip(),
+                    )
+
+                if not generated_path or not os.path.exists(generated_path):
+                    clear_whisper_subtitle_state()
+                    st.error("Whisper 转写失败：未生成字幕文件")
+                    return
+
+                with open(generated_path, "r", encoding="utf-8") as f:
+                    subtitle_content = f.read()
+
+                st.session_state['subtitle_path'] = generated_path
+                st.session_state['subtitle_content'] = subtitle_content
+                st.session_state['subtitle_file_processed'] = True
+                st.success(f"字幕转写成功: {os.path.basename(generated_path)}")
+            except Exception as e:
+                clear_whisper_subtitle_state()
+                logger.error(f"Whisper 字幕转写失败: {traceback.format_exc()}")
+                st.error(f"Whisper 字幕转写失败: {str(e)}")
 
 
 def render_script_buttons(tr, params):

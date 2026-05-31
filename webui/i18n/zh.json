@@ -162,6 +162,7 @@
     "Batch Size": "批处理大小",
     "Batch Size (More keyframes consume more tokens)": "批处理大小, 每批处理越少消耗 token 越多",
     "Short Drama Summary": "短剧解说",
+    "Subtitle Transcription": "字幕转录",
     "Enhanced Mix Narration": "智能混剪解说",
     "Generate Enhanced Mix Script": "生成智能混剪解说脚本",
     "Enhanced Mix Mode Description": "自动混入 BGM；解说段（OST=0）显示 TTS 解说字幕，原声段（OST=1）从原片 SRT 提取对白字幕并叠加到成片（不保留原片硬字幕轨）。请先上传完整原片字幕。",

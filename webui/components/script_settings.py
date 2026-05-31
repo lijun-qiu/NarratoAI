@@ -60,6 +60,13 @@ def render_script_file(tr, params):
     MODE_SHORT = "short"
     MODE_SUMMARY = "summary"
     MODE_ENHANCED = "enhanced"
+    SCRIPT_WORK_MODES = {MODE_AUTO, MODE_SHORT, MODE_SUMMARY, MODE_ENHANCED}
+
+    if "script_work_mode" not in st.session_state:
+        st.session_state["script_work_mode"] = MODE_ENHANCED
+    if not st.session_state.get("video_clip_json_path"):
+        st.session_state["video_clip_json_path"] = MODE_ENHANCED
+        st.session_state["processing_mode"] = "enhanced"
 
     # 处理保存脚本后的模式切换（必须在 widget 实例化之前）
     if st.session_state.get('_switch_to_file_mode'):
@@ -75,20 +82,20 @@ def render_script_file(tr, params):
         tr("Enhanced Mix Narration"): MODE_ENHANCED,
     }
     
-    # 获取当前状态
-    current_path = st.session_state.get('video_clip_json_path', '')
-    
-    # 确定当前选中的模式索引
-    default_index = 0
+    current_path = st.session_state.get("video_clip_json_path", MODE_ENHANCED)
+    if current_path in SCRIPT_WORK_MODES:
+        st.session_state["script_work_mode"] = current_path
+
+    work_mode = st.session_state.get("script_work_mode", MODE_ENHANCED)
     mode_keys = list(mode_options.keys())
-    
-    if current_path == "auto":
+
+    if work_mode == MODE_AUTO:
         default_index = mode_keys.index(tr("Auto Generate"))
-    elif current_path == "short":
+    elif work_mode == MODE_SHORT:
         default_index = mode_keys.index(tr("Short Generate"))
-    elif current_path == "summary":
+    elif work_mode == MODE_SUMMARY:
         default_index = mode_keys.index(tr("Short Drama Summary"))
-    elif current_path == "enhanced":
+    elif work_mode == MODE_ENHANCED:
         default_index = mode_keys.index(tr("Enhanced Mix Narration"))
     else:
         default_index = mode_keys.index(tr("Select/Upload Script"))
@@ -99,16 +106,29 @@ def render_script_file(tr, params):
     
     # 定义回调函数来处理状态更新
     def update_script_mode():
-        # 获取当前选中的标签
         selected_label = st.session_state.script_mode_selection
         if selected_label:
-            # 更新实际的 path 状态
             new_mode = mode_options[selected_label]
-            st.session_state.video_clip_json_path = new_mode
-            params.video_clip_json_path = new_mode
+            st.session_state["script_work_mode"] = new_mode
+            current = st.session_state.get("video_clip_json_path", "")
+            if new_mode == MODE_FILE:
+                restored = st.session_state.get("last_saved_script_json_path", "")
+                if restored and os.path.isfile(restored):
+                    st.session_state["video_clip_json_path"] = restored
+                elif current and current not in SCRIPT_WORK_MODES and os.path.isfile(current):
+                    st.session_state["video_clip_json_path"] = current
+                else:
+                    st.session_state["video_clip_json_path"] = ""
+            else:
+                if current and current not in SCRIPT_WORK_MODES and os.path.isfile(current):
+                    st.session_state["last_saved_script_json_path"] = current
+                st.session_state["video_clip_json_path"] = new_mode
+                if new_mode == MODE_ENHANCED:
+                    st.session_state["processing_mode"] = "enhanced"
+                elif new_mode in (MODE_AUTO, MODE_SHORT, MODE_SUMMARY):
+                    st.session_state["processing_mode"] = "standard"
+            params.video_clip_json_path = st.session_state["video_clip_json_path"]
         else:
-            # 如果用户取消选择（segmented_control 允许取消），恢复到默认或上一个状态
-            # 这里我们强制保持当前状态，或者重置为默认
             st.session_state.script_mode_selection = default_mode_label
 
     # 渲染组件
@@ -154,7 +174,9 @@ def render_script_file(tr, params):
 
         # 找到保存的脚本文件在列表中的索引
         # 如果当前path是特殊值(auto/short/summary)，则重置为空
-        saved_script_path = current_path if current_path not in [MODE_AUTO, MODE_SHORT, MODE_SUMMARY, MODE_ENHANCED] else ""
+        saved_script_path = current_path if current_path not in SCRIPT_WORK_MODES else ""
+        if saved_script_path:
+            st.session_state["last_saved_script_json_path"] = saved_script_path
         
         selected_index = 0
         for i, (_, path) in enumerate(script_list):
@@ -215,7 +237,9 @@ def render_script_file(tr, params):
 
                     # 更新状态
                     st.success(tr("Script Uploaded Successfully"))
-                    st.session_state['video_clip_json_path'] = script_file_path
+                    st.session_state["video_clip_json_path"] = script_file_path
+                    st.session_state["last_saved_script_json_path"] = script_file_path
+                    st.session_state["script_work_mode"] = MODE_FILE
                     params.video_clip_json_path = script_file_path
                     time.sleep(1)
                     st.rerun()
@@ -225,13 +249,13 @@ def render_script_file(tr, params):
                 except Exception as e:
                     st.error(f"{tr('Upload failed')}: {str(e)}")
     else:
-        # --- 功能生成模式 ---
-        st.session_state['video_clip_json_path'] = selected_mode
+        st.session_state["script_work_mode"] = selected_mode
+        st.session_state["video_clip_json_path"] = selected_mode
         params.video_clip_json_path = selected_mode
         if selected_mode == MODE_ENHANCED:
-            st.session_state['processing_mode'] = 'enhanced'
+            st.session_state["processing_mode"] = "enhanced"
         elif selected_mode in (MODE_AUTO, MODE_SHORT, MODE_SUMMARY):
-            st.session_state['processing_mode'] = 'standard'
+            st.session_state["processing_mode"] = "standard"
 
 
 def render_video_file(tr, params):
@@ -302,35 +326,35 @@ def render_short_generate_options(tr):
 
 def render_enhanced_mix_options(tr):
     """智能混剪解说：解说+原声混合、BGM、分段字幕"""
-    st.info(
-        tr("Enhanced Mix Mode Description")
-    )
     short_drama_summary(tr, script_mode="enhanced")
 
-    if st.session_state.get("subtitle_path"):
-        st.session_state["source_subtitle_path"] = st.session_state["subtitle_path"]
-        st.session_state["processing_mode"] = "enhanced"
+    with st.expander(tr("Enhanced Mix Narration"), expanded=False):
+        st.info(tr("Enhanced Mix Mode Description"))
 
-    mood_options = {
-        tr("BGM Mood Auto"): "",
-        tr("BGM Mood Suspense"): "suspense",
-        tr("BGM Mood Emotional"): "emotional",
-        tr("BGM Mood Action"): "action",
-        tr("BGM Mood Comedy"): "comedy",
-    }
-    mood_labels = list(mood_options.keys())
-    current_mood = st.session_state.get("bgm_mood", "")
-    default_mood_index = next(
-        (index for index, label in enumerate(mood_labels) if mood_options[label] == current_mood),
-        0,
-    )
-    selected_mood_label = st.selectbox(
-        tr("BGM Mood"),
-        options=mood_labels,
-        index=default_mood_index,
-        help=tr("BGM Mood Help"),
-    )
-    st.session_state["bgm_mood"] = mood_options[selected_mood_label]
+        if st.session_state.get("subtitle_path"):
+            st.session_state["source_subtitle_path"] = st.session_state["subtitle_path"]
+            st.session_state["processing_mode"] = "enhanced"
+
+        mood_options = {
+            tr("BGM Mood Auto"): "",
+            tr("BGM Mood Suspense"): "suspense",
+            tr("BGM Mood Emotional"): "emotional",
+            tr("BGM Mood Action"): "action",
+            tr("BGM Mood Comedy"): "comedy",
+        }
+        mood_labels = list(mood_options.keys())
+        current_mood = st.session_state.get("bgm_mood", "")
+        default_mood_index = next(
+            (index for index, label in enumerate(mood_labels) if mood_options[label] == current_mood),
+            0,
+        )
+        selected_mood_label = st.selectbox(
+            tr("BGM Mood"),
+            options=mood_labels,
+            index=default_mood_index,
+            help=tr("BGM Mood Help"),
+        )
+        st.session_state["bgm_mood"] = mood_options[selected_mood_label]
 
 
 def render_video_details(tr):
@@ -373,10 +397,11 @@ def short_drama_summary(tr, script_mode="summary"):
     if 'subtitle_file_processed' not in st.session_state:
         st.session_state['subtitle_file_processed'] = False
 
-    render_whisper_transcription(tr)
-    render_gemini_transcription(tr)
-    render_fun_asr_transcription(tr)
-    
+    with st.expander(tr("Subtitle Transcription"), expanded=False):
+        render_whisper_transcription(tr)
+        render_gemini_transcription(tr)
+        render_fun_asr_transcription(tr)
+
     subtitle_file = st.file_uploader(
         tr("上传字幕文件"),
         type=["srt"],
@@ -571,7 +596,7 @@ def render_gemini_transcription(tr):
     )
     default_provider = config.gemini_asr.get("provider", "auto") or "auto"
 
-    with st.expander("Gemini 字幕转录", expanded=True):
+    with st.expander("Gemini 字幕转录", expanded=False):
         st.caption(
             "上传本地音频/视频，使用 Gemini 多模态模型转写为 SRT 字幕。"
             "若代理返回 502，将自动重试并回退到 Whisper API。"
@@ -908,6 +933,7 @@ def save_script_with_validation(tr, video_clip_json_details):
 
                 # 更新配置
                 config.app["video_clip_json_path"] = save_path
+                st.session_state["last_saved_script_json_path"] = save_path
 
                 # 显示成功消息
                 st.success("✅ 脚本格式验证通过，保存成功！")

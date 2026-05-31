@@ -89,6 +89,7 @@
     "Frame Interval (seconds)": "Frame Interval (seconds) (More keyframes consume more tokens)",
     "Short Generate": "Short Drama Mix",
     "Short Drama Summary": "Short Drama Narration",
+    "Subtitle Transcription": "Subtitle Transcription",
     "Enhanced Mix Narration": "Enhanced Mix Narration",
     "Generate Enhanced Mix Script": "Generate Enhanced Mix Script",
     "Enhanced Mix Mode Description": "Adds BGM automatically. Narration segments (OST=0) show TTS subtitles; original-audio segments (OST=1) use dialogue clipped from the source SRT. Upload the full source subtitle first.",

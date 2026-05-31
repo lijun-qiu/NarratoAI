@@ -117,6 +117,11 @@ def init_global_state():
         st.session_state['video_plot'] = ''
     if 'ui_language' not in st.session_state:
         st.session_state['ui_language'] = config.ui.get("language", utils.get_system_locale())
+    if 'script_work_mode' not in st.session_state:
+        st.session_state['script_work_mode'] = 'enhanced'
+    if not st.session_state.get('video_clip_json_path'):
+        st.session_state['video_clip_json_path'] = 'enhanced'
+        st.session_state['processing_mode'] = 'enhanced'
     # 移除subclip_videos初始化 - 现在使用统一裁剪策略
 
 
@@ -258,8 +263,12 @@ def get_jianying_export_params() -> VideoClipParams:
         font_name=st.session_state.get('font_name', 'Microsoft YaHei'),
         font_size=st.session_state.get('font_size', 24),
         text_fore_color=st.session_state.get('text_fore_color', '#FFFFFF'),
-        subtitle_position=st.session_state.get('subtitle_position', 'bottom'),
-        custom_position=st.session_state.get('custom_position', 70.0),
+        subtitle_position=st.session_state.get(
+            'subtitle_position', config.ui.get('subtitle_position', 'custom')
+        ),
+        custom_position=st.session_state.get(
+            'custom_position', config.ui.get('custom_position', 61.0)
+        ),
         tts_volume=st.session_state.get('tts_volume', 1.0),
         original_volume=st.session_state.get('original_volume', 0.7),
         bgm_volume=st.session_state.get('bgm_volume', 0.3),

@@ -226,12 +226,13 @@ class SubtitleAnalyzerAdapter:
 
         return output
     
-    def analyze_subtitle(self, subtitle_content: str) -> Dict[str, Any]:
+    def analyze_subtitle(self, subtitle_content: str, drama_name: str = "") -> Dict[str, Any]:
         """
         分析字幕内容 - 兼容原有接口
         
         Args:
             subtitle_content: 字幕内容
+            drama_name: 电影/电视剧名称，用于结合作品背景分析片段内容
             
         Returns:
             分析结果字典
@@ -241,6 +242,7 @@ class SubtitleAnalyzerAdapter:
             result = self._run_async_safely(
                 UnifiedLLMService.analyze_subtitle,
                 subtitle_content=subtitle_content,
+                drama_name=drama_name,
                 provider=self.provider,
                 temperature=1.0,
                 api_key=self.api_key,

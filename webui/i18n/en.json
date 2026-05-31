@@ -99,6 +99,10 @@
     "BGM Mood Emotional": "Emotional",
     "BGM Mood Action": "Action",
     "BGM Mood Comedy": "Comedy",
+    "Short Drama Name": "Short Drama Name",
+    "Movie or TV Show Name": "Movie / TV Show Name",
+    "Movie or TV Show Name Help": "Enter the source title so AI can learn the work's background, analyze what the clip is about, then generate a more accurate narration script",
+    "Movie or TV Show Name Placeholder": "e.g. Breaking Bad, The Shawshank Redemption",
     "Video Type": "Video Type",
     "Select/Upload Script": "Select/Upload Script"
   }

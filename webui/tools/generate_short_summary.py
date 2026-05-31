@@ -23,11 +23,11 @@ import app.services.llm  # 这会触发提供商注册
 from app.services.llm.migration_adapter import SubtitleAnalyzerAdapter
 
 
-def generate_script_short_sunmmary(params, subtitle_path, video_theme, temperature):
+def generate_script_short_sunmmary(params, subtitle_path, video_theme, temperature, require_media_name=False):
     """
-    生成 短剧解说 视频脚本
-    要求: 提供高质量短剧字幕
-    适合场景: 短剧
+    生成 短剧解说 / 智能混剪解说 视频脚本
+    要求: 提供高质量字幕
+    适合场景: 短剧、电影/电视剧混剪片段
     """
     progress_bar = st.progress(0)
     status_text = st.empty()
@@ -44,6 +44,10 @@ def generate_script_short_sunmmary(params, subtitle_path, video_theme, temperatu
             if not params.video_origin_path:
                 st.error("请先选择视频文件")
                 return
+            if require_media_name and not (video_theme or "").strip():
+                st.error("请先填写电影/电视剧名称，以便 AI 理解片段在整部作品中的内容")
+                return
+            media_name = (video_theme or "").strip()
             """
             1. 获取字幕
             """
@@ -72,13 +76,14 @@ def generate_script_short_sunmmary(params, subtitle_path, video_theme, temperatu
                 logger.info("使用新的LLM服务架构进行字幕分析")
                 analyzer = SubtitleAnalyzerAdapter(text_api_key, text_model, text_base_url, text_provider)
 
-                analysis_result = analyzer.analyze_subtitle(subtitle_content)
+                analysis_result = analyzer.analyze_subtitle(subtitle_content, drama_name=media_name)
 
             except Exception as e:
                 logger.warning(f"使用新LLM服务失败，回退到旧实现: {str(e)}")
                 # 回退到旧的实现
                 analysis_result = analyze_subtitle(
                     subtitle_file_path=subtitle_path,
+                    drama_name=media_name,
                     api_key=text_api_key,
                     model=text_model,
                     base_url=text_base_url,
@@ -98,7 +103,7 @@ def generate_script_short_sunmmary(params, subtitle_path, video_theme, temperatu
                     # 优先使用新的LLM服务架构
                     logger.info("使用新的LLM服务架构生成解说文案")
                     narration_result = analyzer.generate_narration_script(
-                        short_name=video_theme,
+                        short_name=media_name,
                         plot_analysis=analysis_result["analysis"],
                         subtitle_content=subtitle_content,  # 传递原始字幕内容
                         temperature=temperature
@@ -107,7 +112,7 @@ def generate_script_short_sunmmary(params, subtitle_path, video_theme, temperatu
                     logger.warning(f"使用新LLM服务失败，回退到旧实现: {str(e)}")
                     # 回退到旧的实现
                     narration_result = generate_narration_script(
-                        short_name=video_theme,
+                        short_name=media_name,
                         plot_analysis=analysis_result["analysis"],
                         subtitle_content=subtitle_content,  # 传递原始字幕内容
                         api_key=text_api_key,

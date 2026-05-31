@@ -172,6 +172,10 @@
     "BGM Mood Emotional": "情感叙事",
     "BGM Mood Action": "动作节奏",
     "BGM Mood Comedy": "轻松搞笑",
+    "Short Drama Name": "短剧名称",
+    "Movie or TV Show Name": "电影/电视剧名称",
+    "Movie or TV Show Name Help": "填写原片名称，AI 将先了解该作品背景，再结合字幕分析片段在讲什么内容，最后生成更准确的解说脚本",
+    "Movie or TV Show Name Placeholder": "例如：狂飙、肖申克的救赎",
     "Video Type": "视频类型",
     "Select/Upload Script": "选择/上传脚本"
   }

@@ -305,7 +305,7 @@ def render_enhanced_mix_options(tr):
     st.info(
         tr("Enhanced Mix Mode Description")
     )
-    short_drama_summary(tr)
+    short_drama_summary(tr, script_mode="enhanced")
 
     if st.session_state.get("subtitle_path"):
         st.session_state["source_subtitle_path"] = st.session_state["subtitle_path"]
@@ -367,8 +367,8 @@ def render_video_details(tr):
     return video_theme, custom_prompt
 
 
-def short_drama_summary(tr):
-    """短剧解说 渲染视频主题和提示词"""
+def short_drama_summary(tr, script_mode="summary"):
+    """短剧解说 / 智能混剪解说：渲染字幕上传与作品名称"""
     # 检查是否已经处理过字幕文件
     if 'subtitle_file_processed' not in st.session_state:
         st.session_state['subtitle_file_processed'] = False
@@ -441,8 +441,19 @@ def short_drama_summary(tr):
         except Exception as e:
             st.error(f"{tr('Upload failed')}: {str(e)}")
 
-    # 名称输入框
-    video_theme = st.text_input(tr("短剧名称"))
+    # 作品名称输入框
+    if script_mode == "enhanced":
+        video_theme = st.text_input(
+            tr("Movie or TV Show Name"),
+            value=st.session_state.get("video_theme", ""),
+            help=tr("Movie or TV Show Name Help"),
+            placeholder=tr("Movie or TV Show Name Placeholder"),
+        )
+    else:
+        video_theme = st.text_input(
+            tr("Short Drama Name"),
+            value=st.session_state.get("video_theme", ""),
+        )
     st.session_state['video_theme'] = video_theme
     # 数字输入框
     temperature = st.slider("temperature", 0.0, 2.0, 0.7)

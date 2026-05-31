@@ -12,6 +12,7 @@ from loguru import logger
 from .manager import LLMServiceManager
 from .validators import OutputValidator
 from .exceptions import LLMServiceError
+from app.services.prompts import PromptManager
 
 # 提供商注册由 webui.py:main() 显式调用（见 LLM 提供商注册机制重构）
 # 这样更可靠，错误也更容易调试
@@ -160,6 +161,7 @@ class UnifiedLLMService:
     
     @staticmethod
     async def analyze_subtitle(subtitle_content: str,
+                             drama_name: str = "",
                              provider: Optional[str] = None,
                              temperature: float = 1.0,
                              validate_output: bool = True,
@@ -169,6 +171,7 @@ class UnifiedLLMService:
         
         Args:
             subtitle_content: 字幕内容
+            drama_name: 电影/电视剧名称，用于结合作品背景理解片段内容
             provider: 文本模型提供商名称
             temperature: 生成温度
             validate_output: 是否验证输出格式
@@ -181,12 +184,19 @@ class UnifiedLLMService:
             LLMServiceError: 服务调用失败时抛出
         """
         try:
-            # 构建分析提示词
-            system_prompt = "你是一位专业的剧本分析师和剧情概括助手。请仔细分析字幕内容，提取关键剧情信息。"
+            prompt = PromptManager.get_prompt(
+                category="short_drama_narration",
+                name="plot_analysis",
+                parameters={
+                    "drama_name": drama_name or "未知作品",
+                    "subtitle_content": subtitle_content,
+                },
+            )
+            system_prompt = "你是一位专业的剧本分析师和剧情概括助手。请仔细分析字幕内容，结合影视作品背景提取关键剧情信息。"
             
             # 生成分析结果
             result = await UnifiedLLMService.generate_text(
-                prompt=subtitle_content,
+                prompt=prompt,
                 system_prompt=system_prompt,
                 provider=provider,
                 temperature=temperature,

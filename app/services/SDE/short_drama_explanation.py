@@ -76,12 +76,13 @@ class SubtitleAnalyzer:
             logger.error(f"初始化请求头失败: {str(e)}")
             raise
     
-    def analyze_subtitle(self, subtitle_content: str) -> Dict[str, Any]:
+    def analyze_subtitle(self, subtitle_content: str, drama_name: str = "") -> Dict[str, Any]:
         """
         分析字幕内容
 
         Args:
             subtitle_content: 字幕内容文本
+            drama_name: 电影/电视剧名称
 
         Returns:
             Dict[str, Any]: 包含分析结果的字典
@@ -90,13 +91,17 @@ class SubtitleAnalyzer:
             # 构建完整提示词
             if self.custom_prompt:
                 # 使用自定义提示词
-                prompt = f"{self.custom_prompt}\n\n{subtitle_content}"
+                header = f"作品名称：{drama_name}\n\n" if drama_name else ""
+                prompt = f"{self.custom_prompt}\n\n{header}{subtitle_content}"
             else:
                 # 使用新的提示词管理系统，正确传入参数
                 prompt = PromptManager.get_prompt(
                     category="short_drama_narration",
                     name="plot_analysis",
-                    parameters={"subtitle_content": subtitle_content}
+                    parameters={
+                        "drama_name": drama_name or "未知作品",
+                        "subtitle_content": subtitle_content,
+                    },
                 )
 
             if self.is_native_gemini:
@@ -290,12 +295,13 @@ class SubtitleAnalyzer:
                 "temperature": self.temperature
             }
     
-    def analyze_subtitle_from_file(self, subtitle_file_path: str) -> Dict[str, Any]:
+    def analyze_subtitle_from_file(self, subtitle_file_path: str, drama_name: str = "") -> Dict[str, Any]:
         """
         从文件读取字幕并分析
         
         Args:
             subtitle_file_path: 字幕文件的路径
+            drama_name: 电影/电视剧名称
             
         Returns:
             Dict[str, Any]: 包含分析结果的字典
@@ -319,7 +325,7 @@ class SubtitleAnalyzer:
                 }
             
             # 分析字幕
-            return self.analyze_subtitle(subtitle_content)
+            return self.analyze_subtitle(subtitle_content, drama_name=drama_name)
             
         except Exception as e:
             logger.error(f"从文件读取字幕并分析过程中发生错误: {str(e)}")
@@ -625,6 +631,7 @@ class SubtitleAnalyzer:
 def analyze_subtitle(
         subtitle_content: str = None,
         subtitle_file_path: str = None,
+        drama_name: str = "",
         api_key: Optional[str] = None,
         model: Optional[str] = None,
         base_url: Optional[str] = None,
@@ -640,6 +647,7 @@ def analyze_subtitle(
     Args:
         subtitle_content: 字幕内容文本
         subtitle_file_path: 字幕文件路径
+        drama_name: 电影/电视剧名称
         custom_prompt: 自定义提示词
         api_key: API密钥
         model: 模型名称
@@ -664,9 +672,9 @@ def analyze_subtitle(
     logger.debug(f"使用模型: {analyzer.model} 开始分析, 温度: {analyzer.temperature}")
     # 分析字幕
     if subtitle_content:
-        result = analyzer.analyze_subtitle(subtitle_content)
+        result = analyzer.analyze_subtitle(subtitle_content, drama_name=drama_name)
     elif subtitle_file_path:
-        result = analyzer.analyze_subtitle_from_file(subtitle_file_path)
+        result = analyzer.analyze_subtitle_from_file(subtitle_file_path, drama_name=drama_name)
     else:
         return {
             "status": "error",

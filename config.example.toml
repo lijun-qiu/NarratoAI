@@ -157,6 +157,10 @@
     doubaotts_voice_type = "BV700_V2_streaming"
     doubaotts_rate = 1.0
 
+    # 字幕位置（top / center / bottom / custom）
+    subtitle_position = "custom"
+    custom_position = 60.0
+
 ##########################################
 # 代理和网络配置
 ##########################################

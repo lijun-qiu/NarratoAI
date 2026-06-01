@@ -162,6 +162,9 @@
     "Batch Size": "批处理大小",
     "Batch Size (More keyframes consume more tokens)": "批处理大小, 每批处理越少消耗 token 越多",
     "Short Drama Summary": "短剧解说",
+    "Film TV Narration": "影视解说",
+    "Film Title": "影视作品名称",
+    "Generate Film TV Script": "生成影视解说脚本",
     "Video Type": "视频类型",
     "Select/Upload Script": "选择/上传脚本"
   }

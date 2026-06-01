@@ -89,8 +89,8 @@ def merge_materials(
             - subtitle_font_size: 字幕字体大小，默认40
             - subtitle_color: 字幕颜色，默认白色
             - subtitle_bg_color: 字幕背景颜色，默认透明
-            - subtitle_position: 字幕位置，可选值'bottom', 'top', 'center'，默认'bottom'
-            - custom_position: 自定义位置
+            - subtitle_position: 字幕位置，可选值'bottom', 'top', 'center', 'custom'，默认'custom'
+            - custom_position: 自定义位置（距顶部百分比），默认60
             - stroke_color: 描边颜色，默认黑色
             - stroke_width: 描边宽度，默认1
             - threads: 处理线程数，默认2
@@ -114,8 +114,8 @@ def merge_materials(
     subtitle_font_size = options.get('subtitle_font_size', 40)
     subtitle_color = options.get('subtitle_color', '#FFFFFF')
     subtitle_bg_color = options.get('subtitle_bg_color', 'transparent')
-    subtitle_position = options.get('subtitle_position', 'bottom')
-    custom_position = options.get('custom_position', 70)
+    subtitle_position = options.get('subtitle_position', 'custom')
+    custom_position = options.get('custom_position', 60)
     stroke_color = options.get('stroke_color', '#000000')
     stroke_width = options.get('stroke_width', 1)
     threads = options.get('threads', 2)
@@ -492,7 +492,8 @@ if __name__ == '__main__':
         'subtitle_font_size': 40,
         'subtitle_color': '#FFFFFF',
         'subtitle_bg_color': None,      # 直接使用None表示透明背景
-        'subtitle_position': 'bottom',
+        'subtitle_position': 'custom',
+        'custom_position': 60,
         'threads': 2
     }
     

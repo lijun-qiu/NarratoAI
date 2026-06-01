@@ -22,6 +22,19 @@ from app.services.prompts import PromptManager
 
 class SubtitleAnalyzer:
     """字幕剧情分析器，负责分析字幕内容并提取关键剧情段落"""
+
+    PROMPT_CATEGORIES = {
+        "short_drama_narration": {
+            "name_field": "drama_name",
+            "analysis_system": "你是一位专业的剧本分析师和剧情概括助手。请严格按照要求的格式输出分析结果。",
+            "script_system": "你是一位专业的短视频解说脚本撰写专家。你必须严格按照JSON格式输出，不能包含任何其他文字、说明或代码块标记。",
+        },
+        "film_tv_narration": {
+            "name_field": "film_name",
+            "analysis_system": "你是一位专业的影视剧本分析师，擅长分析电影和电视剧字幕。请严格按照要求的格式输出分析结果。",
+            "script_system": "你是一位资深的影视解说创作者。你必须严格按照JSON格式输出，不能包含任何其他文字、说明或代码块标记。",
+        },
+    }
     
     def __init__(
         self,
@@ -31,6 +44,7 @@ class SubtitleAnalyzer:
         custom_prompt: Optional[str] = None,
         temperature: Optional[float] = 1.0,
         provider: Optional[str] = None,
+        prompt_category: str = "short_drama_narration",
     ):
         """
         初始化字幕分析器
@@ -42,6 +56,7 @@ class SubtitleAnalyzer:
             custom_prompt: 自定义提示词，如果不提供则使用默认值
             temperature: 模型温度
             provider: 提供商类型，用于确定API调用格式
+            prompt_category: 提示词分类（short_drama_narration / film_tv_narration）
         """
         # 使用传入的参数或从配置中获取
         self.api_key = api_key
@@ -49,6 +64,7 @@ class SubtitleAnalyzer:
         self.base_url = base_url
         self.temperature = temperature
         self.provider = provider or self._detect_provider()
+        self.prompt_category = prompt_category if prompt_category in self.PROMPT_CATEGORIES else "short_drama_narration"
 
         # 设置自定义提示词（如果提供）
         self.custom_prompt = custom_prompt
@@ -58,6 +74,23 @@ class SubtitleAnalyzer:
 
         # 初始化HTTP请求所需的头信息
         self._init_headers()
+
+    def _get_category_config(self) -> Dict[str, str]:
+        return self.PROMPT_CATEGORIES[self.prompt_category]
+
+    def _build_script_generation_parameters(
+        self,
+        work_name: str,
+        plot_analysis: str,
+        subtitle_content: str,
+    ) -> Dict[str, str]:
+        config = self._get_category_config()
+        parameters = {
+            config["name_field"]: work_name,
+            "plot_analysis": plot_analysis,
+            "subtitle_content": subtitle_content,
+        }
+        return parameters
 
     def _detect_provider(self):
         """根据配置自动检测提供商类型"""
@@ -94,7 +127,7 @@ class SubtitleAnalyzer:
             else:
                 # 使用新的提示词管理系统，正确传入参数
                 prompt = PromptManager.get_prompt(
-                    category="short_drama_narration",
+                    category=self.prompt_category,
                     name="plot_analysis",
                     parameters={"subtitle_content": subtitle_content}
                 )
@@ -120,7 +153,7 @@ class SubtitleAnalyzer:
             # 构建原生Gemini API请求数据
             payload = {
                 "systemInstruction": {
-                    "parts": [{"text": "你是一位专业的剧本分析师和剧情概括助手。请严格按照要求的格式输出分析结果。"}]
+                    "parts": [{"text": self._get_category_config()["analysis_system"]}]
                 },
                 "contents": [{
                     "parts": [{"text": prompt}]
@@ -379,21 +412,20 @@ class SubtitleAnalyzer:
         try:
             # 使用新的提示词管理系统构建提示词
             prompt = PromptManager.get_prompt(
-                category="short_drama_narration",
+                category=self.prompt_category,
                 name="script_generation",
-                parameters={
-                    "drama_name": short_name,
-                    "plot_analysis": plot_analysis,
-                    "subtitle_content": subtitle_content
-                }
+                parameters=self._build_script_generation_parameters(
+                    short_name, plot_analysis, subtitle_content
+                ),
             )
 
+            script_system = self._get_category_config()["script_system"]
             if self.is_native_gemini:
                 # 使用原生Gemini API格式
-                return self._generate_narration_with_native_gemini(prompt, temperature)
+                return self._generate_narration_with_native_gemini(prompt, temperature, script_system)
             else:
                 # 使用OpenAI兼容格式
-                return self._generate_narration_with_openai_compatible(prompt, temperature)
+                return self._generate_narration_with_openai_compatible(prompt, temperature, script_system)
 
         except Exception as e:
             logger.error(f"解说文案生成过程中发生错误: {str(e)}")
@@ -403,16 +435,20 @@ class SubtitleAnalyzer:
                 "temperature": self.temperature
             }
 
-    def _generate_narration_with_native_gemini(self, prompt: str, temperature: float) -> Dict[str, Any]:
+    def _generate_narration_with_native_gemini(
+        self, prompt: str, temperature: float, script_system: Optional[str] = None
+    ) -> Dict[str, Any]:
         """使用原生Gemini API生成解说文案"""
         try:
+            if script_system is None:
+                script_system = self._get_category_config()["script_system"]
             # 构建原生Gemini API请求数据
             # 为了确保JSON输出，在提示词中添加更强的约束
             enhanced_prompt = f"{prompt}\n\n请确保输出严格的JSON格式，不要包含任何其他文字或标记。"
 
             payload = {
                 "systemInstruction": {
-                    "parts": [{"text": "你是一位专业的短视频解说脚本撰写专家。你必须严格按照JSON格式输出，不能包含任何其他文字、说明或代码块标记。"}]
+                    "parts": [{"text": script_system}]
                 },
                 "contents": [{
                     "parts": [{"text": enhanced_prompt}]
@@ -523,14 +559,18 @@ class SubtitleAnalyzer:
                 "temperature": temperature
             }
 
-    def _generate_narration_with_openai_compatible(self, prompt: str, temperature: float) -> Dict[str, Any]:
+    def _generate_narration_with_openai_compatible(
+        self, prompt: str, temperature: float, script_system: Optional[str] = None
+    ) -> Dict[str, Any]:
         """使用OpenAI兼容API生成解说文案"""
         try:
+            if script_system is None:
+                script_system = self._get_category_config()["script_system"]
             # 构建OpenAI格式的请求数据
             payload = {
                 "model": self.model,
                 "messages": [
-                    {"role": "system", "content": "你是一位专业的短视频解说脚本撰写专家。"},
+                    {"role": "system", "content": script_system},
                     {"role": "user", "content": prompt}
                 ],
                 "temperature": temperature
@@ -632,7 +672,8 @@ def analyze_subtitle(
         temperature: float = 1.0,
         save_result: bool = False,
         output_path: Optional[str] = None,
-        provider: Optional[str] = None
+        provider: Optional[str] = None,
+        prompt_category: str = "short_drama_narration",
 ) -> Dict[str, Any]:
     """
     分析字幕内容的便捷函数
@@ -659,7 +700,8 @@ def analyze_subtitle(
         model=model,
         base_url=base_url,
         custom_prompt=custom_prompt,
-        provider=provider
+        provider=provider,
+        prompt_category=prompt_category,
     )
     logger.debug(f"使用模型: {analyzer.model} 开始分析, 温度: {analyzer.temperature}")
     # 分析字幕
@@ -691,7 +733,8 @@ def generate_narration_script(
     temperature: float = 1.0,
     save_result: bool = False,
     output_path: Optional[str] = None,
-    provider: Optional[str] = None
+    provider: Optional[str] = None,
+    prompt_category: str = "short_drama_narration",
 ) -> Dict[str, Any]:
     """
     根据剧情分析生成解说文案的便捷函数
@@ -707,6 +750,7 @@ def generate_narration_script(
         save_result: 是否保存结果到文件
         output_path: 输出文件路径
         provider: 提供商类型
+        prompt_category: 提示词分类（short_drama_narration / film_tv_narration）
 
     Returns:
         Dict[str, Any]: 包含生成结果的字典
@@ -717,7 +761,8 @@ def generate_narration_script(
         api_key=api_key,
         model=model,
         base_url=base_url,
-        provider=provider
+        provider=provider,
+        prompt_category=prompt_category,
     )
     
     # 生成解说文案

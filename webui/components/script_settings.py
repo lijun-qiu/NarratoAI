@@ -13,6 +13,7 @@ from app.utils import utils, check_script
 from webui.tools.generate_script_docu import generate_script_docu
 from webui.tools.generate_script_short import generate_script_short
 from webui.tools.generate_short_summary import generate_script_short_sunmmary
+from webui.tools.generate_film_tv_summary import generate_script_film_tv_summary
 
 
 def render_script_panel(tr):
@@ -40,6 +41,9 @@ def render_script_panel(tr):
         elif script_path == "summary":
             # 短剧解说
             short_drama_summary(tr)
+        elif script_path == "film_tv":
+            # 影视解说
+            film_tv_narration(tr)
         else:
             # 默认为空
             pass
@@ -55,6 +59,7 @@ def render_script_file(tr, params):
     MODE_AUTO = "auto"
     MODE_SHORT = "short"
     MODE_SUMMARY = "summary"
+    MODE_FILM_TV = "film_tv"
 
     # 处理保存脚本后的模式切换（必须在 widget 实例化之前）
     if st.session_state.get('_switch_to_file_mode'):
@@ -67,6 +72,7 @@ def render_script_file(tr, params):
         tr("Auto Generate"): MODE_AUTO,
         tr("Short Generate"): MODE_SHORT,
         tr("Short Drama Summary"): MODE_SUMMARY,
+        tr("Film TV Narration"): MODE_FILM_TV,
     }
     
     # 获取当前状态
@@ -82,6 +88,10 @@ def render_script_file(tr, params):
         default_index = mode_keys.index(tr("Short Generate"))
     elif current_path == "summary":
         default_index = mode_keys.index(tr("Short Drama Summary"))
+    elif current_path == "film_tv":
+        default_index = mode_keys.index(tr("Film TV Narration"))
+    elif not current_path:
+        default_index = mode_keys.index(tr("Film TV Narration"))
     else:
         default_index = mode_keys.index(tr("Select/Upload Script"))
 
@@ -146,7 +156,7 @@ def render_script_file(tr, params):
 
         # 找到保存的脚本文件在列表中的索引
         # 如果当前path是特殊值(auto/short/summary)，则重置为空
-        saved_script_path = current_path if current_path not in [MODE_AUTO, MODE_SHORT, MODE_SUMMARY] else ""
+        saved_script_path = current_path if current_path not in [MODE_AUTO, MODE_SHORT, MODE_SUMMARY, MODE_FILM_TV] else ""
         
         selected_index = 0
         for i, (_, path) in enumerate(script_list):
@@ -324,6 +334,16 @@ def render_video_details(tr):
 
 def short_drama_summary(tr):
     """短剧解说 渲染视频主题和提示词"""
+    return render_subtitle_narration_panel(tr, work_name_label="短剧名称", uploader_key="subtitle_file_uploader")
+
+
+def film_tv_narration(tr):
+    """影视解说 渲染视频主题和提示词"""
+    return render_subtitle_narration_panel(tr, work_name_label="Film Title", uploader_key="film_tv_subtitle_uploader")
+
+
+def render_subtitle_narration_panel(tr, work_name_label: str, uploader_key: str):
+    """字幕解说类模式共用面板（短剧解说 / 影视解说）"""
     # 检查是否已经处理过字幕文件
     if 'subtitle_file_processed' not in st.session_state:
         st.session_state['subtitle_file_processed'] = False
@@ -334,7 +354,7 @@ def short_drama_summary(tr):
         tr("上传字幕文件"),
         type=["srt"],
         accept_multiple_files=False,
-        key="subtitle_file_uploader"  # 添加唯一key
+        key=uploader_key
     )
     
     # 显示当前已上传的字幕文件路径
@@ -395,7 +415,7 @@ def short_drama_summary(tr):
             st.error(f"{tr('Upload failed')}: {str(e)}")
 
     # 名称输入框
-    video_theme = st.text_input(tr("短剧名称"))
+    video_theme = st.text_input(tr(work_name_label))
     st.session_state['video_theme'] = video_theme
     # 数字输入框
     temperature = st.slider("temperature", 0.0, 2.0, 0.7)
@@ -504,6 +524,8 @@ def render_script_buttons(tr, params):
         button_name = tr("Generate Short Video Script")
     elif script_path == "summary":
         button_name = tr("生成短剧解说脚本")
+    elif script_path == "film_tv":
+        button_name = tr("Generate Film TV Script")
     elif script_path.endswith("json"):
         button_name = tr("Load Video Script")
     else:
@@ -523,6 +545,12 @@ def render_script_buttons(tr, params):
             video_theme = st.session_state.get('video_theme')
             temperature = st.session_state.get('temperature')
             generate_script_short_sunmmary(params, subtitle_path, video_theme, temperature)
+        elif script_path == "film_tv":
+            # 执行 影视解说 脚本生成
+            subtitle_path = st.session_state.get('subtitle_path')
+            video_theme = st.session_state.get('video_theme')
+            temperature = st.session_state.get('temperature')
+            generate_script_film_tv_summary(params, subtitle_path, video_theme, temperature)
         else:
             load_script(tr, script_path)
 

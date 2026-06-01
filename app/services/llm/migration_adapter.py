@@ -198,11 +198,39 @@ class VisionAnalyzerAdapter:
 class SubtitleAnalyzerAdapter:
     """字幕分析器适配器"""
 
-    def __init__(self, api_key: str, model: str, base_url: str, provider: str = None):
+    def __init__(
+        self,
+        api_key: str,
+        model: str,
+        base_url: str,
+        provider: str = None,
+        prompt_category: str = "short_drama_narration",
+    ):
         self.api_key = api_key
         self.model = model
         self.base_url = base_url
         self.provider = provider or "openai"
+        self.prompt_category = prompt_category
+
+    def _get_category_config(self) -> Dict[str, str]:
+        from app.services.SDE.short_drama_explanation import SubtitleAnalyzer
+        return SubtitleAnalyzer.PROMPT_CATEGORIES.get(
+            self.prompt_category,
+            SubtitleAnalyzer.PROMPT_CATEGORIES["short_drama_narration"],
+        )
+
+    def _build_script_generation_parameters(
+        self,
+        work_name: str,
+        plot_analysis: str,
+        subtitle_content: str,
+    ) -> Dict[str, str]:
+        config = self._get_category_config()
+        return {
+            config["name_field"]: work_name,
+            "plot_analysis": plot_analysis,
+            "subtitle_content": subtitle_content,
+        }
 
     def _run_async_safely(self, coro_func, *args, **kwargs):
         """安全地运行异步协程"""
@@ -237,19 +265,24 @@ class SubtitleAnalyzerAdapter:
             分析结果字典
         """
         try:
-            # 使用统一服务分析字幕
+            prompt = PromptManager.get_prompt(
+                category=self.prompt_category,
+                name="plot_analysis",
+                parameters={"subtitle_content": subtitle_content},
+            )
             result = self._run_async_safely(
-                UnifiedLLMService.analyze_subtitle,
-                subtitle_content=subtitle_content,
+                UnifiedLLMService.generate_text,
+                prompt=prompt,
+                system_prompt=self._get_category_config()["analysis_system"],
                 provider=self.provider,
                 temperature=1.0,
                 api_key=self.api_key,
-                api_base=self.base_url
+                api_base=self.base_url,
             )
             
             return {
                 "status": "success",
-                "analysis": result,
+                "analysis": result.strip(),
                 "model": self.model,
                 "temperature": 1.0
             }
@@ -278,20 +311,18 @@ class SubtitleAnalyzerAdapter:
         try:
             # 使用新的提示词管理系统构建提示词
             prompt = PromptManager.get_prompt(
-                category="short_drama_narration",
+                category=self.prompt_category,
                 name="script_generation",
-                parameters={
-                    "drama_name": short_name,
-                    "plot_analysis": plot_analysis,
-                    "subtitle_content": subtitle_content
-                }
+                parameters=self._build_script_generation_parameters(
+                    short_name, plot_analysis, subtitle_content
+                ),
             )
             
             # 使用统一服务生成文案
             result = self._run_async_safely(
                 UnifiedLLMService.generate_text,
                 prompt=prompt,
-                system_prompt="你是一位专业的短视频解说脚本撰写专家。",
+                system_prompt=self._get_category_config()["script_system"],
                 provider=self.provider,
                 temperature=temperature,
                 response_format="json",

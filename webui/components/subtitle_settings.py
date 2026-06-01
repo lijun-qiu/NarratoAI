@@ -101,21 +101,27 @@ def render_position_settings(tr):
         (tr("Custom"), "custom"),
     ]
 
+    saved_subtitle_position = config.ui.get("subtitle_position", "custom")
+    position_values = [p[1] for p in subtitle_positions]
+    default_index = position_values.index(saved_subtitle_position) if saved_subtitle_position in position_values else 3
+
     selected_index = st.selectbox(
         tr("Position"),
-        index=2,
+        index=default_index,
         options=range(len(subtitle_positions)),
         format_func=lambda x: subtitle_positions[x][0],
     )
 
     subtitle_position = subtitle_positions[selected_index][1]
     st.session_state['subtitle_position'] = subtitle_position
+    config.ui["subtitle_position"] = subtitle_position
 
     # 自定义位置处理
     if subtitle_position == "custom":
+        saved_custom_position = config.ui.get("custom_position", 60.0)
         custom_position = st.text_input(
             tr("Custom Position (% from top)"),
-            value="70.0"
+            value=str(saved_custom_position),
         )
         try:
             custom_position_value = float(custom_position)
@@ -123,6 +129,7 @@ def render_position_settings(tr):
                 st.error(tr("Please enter a value between 0 and 100"))
             else:
                 st.session_state['custom_position'] = custom_position_value
+                config.ui["custom_position"] = custom_position_value
         except ValueError:
             st.error(tr("Please enter a valid number"))
 
@@ -157,8 +164,12 @@ def get_subtitle_params():
         'font_name': font_name,
         'font_size': st.session_state.get('font_size', 60),
         'text_fore_color': st.session_state.get('text_fore_color', '#FFFFFF'),
-        'subtitle_position': st.session_state.get('subtitle_position', 'bottom'),
-        'custom_position': st.session_state.get('custom_position', 70.0),
+        'subtitle_position': st.session_state.get(
+            'subtitle_position', config.ui.get('subtitle_position', 'custom')
+        ),
+        'custom_position': st.session_state.get(
+            'custom_position', config.ui.get('custom_position', 60.0)
+        ),
         'stroke_color': st.session_state.get('stroke_color', '#000000'),
         'stroke_width': st.session_state.get('stroke_width', 1.5),
     }

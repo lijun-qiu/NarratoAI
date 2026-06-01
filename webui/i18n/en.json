@@ -86,6 +86,20 @@
     "Hide Log": "Hide Log",
     "Upload Local Files": "Upload Local Files",
     "File Uploaded Successfully": "File Uploaded Successfully",
-    "Frame Interval (seconds)": "Frame Interval (seconds) (More keyframes consume more tokens)"
+    "Frame Interval (seconds)": "Frame Interval (seconds) (More keyframes consume more tokens)",
+    "Short Generate": "Short Drama Editing",
+    "Generate Short Video Script": "Generate Short Drama Editing Script",
+    "Short Drama Summary": "Short Drama Narration",
+    "Film TV Narration": "Film & TV Narration",
+    "Film Title": "Film / TV Title",
+    "Generate Film TV Script": "Generate Film & TV Narration Script",
+    "Video Type": "Video Type",
+    "Select/Upload Script": "Select / Upload Script",
+    "Generate Video Script": "Generate Frame Narration Script",
+    "Load Video Script": "Load Video Script",
+    "Please Select Script File": "Please Select Script File",
+    "Video Theme": "Video Theme",
+    "Generation Prompt": "Custom Prompt",
+    "Upload Script": "Upload Script"
   }
 }

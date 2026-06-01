@@ -15,8 +15,10 @@ import streamlit as st
 from loguru import logger
 
 from app.config import config
-from app.services.SDE.short_drama_explanation import analyze_subtitle, generate_narration_script
+from app.services.SDE.short_drama_explanation import analyze_subtitle, generate_narration_script, research_film_work
+from app.services.film_tv_script_optimizer import get_film_tv_script_prompt_params, optimize_film_tv_script
 from app.services.subtitle_text import read_subtitle_text
+from app.utils.video_processor import VideoProcessor
 import app.services.llm  # noqa: F401 — 触发 LLM 提供商注册
 from app.services.llm.migration_adapter import SubtitleAnalyzerAdapter
 from webui.tools.generate_short_summary import parse_and_fix_json
@@ -60,20 +62,69 @@ def generate_script_film_tv_summary(params, subtitle_path, video_theme, temperat
                 st.error("字幕文件内容为空或无法读取")
                 return
 
-            if not (video_theme or "").strip():
-                st.warning("建议填写影视作品名称，有助于生成更准确的解说文案")
+            source_duration_sec = 0.0
+            try:
+                source_duration_sec = VideoProcessor(params.video_origin_path).duration
+                logger.info(f"原片时长: {source_duration_sec:.1f} 秒")
+            except Exception as e:
+                logger.warning(f"无法读取原片时长: {e}")
 
+            script_extra_params = get_film_tv_script_prompt_params(source_duration_sec)
+
+            film_name = (video_theme or "").strip()
+            if not film_name:
+                st.error("请先填写影视作品名称（剧名/片名），AI 需要先调研作品背景再生成脚本")
+                return
+
+            work_brief = ""
             analyzer = None
             try:
-                logger.info("使用 LLM 服务进行影视字幕分析")
+                logger.info(f"开始调研作品：《{film_name}》")
+                update_progress(15, f"专家剪辑师正在调研《{film_name}》...")
                 analyzer = SubtitleAnalyzerAdapter(
                     text_api_key,
                     text_model,
                     text_base_url,
                     text_provider,
                     prompt_category=PROMPT_CATEGORY,
+                    script_extra_params=script_extra_params,
                 )
-                analysis_result = analyzer.analyze_subtitle(subtitle_content)
+                brief_result = analyzer.research_work(film_name, temperature=temperature)
+            except Exception as e:
+                logger.warning(f"作品调研失败，回退到旧实现: {str(e)}")
+                brief_result = research_film_work(
+                    film_name,
+                    api_key=text_api_key,
+                    model=text_model,
+                    base_url=text_base_url,
+                    temperature=temperature,
+                    provider=text_provider,
+                )
+
+            if brief_result.get("status") == "success":
+                work_brief = brief_result["work_brief"]
+                logger.info(f"《{film_name}》作品调研完成")
+            else:
+                logger.warning(f"作品调研未成功: {brief_result.get('message', 'unknown')}，将继续仅依据字幕分析")
+                work_brief = "（作品调研未完成，请主要依据字幕内容分析）"
+
+            update_progress(35, "正在分析字幕...")
+            try:
+                if analyzer is None:
+                    analyzer = SubtitleAnalyzerAdapter(
+                        text_api_key,
+                        text_model,
+                        text_base_url,
+                        text_provider,
+                        prompt_category=PROMPT_CATEGORY,
+                        script_extra_params=script_extra_params,
+                    )
+                logger.info("使用 LLM 服务进行影视字幕分析")
+                analysis_result = analyzer.analyze_subtitle(
+                    subtitle_content,
+                    film_name=film_name,
+                    work_brief=work_brief,
+                )
             except Exception as e:
                 logger.warning(f"使用新 LLM 服务失败，回退到旧实现: {str(e)}")
                 analysis_result = analyze_subtitle(
@@ -85,6 +136,8 @@ def generate_script_film_tv_summary(params, subtitle_path, video_theme, temperat
                     temperature=temperature,
                     provider=text_provider,
                     prompt_category=PROMPT_CATEGORY,
+                    film_name=film_name,
+                    work_brief=work_brief,
                 )
 
             if analysis_result["status"] != "success":
@@ -93,23 +146,24 @@ def generate_script_film_tv_summary(params, subtitle_path, video_theme, temperat
                 st.stop()
 
             logger.info("影视字幕分析成功")
-            update_progress(60, "正在生成解说文案...")
+            update_progress(60, "专家剪辑师正在生成精剪脚本...")
 
             narration_result = None
             if analyzer is not None:
                 try:
                     narration_result = analyzer.generate_narration_script(
-                        short_name=video_theme or "未命名影视作品",
+                        short_name=film_name,
                         plot_analysis=analysis_result["analysis"],
                         subtitle_content=subtitle_content,
                         temperature=temperature,
+                        work_brief=work_brief,
                     )
                 except Exception as e:
                     logger.warning(f"解说文案生成失败，回退到旧实现: {str(e)}")
 
             if narration_result is None or narration_result.get("status") != "success":
                 narration_result = generate_narration_script(
-                    short_name=video_theme or "未命名影视作品",
+                    short_name=film_name,
                     plot_analysis=analysis_result["analysis"],
                     subtitle_content=subtitle_content,
                     api_key=text_api_key,
@@ -119,6 +173,8 @@ def generate_script_film_tv_summary(params, subtitle_path, video_theme, temperat
                     temperature=temperature,
                     provider=text_provider,
                     prompt_category=PROMPT_CATEGORY,
+                    script_extra_params=script_extra_params,
+                    work_brief=work_brief,
                 )
 
             if narration_result["status"] != "success":
@@ -134,6 +190,13 @@ def generate_script_film_tv_summary(params, subtitle_path, video_theme, temperat
             if "items" not in narration_dict:
                 st.error("生成的解说文案缺少必要的 'items' 字段")
                 st.stop()
+
+            optimized_items = optimize_film_tv_script(
+                narration_dict["items"],
+                subtitle_content=subtitle_content,
+                source_duration_sec=source_duration_sec or None,
+            )
+            narration_dict["items"] = optimized_items
 
             script = json.dumps(narration_dict["items"], ensure_ascii=False, indent=2)
             st.session_state["video_clip_json"] = json.loads(script)

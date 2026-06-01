@@ -31,8 +31,18 @@ class SubtitleAnalyzer:
         },
         "film_tv_narration": {
             "name_field": "film_name",
-            "analysis_system": "你是一位专业的影视剧本分析师，擅长分析电影和电视剧字幕。请严格按照要求的格式输出分析结果。",
-            "script_system": "你是一位资深的影视解说创作者。你必须严格按照JSON格式输出，不能包含任何其他文字、说明或代码块标记。",
+            "work_brief_system": (
+                "你是一位拥有十年以上经验的专家级影视剪辑师与拉片达人，"
+                "熟悉中外影视的类型规律、叙事结构与观众心理。"
+            ),
+            "analysis_system": (
+                "你是一位专家级影视剪辑师兼剧本分析师，拥有十年以上精剪经验。"
+                "请结合作品调研与字幕内容，严格按照要求的格式输出剪辑分析结果。"
+            ),
+            "script_system": (
+                "你是一位专家级影视剪辑师，精通原声为主的高燃精剪风格。"
+                "你必须严格按照JSON格式输出，不能包含任何其他文字、说明或代码块标记。"
+            ),
         },
     }
     
@@ -45,6 +55,7 @@ class SubtitleAnalyzer:
         temperature: Optional[float] = 1.0,
         provider: Optional[str] = None,
         prompt_category: str = "short_drama_narration",
+        script_extra_params: Optional[Dict[str, str]] = None,
     ):
         """
         初始化字幕分析器
@@ -65,6 +76,7 @@ class SubtitleAnalyzer:
         self.temperature = temperature
         self.provider = provider or self._detect_provider()
         self.prompt_category = prompt_category if prompt_category in self.PROMPT_CATEGORIES else "short_drama_narration"
+        self.script_extra_params = script_extra_params or {}
 
         # 设置自定义提示词（如果提供）
         self.custom_prompt = custom_prompt
@@ -83,6 +95,7 @@ class SubtitleAnalyzer:
         work_name: str,
         plot_analysis: str,
         subtitle_content: str,
+        work_brief: str = "",
     ) -> Dict[str, str]:
         config = self._get_category_config()
         parameters = {
@@ -90,26 +103,103 @@ class SubtitleAnalyzer:
             "plot_analysis": plot_analysis,
             "subtitle_content": subtitle_content,
         }
+        if self.prompt_category == "film_tv_narration":
+            from app.services.film_tv_script_optimizer import get_film_tv_script_prompt_params
+            parameters.update(get_film_tv_script_prompt_params())
+            parameters["work_brief"] = work_brief or "（未提供作品调研简报）"
+        parameters.update(self.script_extra_params)
         return parameters
+
+    def research_work(self, film_name: str, temperature: float = 0.7) -> Dict[str, Any]:
+        """根据作品名称调研背景（影视解说专用）。"""
+        if self.prompt_category != "film_tv_narration":
+            return {"status": "skipped", "work_brief": ""}
+
+        if not (film_name or "").strip():
+            return {"status": "error", "message": "作品名称不能为空"}
+
+        try:
+            prompt = PromptManager.get_prompt(
+                category=self.prompt_category,
+                name="work_briefing",
+                parameters={"film_name": film_name.strip()},
+            )
+            category_config = self._get_category_config()
+            system_prompt = category_config.get(
+                "work_brief_system",
+                category_config["analysis_system"],
+            )
+
+            if self.is_native_gemini:
+                payload = {
+                    "systemInstruction": {"parts": [{"text": system_prompt}]},
+                    "contents": [{"parts": [{"text": prompt}]}],
+                    "generationConfig": {
+                        "temperature": temperature,
+                        "topK": 40,
+                        "topP": 0.95,
+                        "maxOutputTokens": 8192,
+                    },
+                }
+                url = f"{self.base_url}/models/{self.model}:generateContent"
+                response = requests.post(
+                    url,
+                    json=payload,
+                    headers={"Content-Type": "application/json", "x-goog-api-key": self.api_key},
+                    timeout=120,
+                )
+                if response.status_code != 200:
+                    return {"status": "error", "message": response.text}
+                data = response.json()
+                work_brief = data["candidates"][0]["content"]["parts"][0]["text"].strip()
+            else:
+                payload = {
+                    "model": self.model,
+                    "messages": [
+                        {"role": "system", "content": system_prompt},
+                        {"role": "user", "content": prompt},
+                    ],
+                    "temperature": temperature,
+                }
+                url = f"{self.base_url}/chat/completions"
+                response = requests.post(url, headers=self.headers, json=payload, timeout=120)
+                if response.status_code != 200:
+                    return {"status": "error", "message": response.text}
+                data = response.json()
+                work_brief = data["choices"][0]["message"]["content"].strip()
+
+            logger.info(f"《{film_name}》作品调研完成，约 {len(work_brief)} 字")
+            return {
+                "status": "success",
+                "work_brief": work_brief,
+                "film_name": film_name.strip(),
+                "temperature": temperature,
+            }
+        except Exception as e:
+            logger.error(f"作品调研失败: {str(e)}")
+            return {"status": "error", "message": str(e)}
 
     def _detect_provider(self):
         """根据配置自动检测提供商类型"""
         return config.app.get('text_llm_provider', 'gemini').lower()
-    
+
     def _init_headers(self):
         """初始化HTTP请求头"""
         try:
-            # 基础请求头，包含API密钥和内容类型
             self.headers = {
                 "Content-Type": "application/json",
                 "Authorization": f"Bearer {self.api_key}"
             }
-            # logger.debug(f"初始化成功 - API Key: {self.api_key[:8]}... - Base URL: {self.base_url}")
         except Exception as e:
             logger.error(f"初始化请求头失败: {str(e)}")
             raise
-    
-    def analyze_subtitle(self, subtitle_content: str) -> Dict[str, Any]:
+
+    def analyze_subtitle(
+        self,
+        subtitle_content: str,
+        film_name: str = "",
+        work_brief: str = "",
+    ) -> Dict[str, Any]:
         """
         分析字幕内容
 
@@ -125,18 +215,26 @@ class SubtitleAnalyzer:
                 # 使用自定义提示词
                 prompt = f"{self.custom_prompt}\n\n{subtitle_content}"
             else:
-                # 使用新的提示词管理系统，正确传入参数
-                prompt = PromptManager.get_prompt(
-                    category=self.prompt_category,
-                    name="plot_analysis",
-                    parameters={"subtitle_content": subtitle_content}
-                )
+                if self.prompt_category == "film_tv_narration":
+                    prompt = PromptManager.get_prompt(
+                        category=self.prompt_category,
+                        name="plot_analysis",
+                        parameters={
+                            "film_name": film_name or "未命名影视作品",
+                            "work_brief": work_brief or "（未提供作品调研，请仅依据字幕分析）",
+                            "subtitle_content": subtitle_content,
+                        },
+                    )
+                else:
+                    prompt = PromptManager.get_prompt(
+                        category=self.prompt_category,
+                        name="plot_analysis",
+                        parameters={"subtitle_content": subtitle_content},
+                    )
 
             if self.is_native_gemini:
-                # 使用原生Gemini API格式
                 return self._call_native_gemini_api(prompt)
             else:
-                # 使用OpenAI兼容格式
                 return self._call_openai_compatible_api(prompt)
 
         except Exception as e:
@@ -396,7 +494,14 @@ class SubtitleAnalyzer:
             logger.error(f"保存分析结果时发生错误: {str(e)}")
             return ""
 
-    def generate_narration_script(self, short_name: str, plot_analysis: str, subtitle_content: str = "", temperature: float = 0.7) -> Dict[str, Any]:
+    def generate_narration_script(
+        self,
+        short_name: str,
+        plot_analysis: str,
+        subtitle_content: str = "",
+        temperature: float = 0.7,
+        work_brief: str = "",
+    ) -> Dict[str, Any]:
         """
         根据剧情分析生成解说文案
 
@@ -415,7 +520,7 @@ class SubtitleAnalyzer:
                 category=self.prompt_category,
                 name="script_generation",
                 parameters=self._build_script_generation_parameters(
-                    short_name, plot_analysis, subtitle_content
+                    short_name, plot_analysis, subtitle_content, work_brief
                 ),
             )
 
@@ -662,6 +767,26 @@ class SubtitleAnalyzer:
             return ""
 
 
+def research_film_work(
+    film_name: str,
+    api_key: Optional[str] = None,
+    model: Optional[str] = None,
+    base_url: Optional[str] = None,
+    temperature: float = 0.7,
+    provider: Optional[str] = None,
+) -> Dict[str, Any]:
+    """根据作品名称调研背景（影视解说专用）。"""
+    analyzer = SubtitleAnalyzer(
+        temperature=temperature,
+        api_key=api_key,
+        model=model,
+        base_url=base_url,
+        provider=provider,
+        prompt_category="film_tv_narration",
+    )
+    return analyzer.research_work(film_name, temperature)
+
+
 def analyze_subtitle(
         subtitle_content: str = None,
         subtitle_file_path: str = None,
@@ -674,6 +799,8 @@ def analyze_subtitle(
         output_path: Optional[str] = None,
         provider: Optional[str] = None,
         prompt_category: str = "short_drama_narration",
+        film_name: str = "",
+        work_brief: str = "",
 ) -> Dict[str, Any]:
     """
     分析字幕内容的便捷函数
@@ -706,7 +833,7 @@ def analyze_subtitle(
     logger.debug(f"使用模型: {analyzer.model} 开始分析, 温度: {analyzer.temperature}")
     # 分析字幕
     if subtitle_content:
-        result = analyzer.analyze_subtitle(subtitle_content)
+        result = analyzer.analyze_subtitle(subtitle_content, film_name=film_name, work_brief=work_brief)
     elif subtitle_file_path:
         result = analyzer.analyze_subtitle_from_file(subtitle_file_path)
     else:
@@ -735,6 +862,8 @@ def generate_narration_script(
     output_path: Optional[str] = None,
     provider: Optional[str] = None,
     prompt_category: str = "short_drama_narration",
+    script_extra_params: Optional[Dict[str, str]] = None,
+    work_brief: str = "",
 ) -> Dict[str, Any]:
     """
     根据剧情分析生成解说文案的便捷函数
@@ -763,10 +892,13 @@ def generate_narration_script(
         base_url=base_url,
         provider=provider,
         prompt_category=prompt_category,
+        script_extra_params=script_extra_params,
     )
     
     # 生成解说文案
-    result = analyzer.generate_narration_script(short_name, plot_analysis, subtitle_content or "", temperature)
+    result = analyzer.generate_narration_script(
+        short_name, plot_analysis, subtitle_content or "", temperature, work_brief=work_brief
+    )
     
     # 保存结果
     if save_result and result["status"] == "success":

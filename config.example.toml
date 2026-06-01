@@ -176,6 +176,24 @@
 # 视频处理配置
 ##########################################
 
+[film_tv]
+# 影视解说（原声为主）成片时长与片段控制
+# target_duration_percent: 成片时长 = 原片时长 × 该比例（如 40 表示 6 分钟原片 → 约 2.4 分钟成片）
+target_duration_percent = 40
+# OST=1 原声片段时长（秒），剪辑引擎按时间戳裁剪，过短会导致成片极短
+ost1_duration_min = 10
+ost1_duration_max = 15
+ost1_duration_long_max = 18
+# 原声/解说段数建议
+ost1_segment_min = 10
+ost1_segment_max = 15
+ost0_segment_min = 5
+ost0_segment_max = 8
+# 原声占比目标（%）
+original_audio_percent = 75
+narration_percent = 25
+allow_consecutive_ost1 = true
+
 [frames]
     # 提取关键帧的间隔时间（秒）
     frame_interval_input = 3

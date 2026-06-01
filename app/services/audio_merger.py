@@ -44,10 +44,15 @@ def merge_audio_files(task_id: str, total_duration: float, list_script: list):
     # 遍历脚本中的每个片段
     for segment in list_script:
         try:
-            # 获取片段时长（秒）
             duration = segment['duration']
-            
-            # 检查audio字段是否为空
+            ost = segment.get('OST', 0)
+
+            # OST=1 原声段不叠加解说音轨；OST=0/2 才叠加 TTS
+            if ost == 1:
+                logger.debug(f"片段 {segment.get('_id')} OST=1 原声播放，跳过解说叠加")
+                current_position += duration
+                continue
+
             if segment['audio'] and os.path.exists(segment['audio']):
                 # 加载TTS音频文件
                 tts_audio = AudioSegment.from_file(segment['audio'])

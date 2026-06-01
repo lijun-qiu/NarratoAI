@@ -100,6 +100,7 @@ tts_qwen = _cfg.get("tts_qwen", {})
 fun_asr = _cfg.get("fun_asr", {})
 indextts2 = _cfg.get("indextts2", {})
 doubaotts = _cfg.get("doubaotts", {})
+film_tv = _cfg.get("film_tv", {})
 
 hostname = socket.gethostname()
 

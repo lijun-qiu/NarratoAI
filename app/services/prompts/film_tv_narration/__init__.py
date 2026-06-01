@@ -8,11 +8,15 @@
 
 from .plot_analysis import PlotAnalysisPrompt
 from .script_generation import ScriptGenerationPrompt
+from .work_briefing import WorkBriefingPrompt
 from ..manager import PromptManager
 
 
 def register_prompts():
     """注册影视解说相关的提示词"""
+    work_briefing_prompt = WorkBriefingPrompt()
+    PromptManager.register_prompt(work_briefing_prompt, is_default=True)
+
     plot_analysis_prompt = PlotAnalysisPrompt()
     PromptManager.register_prompt(plot_analysis_prompt, is_default=True)
 
@@ -21,6 +25,7 @@ def register_prompts():
 
 
 __all__ = [
+    "WorkBriefingPrompt",
     "PlotAnalysisPrompt",
     "ScriptGenerationPrompt",
     "register_prompts",

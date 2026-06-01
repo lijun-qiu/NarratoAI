@@ -205,12 +205,14 @@ class SubtitleAnalyzerAdapter:
         base_url: str,
         provider: str = None,
         prompt_category: str = "short_drama_narration",
+        script_extra_params: Optional[Dict[str, str]] = None,
     ):
         self.api_key = api_key
         self.model = model
         self.base_url = base_url
         self.provider = provider or "openai"
         self.prompt_category = prompt_category
+        self.script_extra_params = script_extra_params or {}
 
     def _get_category_config(self) -> Dict[str, str]:
         from app.services.SDE.short_drama_explanation import SubtitleAnalyzer
@@ -224,13 +226,59 @@ class SubtitleAnalyzerAdapter:
         work_name: str,
         plot_analysis: str,
         subtitle_content: str,
+        work_brief: str = "",
     ) -> Dict[str, str]:
         config = self._get_category_config()
-        return {
+        parameters = {
             config["name_field"]: work_name,
             "plot_analysis": plot_analysis,
             "subtitle_content": subtitle_content,
         }
+        if self.prompt_category == "film_tv_narration":
+            from app.services.film_tv_script_optimizer import get_film_tv_script_prompt_params
+            parameters.update(get_film_tv_script_prompt_params())
+            parameters["work_brief"] = work_brief or "（未提供作品调研简报）"
+        parameters.update(self.script_extra_params)
+        return parameters
+
+    def research_work(self, film_name: str, temperature: float = 0.7) -> Dict[str, Any]:
+        """根据作品名称调研背景（影视解说专用）。"""
+        if self.prompt_category != "film_tv_narration":
+            return {"status": "skipped", "work_brief": ""}
+        if not (film_name or "").strip():
+            return {"status": "error", "message": "作品名称不能为空"}
+
+        try:
+            prompt = PromptManager.get_prompt(
+                category=self.prompt_category,
+                name="work_briefing",
+                parameters={"film_name": film_name.strip()},
+            )
+            category_config = self._get_category_config()
+            system_prompt = category_config.get(
+                "work_brief_system",
+                category_config["analysis_system"],
+            )
+            result = self._run_async_safely(
+                UnifiedLLMService.generate_text,
+                prompt=prompt,
+                system_prompt=system_prompt,
+                provider=self.provider,
+                temperature=temperature,
+                api_key=self.api_key,
+                api_base=self.base_url,
+            )
+            work_brief = result.strip()
+            logger.info(f"《{film_name}》作品调研完成，约 {len(work_brief)} 字")
+            return {
+                "status": "success",
+                "work_brief": work_brief,
+                "film_name": film_name.strip(),
+                "temperature": temperature,
+            }
+        except Exception as e:
+            logger.error(f"作品调研失败: {str(e)}")
+            return {"status": "error", "message": str(e)}
 
     def _run_async_safely(self, coro_func, *args, **kwargs):
         """安全地运行异步协程"""
@@ -254,21 +302,37 @@ class SubtitleAnalyzerAdapter:
 
         return output
     
-    def analyze_subtitle(self, subtitle_content: str) -> Dict[str, Any]:
+    def analyze_subtitle(
+        self,
+        subtitle_content: str,
+        film_name: str = "",
+        work_brief: str = "",
+    ) -> Dict[str, Any]:
         """
         分析字幕内容 - 兼容原有接口
         
         Args:
             subtitle_content: 字幕内容
+            film_name: 影视作品名称（影视解说）
+            work_brief: 作品调研简报（影视解说）
             
         Returns:
             分析结果字典
         """
         try:
+            if self.prompt_category == "film_tv_narration":
+                parameters = {
+                    "film_name": film_name or "未命名影视作品",
+                    "work_brief": work_brief or "（未提供作品调研，请仅依据字幕分析）",
+                    "subtitle_content": subtitle_content,
+                }
+            else:
+                parameters = {"subtitle_content": subtitle_content}
+
             prompt = PromptManager.get_prompt(
                 category=self.prompt_category,
                 name="plot_analysis",
-                parameters={"subtitle_content": subtitle_content},
+                parameters=parameters,
             )
             result = self._run_async_safely(
                 UnifiedLLMService.generate_text,
@@ -295,7 +359,14 @@ class SubtitleAnalyzerAdapter:
                 "temperature": 1.0
             }
     
-    def generate_narration_script(self, short_name: str, plot_analysis: str, subtitle_content: str = "", temperature: float = 0.7) -> Dict[str, Any]:
+    def generate_narration_script(
+        self,
+        short_name: str,
+        plot_analysis: str,
+        subtitle_content: str = "",
+        temperature: float = 0.7,
+        work_brief: str = "",
+    ) -> Dict[str, Any]:
         """
         生成解说文案 - 兼容原有接口
 
@@ -314,7 +385,7 @@ class SubtitleAnalyzerAdapter:
                 category=self.prompt_category,
                 name="script_generation",
                 parameters=self._build_script_generation_parameters(
-                    short_name, plot_analysis, subtitle_content
+                    short_name, plot_analysis, subtitle_content, work_brief
                 ),
             )
             

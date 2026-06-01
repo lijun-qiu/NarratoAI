@@ -17,27 +17,46 @@ class ScriptGenerationPrompt(ParameterizedPrompt):
         metadata = PromptMetadata(
             name="script_generation",
             category="film_tv_narration",
-            version="v1.2",
-            description="影视解说脚本：原声为主(约75%)、短解说串联(约25%)",
+            version="v1.4",
+            description="专家级剪辑师：原声为主解说脚本",
             model_type=ModelType.TEXT,
             output_format=OutputFormat.JSON,
             tags=["电影", "电视剧", "影视解说", "解说脚本", "原声片段"],
-            parameters=["film_name", "plot_analysis", "subtitle_content"],
+            parameters=["film_name", "plot_analysis", "subtitle_content", "work_brief",
+                        "source_duration_minutes", "target_output_minutes",
+                        "ost1_duration_min", "ost1_duration_max",
+                        "ost1_segment_min", "ost1_segment_max"],
         )
         super().__init__(metadata, required_parameters=["film_name", "plot_analysis"])
 
         self._system_prompt = (
-            "你是一位资深的影视解说创作者，擅长「原声为主、解说点睛」的剪辑风格。"
-            "成片以原片对白和名场面为主，解说只做简短串联。"
+            "你是一位专家级影视剪辑师（10 年+ 精剪经验），精通「原声为主、解说点睛」的高燃精剪风格。"
+            "你像院线预告片剪辑师一样选时刻、控节奏：成片以原片对白和名场面为主，解说只做简短串联。"
+            "原声 OST=1 播放期间禁止插入解说，解说 OST=0 必须等当前原声段完全结束后再出现。"
             "你必须理解：OST=0 时长由解说字数决定，OST=1 时长由时间戳跨度决定。"
             "你必须严格按照 JSON 格式输出，绝不能包含任何其他文字、说明或代码块标记。"
         )
 
     def get_template(self) -> str:
-        return """# 影视解说脚本创作任务（原声为主版）
+        return """# 影视解说脚本创作任务（专家级剪辑师 · 原声为主版）
+
+## 你的身份
+你是**专家级影视剪辑师**，即将为《${film_name}》输出可直接交给剪辑引擎执行的 JSON 脚本。
+请先回顾作品调研与剧情分析，再动手选段——像拉片一样精准，像预告片一样抓人。
+
+## 作品背景调研
+<work_brief>
+${work_brief}
+</work_brief>
 
 ## 任务目标
 为《${film_name}》创作**原声占主导**的解说脚本：让观众多听原片台词与表演，解说只做必要铺垫、转折和点睛（类似「拉片」+「精剪原片」风格，而非长篇旁白复述）。
+
+## ⚠️ 成片时长目标（硬性要求）
+- 原片时长约 **${source_duration_minutes} 分钟**
+- **成片总时长必须达到约 ${target_output_minutes} 分钟**（约为原片的 40%）
+- 生成前请自行估算：所有 OST=1 时间戳跨度之和 + 所有 OST=0 解说 TTS 时长之和 ≈ ${target_output_minutes} 分钟
+- **严禁**生成总时长不足 1 分钟的脚本（原声段过短是主要原因）
 
 ## 核心比例（成片时长，必须尽量达到）
 
@@ -47,7 +66,7 @@ class ScriptGenerationPrompt(ParameterizedPrompt):
 | **解说 OST=0** | **约 20%–30%** | 仅作短旁白串联 |
 
 **实现方式（在遵守剪辑引擎规则的前提下）：**
-- 多安排 **OST=1** 段，且每段 **8–15 秒**
+- 多安排 **OST=1** 段，且每段 **${ost1_duration_min}–${ost1_duration_max} 秒**（低于 ${ost1_duration_min} 秒的会被丢弃或无效）
 - **OST=0** 段数要少、每段 **60–100 字**（成片约 10–18 秒），点到为止
 
 ## 素材信息
@@ -72,13 +91,36 @@ ${subtitle_content}
 | **1** 原声 | **时间戳起止差值**（写多长播多长） |
 
 因此：
-- 要**增加原声占比** → 增加 OST=1 段数、拉长每段 OST=1 时间戳（8–15 秒）
+- 要**增加原声占比** → 增加 OST=1 段数（**${ost1_segment_min}–${ost1_segment_max} 段**）、拉长每段 OST=1 时间戳（**${ost1_duration_min}–${ost1_duration_max} 秒**）
 - 要**减少解说占比** → 减少 OST=0 段数、缩短每段解说（60–100 字），不要写 150 字以上的长旁白
+- **致命错误**：OST=1 只框 1–3 秒的单句台词 → 成片会极短，必须框住完整对话（${ost1_duration_min} 秒以上）
 
 其他硬性规则：
 - 所有片段在原片时间轴上**绝对不能重叠**
 - OST=1 必须**单独成段**，禁止嵌套在 OST=0 的大时间窗内
 - 按 `_id` 顺序，原片时间单调向前
+
+## ⚠️ 原声与解说交替规则（成片播放顺序，必须遵守）
+
+成片按 `_id` **顺序播放**，观众听到的声音如下：
+- **OST=1 播放期间**：只有原片声音，**禁止**任何解说配音或解说字幕
+- **OST=0 解说**：必须等**前一段 OST=1 原声完全播完**后才能开始
+
+**禁止的排列（原声被解说打断）：**
+```
+OST=1 → OST=0 → OST=1   ❌ 中间插入的解说了打断原声
+```
+
+**正确的排列：**
+```
+OST=1 → OST=1 → OST=0 → OST=1 → OST=1 → OST=0   ✅ 连续原声播完，再插解说
+短解说(铺垫) → 原声 → 原声 → 短解说(转折) → …
+```
+
+**执行要点：**
+- 同一场对峙/对话的多个 OST=1 段应**连续排列**，中间**不要**夹 OST=0
+- OST=0 只出现在**一组连续 OST=1 结束之后**，用作过渡或点评
+- **禁止使用 OST=2**（解说+原声混合）；本模式只有 OST=0 和 OST=1
 
 ---
 
@@ -93,12 +135,13 @@ ${subtitle_content}
 ```
 短解说(铺垫) → 原声 → 原声 → 短解说(转折) → 原声 → 原声 → 短解说 → …
 ```
-- 允许 **连续 2–3 段 OST=1**（一段对白接一段反应/对峙），再用一句短解说带过
+- 允许 **连续 2–3 段 OST=1**（一段对白接一段反应/对峙），**整组播完后**再用一句短 OST=0 解说带过
+- **禁止**在 OST=1 之间插入 OST=0（原声播放时解说必须等待）
 - 不要写成「长解说 → 短原声」；那是解说为主，**不符合本任务**
 
 ### 原声段（OST=1）怎么选
 - 完整对白、争吵、威胁、反转、告白、名场面
-- 每段包住**一句或多句连贯对话**，跨度 **8–15 秒**
+- 每段包住**一句或多句连贯对话**，跨度 **${ost1_duration_min}–${ost1_duration_max} 秒**
 - 重要冲突可给到 **12–18 秒**（仍须来自字幕真实范围）
 - `narration` 固定：`播放原片+序号`
 
@@ -115,7 +158,7 @@ ${subtitle_content}
 - 格式：`HH:MM:SS,mmm-HH:MM:SS,mmm`
 - **严禁重叠**；后段开始 ≥ 前段结束
 - **OST=0**：开始时间为画面起点；结束时间仅作参考，跨度建议 **10–25 秒**
-- **OST=1**：必须准确框住对白，跨度 **8–15 秒**（核心台词优先取够长度）
+- **OST=1**：必须准确框住对白，跨度 **${ost1_duration_min}–${ost1_duration_max} 秒**（核心台词优先取够长度，**禁止 1–3 秒的极短片段**）
 
 ---
 
@@ -169,15 +212,17 @@ ${subtitle_content}
 
 ### 必须达到
 - 成片时长构成：**原声约 70%–80%，解说约 20%–30%**（生成时按段数与字数估算）
-- OST=1：**10–15 段**，每段 **8–15 秒**
+- OST=1：**${ost1_segment_min}–${ost1_segment_max} 段**，每段 **${ost1_duration_min}–${ost1_duration_max} 秒**
 - OST=0：**5–8 段**，每段 **60–100 字**（个别开场不超过 120 字）
 
 ### 输出前自检
 - [ ] OST=1 段数 ≥ OST=0 段数（最好 OST=1 约为 OST=0 的 2 倍）
 - [ ] 无 OST=0 段超过 120 字
-- [ ] 无 OST=1 段短于 8 秒
+- [ ] 无 OST=1 段短于 ${ost1_duration_min} 秒
+- [ ] 估算成片总时长 ≥ ${target_output_minutes} 分钟
 - [ ] 原片时间戳无重叠
-- [ ] 存在连续原声段，而非全程长旁白
+- [ ] 无「OST=1 → OST=0 → OST=1」打断原声的排列
+- [ ] 未使用 OST=2
 
 ### 创作原则
 1. 只输出 JSON

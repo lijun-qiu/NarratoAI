@@ -358,69 +358,75 @@ def render_film_tv_rules_settings(tr):
     saved = st.session_state.get("film_tv_settings")
     base = saved if isinstance(saved, dict) else defaults
 
+    def _clamp(value, lo, hi):
+        return max(lo, min(hi, int(value)))
+
     with st.expander("影视解说规则参数", expanded=True):
-        st.caption("调节生成脚本与后处理规则；默认值来自 config.toml，可临时调整或保存为默认。")
+        st.caption(
+            "调节生成脚本与后处理规则；默认值来自 config.toml，可临时调整或保存为默认。"
+            "「最少段数」会写入 AI 提示词并在生成后校验，未达标时自动重试一次。"
+        )
 
         c1, c2 = st.columns(2)
         with c1:
             target_duration_percent = st.slider(
                 "成片时长占原片比例 (%)",
-                min_value=20, max_value=80, value=int(base["target_duration_percent"]),
+                min_value=10, max_value=90, value=_clamp(base["target_duration_percent"], 10, 90),
                 help="例如 40 表示 6 分钟原片 → 约 2.4 分钟成片",
                 key="ftv_target_duration_percent",
             )
             ost1_duration_min = st.slider(
-                "原声片段最短 (秒)", 5, 20, int(base["ost1_duration_min"]),
+                "原声片段最短 (秒)", 3, 30, _clamp(base["ost1_duration_min"], 3, 30),
                 key="ftv_ost1_duration_min",
             )
             ost1_duration_max = st.slider(
-                "原声片段最长 (秒)", 8, 30, int(base["ost1_duration_max"]),
+                "原声片段最长 (秒)", 5, 60, _clamp(base["ost1_duration_max"], 5, 60),
                 key="ftv_ost1_duration_max",
             )
             ost1_duration_long_max = st.slider(
-                "名场面原声最长 (秒)", 10, 30, int(base["ost1_duration_long_max"]),
+                "名场面原声最长 (秒)", 8, 60, _clamp(base["ost1_duration_long_max"], 8, 60),
                 key="ftv_ost1_duration_long_max",
             )
             original_audio_percent = st.slider(
-                "原声占比目标 (%)", 50, 90, int(base["original_audio_percent"]),
+                "原声占比目标 (%)", 30, 95, _clamp(base["original_audio_percent"], 30, 95),
                 key="ftv_original_audio_percent",
             )
         with c2:
             ost1_segment_min = st.slider(
-                "原声段数最少", 5, 20, int(base["ost1_segment_min"]),
+                "原声段数最少", 3, 40, _clamp(base["ost1_segment_min"], 3, 40),
                 key="ftv_ost1_segment_min",
             )
             ost1_segment_max = st.slider(
-                "原声段数最多", 8, 25, int(base["ost1_segment_max"]),
+                "原声段数最多", 5, 50, _clamp(base["ost1_segment_max"], 5, 50),
                 key="ftv_ost1_segment_max",
             )
             ost0_segment_min = st.slider(
-                "解说段数最少", 3, 12, int(base["ost0_segment_min"]),
+                "解说段数最少", 2, 25, _clamp(base["ost0_segment_min"], 2, 25),
                 key="ftv_ost0_segment_min",
             )
             ost0_segment_max = st.slider(
-                "解说段数最多", 5, 15, int(base["ost0_segment_max"]),
+                "解说段数最多", 3, 30, _clamp(base["ost0_segment_max"], 3, 30),
                 key="ftv_ost0_segment_max",
             )
             narration_percent = st.slider(
-                "解说占比目标 (%)", 10, 50, int(base["narration_percent"]),
+                "解说占比目标 (%)", 5, 70, _clamp(base["narration_percent"], 5, 70),
                 key="ftv_narration_percent",
             )
 
         c3, c4, c5 = st.columns(3)
         with c3:
             narration_chars_min = st.slider(
-                "解说字数下限", 30, 100, int(base["narration_chars_min"]),
+                "解说字数下限", 20, 150, _clamp(base["narration_chars_min"], 20, 150),
                 key="ftv_narration_chars_min",
             )
         with c4:
             narration_chars_max = st.slider(
-                "解说字数上限", 60, 150, int(base["narration_chars_max"]),
+                "解说字数上限", 40, 250, _clamp(base["narration_chars_max"], 40, 250),
                 key="ftv_narration_chars_max",
             )
         with c5:
             opening_chars_max = st.slider(
-                "开场解说字数上限", 80, 150, int(base["opening_chars_max"]),
+                "开场解说字数上限", 60, 300, _clamp(base["opening_chars_max"], 60, 300),
                 key="ftv_opening_chars_max",
             )
 
@@ -558,56 +564,132 @@ def render_subtitle_narration_panel(tr, work_name_label: str, uploader_key: str)
 
 
 def render_fun_asr_transcription(tr):
-    """使用阿里百炼 Fun-ASR 从本地音视频转写生成字幕。"""
-    def clear_fun_asr_subtitle_state():
+    """音视频字幕转录：Fun-ASR / Whisper API / Gemini 兼容 API，失败自动切换。"""
+    def clear_subtitle_state():
         st.session_state['subtitle_path'] = None
         st.session_state['subtitle_content'] = None
         st.session_state['subtitle_file_processed'] = False
 
-    with st.expander("阿里百炼 Fun-ASR 字幕转录", expanded=False):
-        st.caption("上传本地音频/视频后，将自动上传到阿里百炼临时存储并通过 fun-asr 生成 SRT 字幕。")
-        st.markdown(
-            "API Key 获取地址："
-            "[https://bailian.console.aliyun.com/?tab=model#/api-key]"
-            "(https://bailian.console.aliyun.com/?tab=model#/api-key)"
+    def _apply_subtitle_result(generated_path: str, provider_label: str):
+        if not generated_path or not os.path.exists(generated_path):
+            clear_subtitle_state()
+            st.error(f"{provider_label} 转写失败：未生成字幕文件")
+            return False
+        with open(generated_path, "r", encoding="utf-8") as f:
+            subtitle_content = f.read()
+        st.session_state['subtitle_path'] = generated_path
+        st.session_state['subtitle_content'] = subtitle_content
+        st.session_state['subtitle_file_processed'] = True
+        st.success(f"字幕转写成功（{provider_label}）: {os.path.basename(generated_path)}")
+        return True
+
+    with st.expander("字幕转录（三种方式 + 自动回退）", expanded=False):
+        st.caption(
+            "上传本地音频/视频生成 SRT。大文件会自动提取并压缩音频后再转写。"
+            "若使用 api.4022543.xyz 等 LLM 网关，Whisper/Gemini 转写可能不可用，请优先选 Fun-ASR。"
         )
 
-        api_key = st.text_input(
-            "阿里百炼 API Key",
-            value=config.fun_asr.get("api_key", ""),
-            type="password",
-            help="请输入你自己的阿里百炼 API Key；保存配置后会写入本地 config.toml",
-            key="fun_asr_api_key",
+        from app.services.media_transcription import (
+            PROVIDER_FUN_ASR,
+            PROVIDER_GEMINI,
+            PROVIDER_WHISPER,
+            PROVIDER_LABELS,
         )
+
+        col1, col2 = st.columns(2)
+        with col1:
+            fun_key = st.text_input(
+                "阿里百炼 API Key（Fun-ASR）",
+                value=config.fun_asr.get("api_key", ""),
+                type="password",
+                key="fun_asr_api_key",
+            )
+        with col2:
+            whisper_key = st.text_input(
+                "Whisper / 网关 API Key",
+                value=config.whisper_asr.get("api_key", ""),
+                type="password",
+                key="whisper_asr_api_key",
+            )
+
+        gemini_key = st.text_input(
+            "Gemini 兼容 API Key",
+            value=config.gemini_asr.get("api_key", "") if hasattr(config, "gemini_asr") else "",
+            type="password",
+            key="gemini_asr_api_key",
+        )
+
+        enable_fallback = st.checkbox(
+            "失败时自动尝试其他转录方式",
+            value=config.transcription.get("enable_fallback", True) if hasattr(config, "transcription") else True,
+            key="transcription_enable_fallback",
+        )
+
         uploaded_media = st.file_uploader(
-            "上传需要转录的音频/视频",
+            tr("上传需要转录的音频/视频"),
             type=[
                 "aac", "amr", "avi", "flac", "flv", "m4a", "mkv", "mov",
                 "mp3", "mp4", "mpeg", "ogg", "opus", "wav", "webm", "wma", "wmv",
             ],
             accept_multiple_files=False,
-            key="fun_asr_media_uploader",
+            key="media_transcription_uploader",
         )
 
-        if st.button("转写生成字幕", key="fun_asr_transcribe"):
-            if not api_key.strip():
-                clear_fun_asr_subtitle_state()
-                st.error("请先输入阿里百炼 API Key")
-                return
+        provider_choice = st.radio(
+            "转录方式",
+            options=["auto", PROVIDER_FUN_ASR, PROVIDER_WHISPER, PROVIDER_GEMINI],
+            format_func=lambda x: {
+                "auto": "自动（按顺序尝试已配置的 API）",
+                PROVIDER_FUN_ASR: PROVIDER_LABELS[PROVIDER_FUN_ASR],
+                PROVIDER_WHISPER: PROVIDER_LABELS[PROVIDER_WHISPER],
+                PROVIDER_GEMINI: PROVIDER_LABELS[PROVIDER_GEMINI],
+            }.get(x, x),
+            horizontal=True,
+            key="transcription_provider_choice",
+        )
+
+        st.markdown(
+            "API Key 说明：Fun-ASR → "
+            "[阿里百炼](https://bailian.console.aliyun.com/?tab=model#/api-key)；"
+            "Whisper / Gemini → OpenAI 兼容网关（如 api.openai.com 或自建代理）"
+        )
+
+        if st.button("转写生成字幕", key="media_transcribe_btn", use_container_width=True):
             if uploaded_media is None:
-                clear_fun_asr_subtitle_state()
+                clear_subtitle_state()
                 st.error("请先上传需要转录的音频或视频文件")
                 return
 
-            try:
-                clear_fun_asr_subtitle_state()
-                from app.services import fun_asr_subtitle
+            if provider_choice == PROVIDER_FUN_ASR and not fun_key.strip():
+                st.error("请先填写 Fun-ASR API Key")
+                return
+            if provider_choice == PROVIDER_WHISPER and not whisper_key.strip():
+                st.error("请先填写 Whisper API Key")
+                return
+            if provider_choice == PROVIDER_GEMINI and not gemini_key.strip():
+                st.error("请先填写 Gemini API Key")
+                return
+            if provider_choice == "auto" and not any([
+                fun_key.strip(), whisper_key.strip(), gemini_key.strip()
+            ]):
+                st.error("请至少填写一种转录 API Key")
+                return
 
-                config.fun_asr["api_key"] = api_key.strip()
-                config.fun_asr["model"] = "fun-asr"
+            try:
+                clear_subtitle_state()
+                from app.services import media_transcription
+
+                if fun_key.strip():
+                    config.fun_asr["api_key"] = fun_key.strip()
+                if whisper_key.strip():
+                    config.whisper_asr["api_key"] = whisper_key.strip()
+                if gemini_key.strip():
+                    config.gemini_asr["api_key"] = gemini_key.strip()
+                if hasattr(config, "transcription"):
+                    config.transcription["enable_fallback"] = enable_fallback
                 config.save_config()
 
-                temp_dir = utils.temp_dir("fun_asr")
+                temp_dir = utils.temp_dir("transcription")
                 safe_filename = os.path.basename(uploaded_media.name)
                 media_path = os.path.join(temp_dir, safe_filename)
                 file_name, file_extension = os.path.splitext(safe_filename)
@@ -618,32 +700,23 @@ def render_fun_asr_transcription(tr):
                 with open(media_path, "wb") as f:
                     f.write(uploaded_media.getbuffer())
 
-                subtitle_name = f"{os.path.splitext(os.path.basename(media_path))[0]}_fun_asr.srt"
+                subtitle_name = f"{os.path.splitext(os.path.basename(media_path))[0]}_transcribed.srt"
                 subtitle_path = os.path.join(utils.subtitle_dir(), subtitle_name)
 
-                with st.spinner("正在使用阿里百炼 Fun-ASR 转写字幕，请稍候..."):
-                    generated_path = fun_asr_subtitle.create_with_fun_asr(
-                        local_file=media_path,
-                        subtitle_file=subtitle_path,
-                        api_key=api_key.strip(),
+                with st.spinner("正在转写字幕，失败时将自动切换其他方式..."):
+                    generated_path, used_provider = media_transcription.transcribe_media_to_srt(
+                        media_path,
+                        subtitle_path,
+                        provider=provider_choice,
+                        enable_fallback=enable_fallback,
                     )
 
-                if not generated_path or not os.path.exists(generated_path):
-                    clear_fun_asr_subtitle_state()
-                    st.error("Fun-ASR 转写失败：未生成字幕文件")
-                    return
-
-                with open(generated_path, "r", encoding="utf-8") as f:
-                    subtitle_content = f.read()
-
-                st.session_state['subtitle_path'] = generated_path
-                st.session_state['subtitle_content'] = subtitle_content
-                st.session_state['subtitle_file_processed'] = True
-                st.success(f"字幕转写成功: {os.path.basename(generated_path)}")
+                label = PROVIDER_LABELS.get(used_provider, used_provider)
+                _apply_subtitle_result(generated_path, label)
             except Exception as e:
-                clear_fun_asr_subtitle_state()
-                logger.error(f"Fun-ASR 字幕转写失败: {traceback.format_exc()}")
-                st.error(f"Fun-ASR 字幕转写失败: {str(e)}")
+                clear_subtitle_state()
+                logger.error(f"字幕转写失败: {traceback.format_exc()}")
+                st.error(f"字幕转写失败（已尝试所有可用方式）: {str(e)}")
 
 
 def render_script_buttons(tr, params):
@@ -803,5 +876,6 @@ def get_script_params():
         'video_clip_json_path': st.session_state.get('video_clip_json_path', ''),
         'video_origin_path': st.session_state.get('video_origin_path', ''),
         'video_name': st.session_state.get('video_name', ''),
-        'video_plot': st.session_state.get('video_plot', '')
+        'video_plot': st.session_state.get('video_plot', ''),
+        'source_subtitle_path': st.session_state.get('subtitle_path', ''),
     }

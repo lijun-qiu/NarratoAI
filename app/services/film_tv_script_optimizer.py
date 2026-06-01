@@ -266,6 +266,51 @@ def normalize_ost_types(items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     return items
 
 
+def count_film_tv_segments(items: List[Dict[str, Any]]) -> Tuple[int, int, int]:
+    """统计 OST=1 / OST=0 / 总段数。"""
+    ost1 = sum(1 for item in items if item.get("OST") == 1)
+    ost0 = sum(1 for item in items if item.get("OST") == 0)
+    return ost1, ost0, len(items)
+
+
+def validate_film_tv_script_counts(
+    items: List[Dict[str, Any]],
+    settings: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """
+    校验影视解说脚本是否满足配置中的最少段数要求。
+
+    Returns:
+        ok, ost1_count, ost0_count, total, ost1_min, ost0_min, total_min, message
+    """
+    settings = get_film_tv_settings(settings)
+    ost1_count, ost0_count, total = count_film_tv_segments(items)
+    ost1_min = int(settings["ost1_segment_min"])
+    ost0_min = int(settings["ost0_segment_min"])
+    total_min = ost1_min + ost0_min
+
+    issues: List[str] = []
+    if ost1_count < ost1_min:
+        issues.append(f"原声 OST=1 仅 {ost1_count} 段，要求至少 {ost1_min} 段")
+    if ost0_count < ost0_min:
+        issues.append(f"解说 OST=0 仅 {ost0_count} 段，要求至少 {ost0_min} 段")
+    if total < total_min:
+        issues.append(f"总段数 {total}，要求至少 {total_min} 段（{ost1_min}+{ost0_min}）")
+
+    ok = not issues
+    message = "段数符合配置要求" if ok else "；".join(issues)
+    return {
+        "ok": ok,
+        "ost1_count": ost1_count,
+        "ost0_count": ost0_count,
+        "total": total,
+        "ost1_min": ost1_min,
+        "ost0_min": ost0_min,
+        "total_min": total_min,
+        "message": message,
+    }
+
+
 def optimize_film_tv_script(
     items: List[Dict[str, Any]],
     subtitle_content: str = "",
@@ -351,5 +396,9 @@ def optimize_film_tv_script(
     optimized = normalize_ost_types(optimized)
     if settings.get("enforce_narration_after_ost1", True):
         optimized = enforce_narration_after_ost1(optimized)
+
+    validation = validate_film_tv_script_counts(optimized, settings)
+    if not validation["ok"]:
+        logger.warning(f"影视脚本段数未达标: {validation['message']}")
 
     return optimized

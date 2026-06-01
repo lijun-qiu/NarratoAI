@@ -89,6 +89,7 @@ def get_film_tv_script_prompt_params(
         "ost1_segment_max": str(cfg["ost1_segment_max"]),
         "ost0_segment_min": str(cfg["ost0_segment_min"]),
         "ost0_segment_max": str(cfg["ost0_segment_max"]),
+        "total_segment_min": str(int(cfg["ost1_segment_min"]) + int(cfg["ost0_segment_min"])),
         "original_audio_percent": str(int(cfg["original_audio_percent"])),
         "narration_percent": str(int(cfg["narration_percent"])),
         "narration_chars_min": str(int(cfg["narration_chars_min"])),

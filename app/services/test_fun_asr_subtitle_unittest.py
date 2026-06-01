@@ -106,8 +106,9 @@ class FunAsrSrtConversionTests(unittest.TestCase):
     def test_official_shape_words_convert_ms_and_speaker_label(self):
         srt = fasr.fun_asr_result_to_srt(OFFICIAL_SHAPE_RESULT, max_chars=20, max_duration=3.5)
 
-        self.assertIn("1\n00:00:00,000 --> 00:00:00,400\n说话人1: 你好，", srt)
-        self.assertIn("2\n00:00:00,400 --> 00:00:02,400\n说话人1: 欢迎观看今天的内容。", srt)
+        self.assertIn("1\n00:00:00,000 --> 00:00:00,400\n你好，", srt)
+        self.assertIn("2\n00:00:00,400 --> 00:00:02,400\n欢迎观看今天的内容。", srt)
+        self.assertNotIn("说话人", srt)
         self.assertNotIn("00:06:40,000", srt, "milliseconds must not be treated as seconds")
 
     def test_long_word_sequence_splits_into_fine_blocks(self):
@@ -130,7 +131,8 @@ class FunAsrSrtConversionTests(unittest.TestCase):
         }
         srt = fasr.fun_asr_result_to_srt(result, max_chars=4, max_duration=10)
 
-        self.assertGreaterEqual(srt.count("\n说话人2:"), 3)
+        self.assertGreaterEqual(srt.count("这是"), 1)
+        self.assertNotIn("说话人", srt)
         self.assertIn("1\n00:00:00,000", srt)
 
     def test_sentence_fallback_uses_ms_without_zero_duration(self):
@@ -152,7 +154,8 @@ class FunAsrSrtConversionTests(unittest.TestCase):
         srt = fasr.fun_asr_result_to_srt(result, max_chars=5)
 
         self.assertIn("00:00:01,000", srt)
-        self.assertIn("说话人1:", srt)
+        self.assertIn("没有词级", srt)
+        self.assertNotIn("说话人", srt)
         self.assertNotIn("--> 00:00:01,000\n", srt)
 
     def test_empty_result_raises_clear_error(self):
@@ -220,7 +223,7 @@ class FunAsrServiceTests(unittest.TestCase):
 
             self.assertEqual(str(subtitle_file), result_path)
             self.assertTrue(subtitle_file.exists())
-            self.assertIn("说话人1:", subtitle_file.read_text(encoding="utf-8"))
+            self.assertNotIn("说话人", subtitle_file.read_text(encoding="utf-8"))
 
         policy_call = session.calls[0]
         self.assertEqual("GET", policy_call[0])

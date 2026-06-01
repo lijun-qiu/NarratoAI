@@ -16,6 +16,8 @@ from loguru import logger
 
 from app.utils import utils
 
+from app.services.srt_utils import clean_subtitle_dialogue_text
+
 DASHSCOPE_BASE_URL = "https://dashscope.aliyuncs.com"
 UPLOAD_POLICY_URL = f"{DASHSCOPE_BASE_URL}/api/v1/uploads"
 TRANSCRIPTION_URL = f"{DASHSCOPE_BASE_URL}/api/v1/services/audio/asr/transcription"
@@ -223,7 +225,25 @@ def poll_transcription_task(
             return results[0]
 
         if last_status in TERMINAL_FAILED_STATUSES:
-            raise FunAsrError(f"Fun-ASR 转写任务失败: {last_status}")
+            code = str(output.get("code") or "").strip()
+            message = str(output.get("message") or "").strip()
+            detail = f"{last_status}"
+            if code:
+                detail += f" ({code})"
+            if message and message != code:
+                detail += f": {message}"
+            results = output.get("results") or []
+            if results:
+                first = results[0] if isinstance(results[0], dict) else {}
+                sub_code = str(first.get("code") or "").strip()
+                sub_msg = str(first.get("message") or "").strip()
+                if sub_code and sub_code not in detail:
+                    detail += f" | 子任务: {sub_code}"
+                if sub_msg and sub_msg not in detail:
+                    detail += f" - {sub_msg}"
+            if code == "ASR_RESPONSE_HAVE_NO_WORDS":
+                detail += "（未识别到语音，请确认文件含清晰对白且非纯音乐/静音）"
+            raise FunAsrError(f"Fun-ASR 转写任务失败: {detail}")
 
         time.sleep(poll_interval)
 
@@ -261,7 +281,21 @@ def _timestamp_ms(value: Any, field_name: str) -> float:
         raise FunAsrError(f"Fun-ASR 转写结果时间戳无效: {field_name}={value!r}") from exc
 
 
+def _include_speaker_label() -> bool:
+    try:
+        from app.config import config
+
+        section = config.transcription if hasattr(config, "transcription") else {}
+        if isinstance(section, dict) and "include_speaker_label" in section:
+            return bool(section.get("include_speaker_label"))
+    except Exception:
+        pass
+    return False
+
+
 def _speaker_prefix(speaker_id: Any) -> str:
+    if not _include_speaker_label():
+        return ""
     if speaker_id is None or speaker_id == "":
         return ""
     try:
@@ -402,7 +436,10 @@ def fun_asr_result_to_srt(result_json: dict[str, Any], max_chars: int = 20, max_
 
     lines = []
     for index, block in enumerate(blocks, start=1):
-        text = f"{_speaker_prefix(block.get('speaker_id'))}{block['text']}"
+        raw_text = f"{_speaker_prefix(block.get('speaker_id'))}{block['text']}"
+        text = clean_subtitle_dialogue_text(raw_text)
+        if not text:
+            continue
         lines.append(_srt_block(index, block["start"], block["end"], text))
     return "\n".join(lines).rstrip() + "\n"
 
@@ -449,4 +486,4 @@ def create_with_fun_asr(
     except FunAsrError:
         raise
     except Exception as exc:
-        raise FunAsrError("Fun-ASR 字幕转写失败，请检查文件、网络或阿里百炼服务状态") from exc
+        raise FunAsrError(f"Fun-ASR 字幕转写失败: {exc}") from exc

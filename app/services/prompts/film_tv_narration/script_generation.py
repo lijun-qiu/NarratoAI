@@ -217,9 +217,12 @@ OST=1 → OST=1 → OST=0 → OST=1 → OST=1 → OST=0   ✅ 连续原声播完
 - 成片时长构成：**原声约 ${original_audio_percent}%，解说约 ${narration_percent}%**
 - OST=1：**${ost1_segment_min}–${ost1_segment_max} 段**，每段 **${ost1_duration_min}–${ost1_duration_max} 秒**
 - OST=0：**${ost0_segment_min}–${ost0_segment_max} 段**，每段 **${narration_chars_min}–${narration_chars_max} 字**（开场不超过 ${opening_chars_max} 字）
+- **硬性下限（不满足则输出无效）**：items 总数 **≥ ${total_segment_min}**（OST=1 **≥ ${ost1_segment_min}** 且 OST=0 **≥ ${ost0_segment_min}**）
 
 ### 输出前自检
-- [ ] OST=1 段数 ≥ OST=0 段数（最好 OST=1 约为 OST=0 的 2 倍）
+- [ ] OST=1 段数 ≥ ${ost1_segment_min}（当前配置最少 ${ost1_segment_min} 段）
+- [ ] OST=0 段数 ≥ ${ost0_segment_min}（当前配置最少 ${ost0_segment_min} 段）
+- [ ] items 总段数 ≥ ${total_segment_min}
 - [ ] 无 OST=0 段超过 ${opening_chars_max} 字
 - [ ] 无 OST=1 段短于 ${ost1_duration_min} 秒
 - [ ] 估算成片总时长 ≥ ${target_output_minutes} 分钟

@@ -84,6 +84,10 @@ def save_config():
         _cfg["fun_asr"] = fun_asr
         _cfg["indextts2"] = indextts2
         _cfg["doubaotts"] = doubaotts
+        _cfg["whisper_asr"] = whisper_asr
+        _cfg["gemini_asr"] = gemini_asr
+        _cfg["transcription"] = transcription
+        _cfg["perfect_subtitle"] = perfect_subtitle
         f.write(toml.dumps(_cfg))
 
 
@@ -101,6 +105,10 @@ fun_asr = _cfg.get("fun_asr", {})
 indextts2 = _cfg.get("indextts2", {})
 doubaotts = _cfg.get("doubaotts", {})
 film_tv = _cfg.get("film_tv", {})
+perfect_subtitle = _cfg.get("perfect_subtitle", {})
+whisper_asr = _cfg.get("whisper_asr", {})
+gemini_asr = _cfg.get("gemini_asr", {})
+transcription = _cfg.get("transcription", {})
 
 hostname = socket.gethostname()
 

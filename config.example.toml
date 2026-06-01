@@ -207,3 +207,51 @@ opening_chars_max = 120
 
     # 视觉批处理最大并发批次数（OpenAI 兼容 provider）
     vision_max_concurrency = 2
+
+##########################################
+# 完美字幕（影视解说：解说 + 原声双轨）
+##########################################
+
+[perfect_subtitle]
+    # 是否启用完美字幕（OST=0 ASR 对齐 + OST=1 源字幕切片）
+    enabled = true
+    # ASR 提供方: auto | fun_asr | whisper_api
+    provider = "auto"
+    # OST=1 原声段优先从源 SRT 切片
+    ost1_from_source_srt = true
+    # 源 SRT 无匹配时，对片段音频做 ASR 回退
+    ost1_asr_fallback = true
+    # OST=0 解说段对 TTS 音频做 ASR 获取精确时间轴
+    ost0_use_asr = true
+    # 是否优先使用 TTS 引擎自带字幕（通常不如 ASR 精确）
+    prefer_existing_tts_subtitle = false
+    # 额外导出解说/原文分轨 SRT（便于剪映分样式）
+    export_separate_tracks = true
+    narration_label = ""
+    original_label = ""
+    max_chars = 18
+    max_duration = 4.0
+
+[transcription]
+    enable_fallback = true
+    fallback_order = ["fun_asr", "whisper_api", "gemini_asr"]
+    max_chars = 20
+    max_duration = 3.5
+    preprocess_audio = true
+    max_upload_mb = 24.0
+    chunk_seconds = 600
+    ssl_verify = true
+    include_speaker_label = false
+
+[whisper_asr]
+    api_key = ""
+    model = "whisper-1"
+    base_url = "https://api.openai.com/v1"
+    language = "zh"
+    engine = "api"
+
+[gemini_asr]
+    api_key = ""
+    model = "gemini-2.0-flash"
+    base_url = "https://api.openai.com/v1"
+    language = "zh"

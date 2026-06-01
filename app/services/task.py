@@ -11,8 +11,37 @@ from app.config.audio_config import AudioConfig, get_recommended_volumes_for_con
 from app.models import const
 from app.models.schema import VideoClipParams
 from app.services import (voice, audio_merger, subtitle_merger, clip_video, merger_video, update_script, generate_video)
+from app.services.perfect_subtitle_service import build_merged_subtitle_path
 from app.services import state as sm
 from app.utils import utils
+
+
+def _merge_task_subtitles(
+    task_id: str,
+    new_script_list: list,
+    params: VideoClipParams,
+) -> str:
+    """Generate merged subtitles (perfect dual-track preferred, legacy fallback)."""
+    source_subtitle_path = (getattr(params, "source_subtitle_path", None) or "").strip()
+    if not source_subtitle_path:
+        source_subtitle_path = (config.app.get("source_subtitle_path") or "").strip()
+
+    merged_subtitle_path = build_merged_subtitle_path(
+        new_script_list,
+        task_id=task_id,
+        source_subtitle_path=source_subtitle_path or None,
+    )
+    if merged_subtitle_path:
+        logger.info(f"完美字幕合并成功 -> {merged_subtitle_path}")
+        return merged_subtitle_path
+
+    merged_subtitle_path = subtitle_merger.merge_subtitle_files(new_script_list)
+    if merged_subtitle_path:
+        logger.info(f"字幕文件合并成功 -> {merged_subtitle_path}")
+        return merged_subtitle_path
+
+    logger.warning("没有有效的字幕内容，将生成无字幕视频")
+    return ""
 
 
 def start_subclip(task_id: str, params: VideoClipParams, subclip_path_videos: dict = None):
@@ -128,9 +157,10 @@ def start_subclip(task_id: str, params: VideoClipParams, subclip_path_videos: di
     """
     logger.info("\n\n## 4. 合并音频和字幕")
     total_duration = sum([script["duration"] for script in new_script_list])
-    if tts_segments:
-        try:
-            # 合并音频文件
+    merged_audio_path = ""
+    merged_subtitle_path = ""
+    try:
+        if tts_segments:
             merged_audio_path = audio_merger.merge_audio_files(
                 task_id=task_id,
                 total_duration=total_duration,
@@ -138,24 +168,13 @@ def start_subclip(task_id: str, params: VideoClipParams, subclip_path_videos: di
             )
             logger.info(f"音频文件合并成功->{merged_audio_path}")
 
-            # 合并字幕文件
-            merged_subtitle_path = subtitle_merger.merge_subtitle_files(new_script_list)
-            if merged_subtitle_path:
-                logger.info(f"字幕文件合并成功->{merged_subtitle_path}")
-            else:
-                logger.warning("没有有效的字幕内容，将生成无字幕视频")
-                merged_subtitle_path = ""
-        except Exception as e:
-            logger.error(f"合并音频/字幕文件失败: {str(e)}")
-            # 确保即使合并失败也有默认值
-            if 'merged_audio_path' not in locals():
-                merged_audio_path = ""
-            if 'merged_subtitle_path' not in locals():
-                merged_subtitle_path = ""
-    else:
-        logger.warning("没有需要合并的音频/字幕")
-        merged_audio_path = ""
-        merged_subtitle_path = ""
+        merged_subtitle_path = _merge_task_subtitles(task_id, new_script_list, params)
+    except Exception as e:
+        logger.error(f"合并音频/字幕文件失败: {str(e)}")
+        if not merged_audio_path:
+            merged_audio_path = ""
+        if not merged_subtitle_path:
+            merged_subtitle_path = ""
 
     """
     5. 合并视频
@@ -354,9 +373,10 @@ def start_subclip_unified(task_id: str, params: VideoClipParams):
     """
     logger.info("\n\n## 4. 合并音频和字幕")
     total_duration = sum([script["duration"] for script in new_script_list])
-    if tts_segments:
-        try:
-            # 合并音频文件
+    merged_audio_path = ""
+    merged_subtitle_path = ""
+    try:
+        if tts_segments:
             merged_audio_path = audio_merger.merge_audio_files(
                 task_id=task_id,
                 total_duration=total_duration,
@@ -364,24 +384,13 @@ def start_subclip_unified(task_id: str, params: VideoClipParams):
             )
             logger.info(f"音频文件合并成功->{merged_audio_path}")
 
-            # 合并字幕文件
-            merged_subtitle_path = subtitle_merger.merge_subtitle_files(new_script_list)
-            if merged_subtitle_path:
-                logger.info(f"字幕文件合并成功->{merged_subtitle_path}")
-            else:
-                logger.warning("没有有效的字幕内容，将生成无字幕视频")
-                merged_subtitle_path = ""
-        except Exception as e:
-            logger.error(f"合并音频/字幕文件失败: {str(e)}")
-            # 确保即使合并失败也有默认值
-            if 'merged_audio_path' not in locals():
-                merged_audio_path = ""
-            if 'merged_subtitle_path' not in locals():
-                merged_subtitle_path = ""
-    else:
-        logger.warning("没有需要合并的音频/字幕")
-        merged_audio_path = ""
-        merged_subtitle_path = ""
+        merged_subtitle_path = _merge_task_subtitles(task_id, new_script_list, params)
+    except Exception as e:
+        logger.error(f"合并音频/字幕文件失败: {str(e)}")
+        if not merged_audio_path:
+            merged_audio_path = ""
+        if not merged_subtitle_path:
+            merged_subtitle_path = ""
 
     """
     5. 合并视频

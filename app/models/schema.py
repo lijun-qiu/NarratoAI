@@ -197,6 +197,7 @@ class VideoClipParams(BaseModel):
     original_volume: Optional[float] = Field(default=AudioVolumeDefaults.ORIGINAL_VOLUME, description="视频原声音量")
     bgm_volume: Optional[float] = Field(default=AudioVolumeDefaults.BGM_VOLUME, description="背景音乐音量")
     draft_name: Optional[str] = Field(default="", description="剪映草稿名称")
+    source_subtitle_path: Optional[str] = Field(default="", description="原视频字幕路径（用于原声段字幕切片）")
 
 
 

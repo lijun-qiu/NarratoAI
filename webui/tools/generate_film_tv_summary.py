@@ -17,14 +17,96 @@ from loguru import logger
 from app.config import config
 from app.services.SDE.short_drama_explanation import analyze_subtitle, generate_narration_script, research_film_work
 from app.services.film_tv_settings import get_film_tv_settings, get_film_tv_script_prompt_params
-from app.services.film_tv_script_optimizer import optimize_film_tv_script, validate_film_tv_script_counts
 from app.services.subtitle_text import read_subtitle_text
 from app.utils.video_processor import VideoProcessor
 import app.services.llm  # noqa: F401 — 触发 LLM 提供商注册
-from app.services.llm.migration_adapter import SubtitleAnalyzerAdapter
+from app.services.llm.migration_adapter import SubtitleAnalyzerAdapter, _run_async_safely
+from app.services.llm.unified_service import UnifiedLLMService
+from app.services.film_tv_script_optimizer import (
+    AUTO_NARRATION_MARKER,
+    fill_auto_narration_placeholders,
+    optimize_film_tv_script,
+    supplement_film_tv_segment_counts,
+    validate_film_tv_script_counts,
+)
 from webui.tools.generate_short_summary import parse_and_fix_json
 
 PROMPT_CATEGORY = "film_tv_narration"
+
+
+def _fill_auto_narrations_with_llm(
+    items: list,
+    *,
+    film_name: str,
+    plot_analysis: str,
+    film_tv_settings: dict,
+    text_api_key: str,
+    text_model: str,
+    text_base_url: str,
+    text_provider: str,
+    temperature: float,
+) -> list:
+    pending = [item for item in items if item.get("narration") == AUTO_NARRATION_MARKER]
+    if not pending:
+        return items
+
+    chars_min = int(film_tv_settings["narration_chars_min"])
+    chars_max = int(film_tv_settings["narration_chars_max"])
+    brief_items = [
+        {
+            "_id": item.get("_id"),
+            "picture": item.get("picture"),
+            "timestamp": item.get("timestamp"),
+        }
+        for item in pending
+    ]
+    prompt = (
+        f"你是专业影视解说编剧。请为《{film_name}》补写 {len(pending)} 段 OST=0 解说词。\n"
+        f"要求：每段 {chars_min}-{chars_max} 个汉字，承上启下，不要写「播放原片」，不要重复对白。\n"
+        f"只输出 JSON 数组，每项含 _id（整数）和 narration（字符串）。\n\n"
+        f"待补片段：\n{json.dumps(brief_items, ensure_ascii=False, indent=2)}\n\n"
+        f"剧情分析摘要：\n{plot_analysis[:4000]}"
+    )
+
+    try:
+        result = _run_async_safely(
+            UnifiedLLMService.generate_text,
+            prompt=prompt,
+            system_prompt="你只输出合法 JSON 数组，不要 markdown 代码块。",
+            provider=text_provider,
+            temperature=min(1.0, temperature + 0.15),
+            response_format="json",
+            api_key=text_api_key,
+            api_base=text_base_url,
+        )
+        parsed = parse_and_fix_json(result)
+        if isinstance(parsed, list):
+            patches = {int(p["_id"]): p["narration"] for p in parsed if "_id" in p and p.get("narration")}
+        elif isinstance(parsed, dict) and "items" in parsed:
+            patches = {
+                int(p["_id"]): p["narration"]
+                for p in parsed["items"]
+                if "_id" in p and p.get("narration")
+            }
+        else:
+            patches = {}
+
+        updated = [dict(item) for item in items]
+        filled = 0
+        for item in updated:
+            if item.get("narration") != AUTO_NARRATION_MARKER:
+                continue
+            narration = patches.get(int(item.get("_id", 0)))
+            if narration:
+                item["narration"] = str(narration).strip()
+                filled += 1
+        if filled:
+            logger.info(f"LLM 已补写 {filled}/{len(pending)} 段解说文案")
+            return updated
+    except Exception as exc:
+        logger.warning(f"LLM 补写解说失败，使用模板兜底: {exc}")
+
+    return fill_auto_narration_placeholders(items, film_tv_settings)
 
 
 def generate_script_film_tv_summary(params, subtitle_path, video_theme, temperature, film_tv_settings=None):
@@ -153,14 +235,15 @@ def generate_script_film_tv_summary(params, subtitle_path, video_theme, temperat
             logger.info("影视字幕分析成功")
             update_progress(60, "专家剪辑师正在生成精剪脚本...")
 
-            def _call_generate_narration(plot_analysis: str):
+            def _call_generate_narration(plot_analysis: str, gen_temperature=None):
+                use_temp = temperature if gen_temperature is None else gen_temperature
                 if analyzer is not None:
                     try:
                         result = analyzer.generate_narration_script(
                             short_name=film_name,
                             plot_analysis=plot_analysis,
                             subtitle_content=subtitle_content,
-                            temperature=temperature,
+                            temperature=use_temp,
                             work_brief=work_brief,
                         )
                         if result.get("status") == "success":
@@ -175,7 +258,7 @@ def generate_script_film_tv_summary(params, subtitle_path, video_theme, temperat
                     model=text_model,
                     base_url=text_base_url,
                     save_result=True,
-                    temperature=temperature,
+                    temperature=use_temp,
                     provider=text_provider,
                     prompt_category=PROMPT_CATEGORY,
                     script_extra_params=script_extra_params,
@@ -186,14 +269,17 @@ def generate_script_film_tv_summary(params, subtitle_path, video_theme, temperat
             narration_result = None
             narration_dict = None
             validation = None
-            max_attempts = 2
+            max_attempts = 3
+            supplemented = False
+            retry_temperature = temperature
 
             for attempt in range(1, max_attempts + 1):
                 if attempt > 1:
                     update_progress(65, f"段数未达标，正在第 {attempt} 次重新生成...")
                     logger.info(f"影视脚本段数未达标，第 {attempt} 次生成")
 
-                narration_result = _call_generate_narration(plot_analysis)
+                retry_temperature = min(1.2, temperature + 0.1 * (attempt - 1))
+                narration_result = _call_generate_narration(plot_analysis, retry_temperature)
                 if narration_result["status"] != "success":
                     break
 
@@ -215,16 +301,47 @@ def generate_script_film_tv_summary(params, subtitle_path, video_theme, temperat
                 if attempt < max_attempts:
                     plot_analysis = (
                         f"{analysis_result['analysis']}\n\n"
-                        f"【重要修正】上次脚本段数不足：原声 OST=1 仅 {validation['ost1_count']} 段"
-                        f"（需≥{validation['ost1_min']}），解说 OST=0 仅 {validation['ost0_count']} 段"
-                        f"（需≥{validation['ost0_min']}），总段数 {validation['total']}"
-                        f"（需≥{validation['total_min']}）。"
-                        f"请重新输出完整 JSON，务必补全至至少 {validation['ost1_min']} 段 OST=1"
-                        f" 和 {validation['ost0_min']} 段 OST=0。"
+                        f"【重要修正·第{attempt}次】脚本段数严重不足，当前输出无效。"
+                        f"原声 OST=1 仅 {validation['ost1_count']} 段（必须≥{validation['ost1_min']}），"
+                        f"解说 OST=0 仅 {validation['ost0_count']} 段（必须≥{validation['ost0_min']}），"
+                        f"总段数 {validation['total']}（必须≥{validation['total_min']}）。"
+                        f"请输出完整 JSON，OST=0 解说段必须穿插在原声段之间，"
+                        f"至少 {validation['ost0_min']} 段 OST=0、{validation['ost1_min']} 段 OST=1。"
                     )
                 else:
                     narration_dict["items"] = optimized_items
-                    logger.warning(f"重试后段数仍未达标: {validation['message']}")
+                    logger.warning(f"LLM 重试后段数仍未达标: {validation['message']}")
+
+            if narration_dict and "items" in narration_dict and validation and not validation["ok"]:
+                update_progress(72, "段数不足，正在按配置自动补段...")
+                supplemented_items, validation = supplement_film_tv_segment_counts(
+                    narration_dict["items"],
+                    subtitle_content=subtitle_content,
+                    source_duration_sec=source_duration_sec or None,
+                    settings=film_tv_settings,
+                )
+                if any(item.get("narration") == AUTO_NARRATION_MARKER for item in supplemented_items):
+                    update_progress(78, "正在为补入的解说段撰写文案...")
+                    supplemented_items = _fill_auto_narrations_with_llm(
+                        supplemented_items,
+                        film_name=film_name,
+                        plot_analysis=analysis_result["analysis"],
+                        film_tv_settings=film_tv_settings,
+                        text_api_key=text_api_key,
+                        text_model=text_model,
+                        text_base_url=text_base_url,
+                        text_provider=text_provider,
+                        temperature=retry_temperature,
+                    )
+                optimized_items = optimize_film_tv_script(
+                    supplemented_items,
+                    subtitle_content=subtitle_content,
+                    source_duration_sec=source_duration_sec or None,
+                    settings=film_tv_settings,
+                )
+                validation = validate_film_tv_script_counts(optimized_items, film_tv_settings)
+                narration_dict["items"] = optimized_items
+                supplemented = True
 
             if narration_result is None or narration_result["status"] != "success":
                 logger.error(f"解说文案生成失败: {narration_result.get('message', 'unknown') if narration_result else 'unknown'}")
@@ -241,10 +358,15 @@ def generate_script_film_tv_summary(params, subtitle_path, video_theme, temperat
 
             if validation and not validation["ok"]:
                 st.warning(
-                    f"脚本段数未完全达到配置要求：原声 {validation['ost1_count']}/{validation['ost1_min']} 段，"
+                    f"脚本段数仍未完全达标：原声 {validation['ost1_count']}/{validation['ost1_min']} 段，"
                     f"解说 {validation['ost0_count']}/{validation['ost0_min']} 段，"
                     f"共 {validation['total']}/{validation['total_min']} 段。"
-                    f"已自动重试一次，建议调高 temperature 或再次点击生成。"
+                    f"已自动重试并补段，建议检查补入片段文案或再次生成。"
+                )
+            elif supplemented and validation and validation["ok"]:
+                st.info(
+                    f"段数已按配置自动补全：原声 {validation['ost1_count']} 段，"
+                    f"解说 {validation['ost0_count']} 段（含程序补段，请预览解说文案）。"
                 )
 
             script = json.dumps(narration_dict["items"], ensure_ascii=False, indent=2)

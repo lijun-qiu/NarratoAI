@@ -14,6 +14,9 @@ from loguru import logger
 
 from app.services.update_script import calculate_duration
 from app.services.film_tv_settings import get_film_tv_settings
+from app.services.srt_utils import extract_entries_in_range, parse_srt
+
+AUTO_NARRATION_MARKER = "__AUTO_NARRATION__"
 
 _SRT_BLOCK_RE = re.compile(
     r"(\d{2}:\d{2}:\d{2},\d{3})\s*-->\s*(\d{2}:\d{2}:\d{2},\d{3})",
@@ -309,6 +312,243 @@ def validate_film_tv_script_counts(
         "total_min": total_min,
         "message": message,
     }
+
+
+def _collect_item_ranges(items: List[Dict[str, Any]]) -> List[Tuple[float, float]]:
+    ranges: List[Tuple[float, float]] = []
+    for item in items:
+        try:
+            ranges.append(parse_timestamp_range(item["timestamp"]))
+        except (ValueError, AttributeError, KeyError):
+            continue
+    return ranges
+
+
+def _merge_time_ranges(ranges: List[Tuple[float, float]], gap: float = 0.5) -> List[Tuple[float, float]]:
+    if not ranges:
+        return []
+    merged = [ranges[0]]
+    for start, end in sorted(ranges, key=lambda r: r[0])[1:]:
+        prev_start, prev_end = merged[-1]
+        if start <= prev_end + gap:
+            merged[-1] = (prev_start, max(prev_end, end))
+        else:
+            merged.append((start, end))
+    return merged
+
+
+def _find_timeline_gaps(
+    occupied: List[Tuple[float, float]],
+    source_duration: float,
+    min_gap: float,
+) -> List[Tuple[float, float]]:
+    gaps: List[Tuple[float, float]] = []
+    cursor = 0.0
+    for start, end in _merge_time_ranges(occupied):
+        if start - cursor >= min_gap:
+            gaps.append((cursor, start))
+        cursor = max(cursor, end)
+    if source_duration - cursor >= min_gap:
+        gaps.append((cursor, source_duration))
+    gaps.sort(key=lambda g: g[1] - g[0], reverse=True)
+    return gaps
+
+
+def _picture_hint_from_subtitle(
+    srt_entries: list,
+    start_sec: float,
+    end_sec: float,
+) -> str:
+    if not srt_entries:
+        return "剧情过渡"
+    clipped = extract_entries_in_range(
+        srt_entries,
+        int(round(start_sec * 1000)),
+        int(round(end_sec * 1000)),
+    )
+    if not clipped:
+        return "剧情过渡"
+    text = clipped[0].text.strip().replace("\n", " ")
+    if len(text) > 24:
+        return text[:24]
+    return text or "剧情过渡"
+
+
+def _renumber_items_by_time(items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    def sort_key(item: Dict[str, Any]) -> Tuple[float, int]:
+        try:
+            start, _ = parse_timestamp_range(item["timestamp"])
+            return start, int(item.get("_id", 0) or 0)
+        except (ValueError, AttributeError, KeyError):
+            return 0.0, int(item.get("_id", 0) or 0)
+
+    ordered = sorted(items, key=sort_key)
+    for idx, item in enumerate(ordered, 1):
+        item["_id"] = idx
+    return ordered
+
+
+def supplement_film_tv_segment_counts(
+    items: List[Dict[str, Any]],
+    subtitle_content: str = "",
+    source_duration_sec: Optional[float] = None,
+    settings: Optional[Dict[str, Any]] = None,
+) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
+    """
+    当 LLM 输出段数不足时，依据字幕时间轴在空白区间自动补 OST=1 / OST=0 段。
+    补入的 OST=0 解说文案标记为 AUTO_NARRATION_MARKER，需后续 LLM 填充。
+    """
+    settings = get_film_tv_settings(settings)
+    result = [dict(item) for item in items]
+    validation = validate_film_tv_script_counts(result, settings)
+    if validation["ok"]:
+        return result, validation
+
+    cues = parse_srt_cues(subtitle_content)
+    srt_entries = parse_srt(subtitle_content) if subtitle_content else []
+
+    if source_duration_sec is None or source_duration_sec <= 0:
+        if cues:
+            source_duration_sec = max(end for _, end in cues) + 1.0
+        else:
+            ends = [end for _, end in _collect_item_ranges(result)]
+            source_duration_sec = (max(ends) + 1.0) if ends else 600.0
+
+    ost1_min = int(settings["ost1_duration_min"])
+    ost1_max = int(settings["ost1_duration_max"])
+    next_id = max((int(i.get("_id", 0) or 0) for i in result), default=0) + 1
+
+    ost1_need = max(0, validation["ost1_min"] - validation["ost1_count"])
+    if ost1_need > 0 and cues:
+        occupied = _merge_time_ranges(_collect_item_ranges(result))
+        gaps = _find_timeline_gaps(occupied, source_duration_sec, min_gap=float(ost1_min))
+        added = 0
+        for gap_start, gap_end in gaps:
+            if added >= ost1_need:
+                break
+            gap_cues = [(s, e) for s, e in cues if e > gap_start and s < gap_end]
+            if not gap_cues:
+                continue
+            clip_start = max(gap_start, min(s for s, _ in gap_cues))
+            clip_end = min(gap_end, max(e for _, e in gap_cues))
+            duration = clip_end - clip_start
+            if duration < ost1_min:
+                continue
+            if duration > ost1_max:
+                clip_end = clip_start + ost1_max
+            result.append(
+                {
+                    "_id": next_id,
+                    "timestamp": format_timestamp_range(clip_start, clip_end),
+                    "picture": _picture_hint_from_subtitle(srt_entries, clip_start, clip_end),
+                    "narration": f"播放原片{next_id}",
+                    "OST": 1,
+                }
+            )
+            next_id += 1
+            added += 1
+        if added:
+            logger.info(f"自动补入 {added} 段 OST=1 原声")
+
+    validation = validate_film_tv_script_counts(result, settings)
+    ost0_need = max(0, validation["ost0_min"] - validation["ost0_count"])
+    if ost0_need > 0:
+        occupied = _merge_time_ranges(_collect_item_ranges(result))
+        gaps = _find_timeline_gaps(occupied, source_duration_sec, min_gap=10.0)
+        added = 0
+        for gap_start, gap_end in gaps:
+            if added >= ost0_need:
+                break
+            available = gap_end - gap_start
+            if available < 10.0:
+                continue
+            seg_len = min(15.0, max(12.0, available * 0.8))
+            seg_start = gap_start + (available - seg_len) / 2.0
+            seg_end = seg_start + seg_len
+            result.append(
+                {
+                    "_id": next_id,
+                    "timestamp": format_timestamp_range(seg_start, seg_end),
+                    "picture": _picture_hint_from_subtitle(srt_entries, seg_start, seg_end),
+                    "narration": AUTO_NARRATION_MARKER,
+                    "OST": 0,
+                }
+            )
+            next_id += 1
+            added += 1
+        if added:
+            logger.info(f"自动补入 {added} 段 OST=0 解说（待填充文案，来自时间轴空白）")
+
+    validation = validate_film_tv_script_counts(result, settings)
+    ost0_need = max(0, validation["ost0_min"] - validation["ost0_count"])
+    if ost0_need > 0:
+        occupied = _merge_time_ranges(_collect_item_ranges(result))
+        ost0_min_target = int(settings["ost0_segment_min"])
+        bin_size = source_duration_sec / max(ost0_min_target, 1)
+        ost0_starts = {
+            parse_timestamp_range(item["timestamp"])[0]
+            for item in result
+            if item.get("OST") == 0
+        }
+        added = 0
+        for bin_idx in range(ost0_min_target):
+            if ost0_need <= 0:
+                break
+            bin_start = bin_idx * bin_size
+            bin_end = min(source_duration_sec, (bin_idx + 1) * bin_size)
+            if any(bin_start <= start < bin_end for start in ost0_starts):
+                continue
+            seg_len = min(15.0, max(12.0, bin_end - bin_start - 0.5))
+            if seg_len < 10.0 or bin_end - bin_start < 10.0:
+                continue
+            seg_start = bin_start + max(0.0, (bin_end - bin_start - seg_len) / 2.0)
+            seg_end = seg_start + seg_len
+            result.append(
+                {
+                    "_id": next_id,
+                    "timestamp": format_timestamp_range(seg_start, seg_end),
+                    "picture": _picture_hint_from_subtitle(srt_entries, seg_start, seg_end),
+                    "narration": AUTO_NARRATION_MARKER,
+                    "OST": 0,
+                }
+            )
+            next_id += 1
+            added += 1
+            ost0_need -= 1
+            ost0_starts.add(seg_start)
+            occupied = _merge_time_ranges(_collect_item_ranges(result))
+        if added:
+            logger.info(f"自动补入 {added} 段 OST=0 解说（均匀分桶，待填充文案）")
+
+    result = _renumber_items_by_time(result)
+    validation = validate_film_tv_script_counts(result, settings)
+    if not validation["ok"]:
+        logger.warning(f"自动补段后仍未达标: {validation['message']}")
+    else:
+        logger.info("自动补段后段数已达标")
+    return result, validation
+
+
+def fill_auto_narration_placeholders(
+    items: List[Dict[str, Any]],
+    settings: Optional[Dict[str, Any]] = None,
+) -> List[Dict[str, Any]]:
+    """无 LLM 时用 picture 生成兜底解说，去掉 AUTO 标记。"""
+    settings = get_film_tv_settings(settings)
+    chars_min = int(settings["narration_chars_min"])
+    chars_max = int(settings["narration_chars_max"])
+    result = [dict(item) for item in items]
+    for item in result:
+        if item.get("narration") != AUTO_NARRATION_MARKER:
+            continue
+        picture = str(item.get("picture") or "剧情").strip()
+        text = f"此时，{picture}。随着调查深入，更多线索浮出水面。"
+        if len(text) < chars_min:
+            text += "真相往往藏在细节之中。"
+        if len(text) > chars_max:
+            text = text[:chars_max]
+        item["narration"] = text
+    return result
 
 
 def optimize_film_tv_script(

@@ -23,9 +23,12 @@ class ScriptGenerationPrompt(ParameterizedPrompt):
             output_format=OutputFormat.JSON,
             tags=["电影", "电视剧", "影视解说", "解说脚本", "原声片段"],
             parameters=["film_name", "plot_analysis", "subtitle_content", "work_brief",
-                        "source_duration_minutes", "target_output_minutes",
-                        "ost1_duration_min", "ost1_duration_max",
-                        "ost1_segment_min", "ost1_segment_max"],
+                        "source_duration_minutes", "target_output_minutes", "target_duration_percent",
+                        "ost1_duration_min", "ost1_duration_max", "ost1_duration_long_max",
+                        "ost1_segment_min", "ost1_segment_max",
+                        "ost0_segment_min", "ost0_segment_max",
+                        "original_audio_percent", "narration_percent",
+                        "narration_chars_min", "narration_chars_max", "opening_chars_max"],
         )
         super().__init__(metadata, required_parameters=["film_name", "plot_analysis"])
 
@@ -54,7 +57,7 @@ ${work_brief}
 
 ## ⚠️ 成片时长目标（硬性要求）
 - 原片时长约 **${source_duration_minutes} 分钟**
-- **成片总时长必须达到约 ${target_output_minutes} 分钟**（约为原片的 40%）
+- **成片总时长必须达到约 ${target_output_minutes} 分钟**（约为原片的 ${target_duration_percent}%）
 - 生成前请自行估算：所有 OST=1 时间戳跨度之和 + 所有 OST=0 解说 TTS 时长之和 ≈ ${target_output_minutes} 分钟
 - **严禁**生成总时长不足 1 分钟的脚本（原声段过短是主要原因）
 
@@ -62,12 +65,12 @@ ${work_brief}
 
 | 类型 | 目标占比 | 说明 |
 |------|----------|------|
-| **原声 OST=1** | **约 70%–80%** | 成片的大部分时间播放原片 |
-| **解说 OST=0** | **约 20%–30%** | 仅作短旁白串联 |
+| **原声 OST=1** | **约 ${original_audio_percent}%** | 成片的大部分时间播放原片 |
+| **解说 OST=0** | **约 ${narration_percent}%** | 仅作短旁白串联 |
 
 **实现方式（在遵守剪辑引擎规则的前提下）：**
-- 多安排 **OST=1** 段，且每段 **${ost1_duration_min}–${ost1_duration_max} 秒**（低于 ${ost1_duration_min} 秒的会被丢弃或无效）
-- **OST=0** 段数要少、每段 **60–100 字**（成片约 10–18 秒），点到为止
+- 多安排 **OST=1** 段（**${ost1_segment_min}–${ost1_segment_max} 段**），且每段 **${ost1_duration_min}–${ost1_duration_max} 秒**（低于 ${ost1_duration_min} 秒的会被丢弃或无效）
+- **OST=0** 段数 **${ost0_segment_min}–${ost0_segment_max} 段**、每段 **${narration_chars_min}–${narration_chars_max} 字**（开场可至 ${opening_chars_max} 字），点到为止
 
 ## 素材信息
 
@@ -92,7 +95,7 @@ ${subtitle_content}
 
 因此：
 - 要**增加原声占比** → 增加 OST=1 段数（**${ost1_segment_min}–${ost1_segment_max} 段**）、拉长每段 OST=1 时间戳（**${ost1_duration_min}–${ost1_duration_max} 秒**）
-- 要**减少解说占比** → 减少 OST=0 段数、缩短每段解说（60–100 字），不要写 150 字以上的长旁白
+- 要**减少解说占比** → 减少 OST=0 段数、缩短每段解说（${narration_chars_min}–${narration_chars_max} 字），不要写超过 ${opening_chars_max} 字的长旁白
 - **致命错误**：OST=1 只框 1–3 秒的单句台词 → 成片会极短，必须框住完整对话（${ost1_duration_min} 秒以上）
 
 其他硬性规则：
@@ -126,9 +129,9 @@ OST=1 → OST=1 → OST=0 → OST=1 → OST=1 → OST=0   ✅ 连续原声播完
 
 ## 推荐结构（原声为主）
 
-### 片段数量（5 分钟原片参考）
-- **OST=1 原声：10–15 段**（主力）
-- **OST=0 解说：5–8 段**（点缀）
+### 片段数量（参考）
+- **OST=1 原声：${ost1_segment_min}–${ost1_segment_max} 段**（主力）
+- **OST=0 解说：${ost0_segment_min}–${ost0_segment_max} 段**（点缀）
 - 总 `items` 约 **15–22 个**
 
 ### 推荐节奏
@@ -146,10 +149,10 @@ OST=1 → OST=1 → OST=0 → OST=1 → OST=1 → OST=0   ✅ 连续原声播完
 - `narration` 固定：`播放原片+序号`
 
 ### 解说段（OST=0）怎么写
-- 每段 **60–100 字**（上限 120 字），**不要超过 100 字为佳**
+- 每段 **${narration_chars_min}–${narration_chars_max} 字**（上限 ${opening_chars_max} 字），**不要超过 ${narration_chars_max} 字为佳**
 - 只负责：开场钩子、段落过渡、一句点评、结尾点题
 - 禁止用大段旁白复述剧情（剧情交给原声展示）
-- 开场可略长至 **100–120 字**，其余段尽量 **60–80 字**
+- 开场可略长至 **${opening_chars_max} 字**，其余段尽量 **${narration_chars_min}–${narration_chars_max} 字**
 
 ---
 
@@ -211,13 +214,13 @@ OST=1 → OST=1 → OST=0 → OST=1 → OST=1 → OST=0   ✅ 连续原声播完
 ## 质量标准
 
 ### 必须达到
-- 成片时长构成：**原声约 70%–80%，解说约 20%–30%**（生成时按段数与字数估算）
+- 成片时长构成：**原声约 ${original_audio_percent}%，解说约 ${narration_percent}%**
 - OST=1：**${ost1_segment_min}–${ost1_segment_max} 段**，每段 **${ost1_duration_min}–${ost1_duration_max} 秒**
-- OST=0：**5–8 段**，每段 **60–100 字**（个别开场不超过 120 字）
+- OST=0：**${ost0_segment_min}–${ost0_segment_max} 段**，每段 **${narration_chars_min}–${narration_chars_max} 字**（开场不超过 ${opening_chars_max} 字）
 
 ### 输出前自检
 - [ ] OST=1 段数 ≥ OST=0 段数（最好 OST=1 约为 OST=0 的 2 倍）
-- [ ] 无 OST=0 段超过 120 字
+- [ ] 无 OST=0 段超过 ${opening_chars_max} 字
 - [ ] 无 OST=1 段短于 ${ost1_duration_min} 秒
 - [ ] 估算成片总时长 ≥ ${target_output_minutes} 分钟
 - [ ] 原片时间戳无重叠

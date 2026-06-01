@@ -8,8 +8,9 @@ import asyncio
 import io
 import base64
 import re
+from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, AsyncIterator, Dict, List, Optional, Union
 
 import PIL.Image
 from loguru import logger
@@ -88,6 +89,24 @@ class _OpenAICompatibleBase:
             max_retries=max_retries,
         )
 
+    @asynccontextmanager
+    async def _open_client(
+        self,
+        api_key_override: Optional[str] = None,
+        base_url_override: Optional[str] = None,
+        timeout_override: Optional[float] = None,
+    ) -> AsyncIterator[AsyncOpenAI]:
+        """构建并在使用后关闭 AsyncOpenAI，避免事件循环关闭后 httpx 清理报错。"""
+        client = self._build_client(
+            api_key_override=api_key_override,
+            base_url_override=base_url_override,
+            timeout_override=timeout_override,
+        )
+        try:
+            yield client
+        finally:
+            await client.close()
+
 
 class OpenAICompatibleVisionProvider(_OpenAICompatibleBase, VisionModelProvider):
     """OpenAI 兼容视觉模型提供商。"""
@@ -140,39 +159,38 @@ class OpenAICompatibleVisionProvider(_OpenAICompatibleBase, VisionModelProvider)
         messages = [{"role": "user", "content": content}]
         model_name = _normalize_model_name(self.model_name)
 
-        client = self._build_client(
+        async with self._open_client(
             api_key_override=kwargs.get("api_key"),
             base_url_override=kwargs.get("api_base"),
             timeout_override=config.app.get("llm_vision_timeout", 120),
-        )
-
-        try:
-            response = await client.chat.completions.create(
-                model=model_name,
-                messages=messages,
-                temperature=kwargs.get("temperature", 1.0),
-                max_tokens=kwargs.get("max_tokens", 4000),
-            )
-            if response.choices and response.choices[0].message and response.choices[0].message.content:
-                return response.choices[0].message.content
-            raise APICallError("OpenAI 兼容接口返回空响应")
-        except OpenAIAuthError as exc:
-            logger.error(f"OpenAI 兼容接口认证失败: {exc}")
-            raise AuthenticationError(str(exc))
-        except OpenAIRateLimitError as exc:
-            logger.error(f"OpenAI 兼容接口速率限制: {exc}")
-            raise RateLimitError(str(exc))
-        except OpenAIBadRequestError as exc:
-            error_msg = str(exc)
-            if _is_content_filter_error(error_msg):
-                raise ContentFilterError(f"内容被安全过滤器阻止: {error_msg}")
-            raise APICallError(f"请求错误: {error_msg}")
-        except OpenAIAPIError as exc:
-            logger.error(f"OpenAI 兼容接口 API 错误: {exc}")
-            raise APICallError(f"API 错误: {exc}")
-        except Exception as exc:
-            logger.error(f"OpenAI 兼容接口调用失败: {exc}")
-            raise APICallError(f"调用失败: {exc}")
+        ) as client:
+            try:
+                response = await client.chat.completions.create(
+                    model=model_name,
+                    messages=messages,
+                    temperature=kwargs.get("temperature", 1.0),
+                    max_tokens=kwargs.get("max_tokens", 4000),
+                )
+                if response.choices and response.choices[0].message and response.choices[0].message.content:
+                    return response.choices[0].message.content
+                raise APICallError("OpenAI 兼容接口返回空响应")
+            except OpenAIAuthError as exc:
+                logger.error(f"OpenAI 兼容接口认证失败: {exc}")
+                raise AuthenticationError(str(exc))
+            except OpenAIRateLimitError as exc:
+                logger.error(f"OpenAI 兼容接口速率限制: {exc}")
+                raise RateLimitError(str(exc))
+            except OpenAIBadRequestError as exc:
+                error_msg = str(exc)
+                if _is_content_filter_error(error_msg):
+                    raise ContentFilterError(f"内容被安全过滤器阻止: {error_msg}")
+                raise APICallError(f"请求错误: {error_msg}")
+            except OpenAIAPIError as exc:
+                logger.error(f"OpenAI 兼容接口 API 错误: {exc}")
+                raise APICallError(f"API 错误: {exc}")
+            except Exception as exc:
+                logger.error(f"OpenAI 兼容接口调用失败: {exc}")
+                raise APICallError(f"调用失败: {exc}")
 
     def _image_to_base64(self, img: PIL.Image.Image) -> str:
         img_buffer = io.BytesIO()
@@ -198,12 +216,6 @@ class OpenAICompatibleTextProvider(_OpenAICompatibleBase, TextModelProvider):
         messages = self._build_messages(prompt, system_prompt)
         model_name = _normalize_model_name(self.model_name)
 
-        client = self._build_client(
-            api_key_override=kwargs.get("api_key"),
-            base_url_override=kwargs.get("api_base"),
-            timeout_override=config.app.get("llm_text_timeout", 180),
-        )
-
         completion_kwargs: Dict[str, Any] = {
             "model": model_name,
             "messages": messages,
@@ -214,41 +226,45 @@ class OpenAICompatibleTextProvider(_OpenAICompatibleBase, TextModelProvider):
         if response_format == "json":
             completion_kwargs["response_format"] = {"type": "json_object"}
 
-        try:
-            response = await client.chat.completions.create(**completion_kwargs)
-            if response.choices and response.choices[0].message and response.choices[0].message.content:
-                return response.choices[0].message.content
-            raise APICallError("OpenAI 兼容接口返回空响应")
-
-        except OpenAIBadRequestError as exc:
-            error_msg = str(exc)
-            # 某些网关不支持 response_format，回退到提示词约束模式
-            if response_format == "json" and _is_response_format_error(error_msg):
-                logger.warning("目标网关不支持 response_format，回退为提示词约束 JSON 输出")
-                completion_kwargs.pop("response_format", None)
-                messages[-1]["content"] += "\n\n请确保输出严格的JSON格式，不要包含任何其他文字或标记。"
-
-                retry_response = await client.chat.completions.create(**completion_kwargs)
-                if retry_response.choices and retry_response.choices[0].message and retry_response.choices[0].message.content:
-                    return _clean_json_output(retry_response.choices[0].message.content)
+        async with self._open_client(
+            api_key_override=kwargs.get("api_key"),
+            base_url_override=kwargs.get("api_base"),
+            timeout_override=config.app.get("llm_text_timeout", 180),
+        ) as client:
+            try:
+                response = await client.chat.completions.create(**completion_kwargs)
+                if response.choices and response.choices[0].message and response.choices[0].message.content:
+                    return response.choices[0].message.content
                 raise APICallError("OpenAI 兼容接口返回空响应")
 
-            if _is_content_filter_error(error_msg):
-                raise ContentFilterError(f"内容被安全过滤器阻止: {error_msg}")
-            raise APICallError(f"请求错误: {error_msg}")
+            except OpenAIBadRequestError as exc:
+                error_msg = str(exc)
+                if response_format == "json" and _is_response_format_error(error_msg):
+                    logger.warning("目标网关不支持 response_format，回退为提示词约束 JSON 输出")
+                    completion_kwargs.pop("response_format", None)
+                    messages[-1]["content"] += "\n\n请确保输出严格的JSON格式，不要包含任何其他文字或标记。"
 
-        except OpenAIAuthError as exc:
-            logger.error(f"OpenAI 兼容接口认证失败: {exc}")
-            raise AuthenticationError(str(exc))
-        except OpenAIRateLimitError as exc:
-            logger.error(f"OpenAI 兼容接口速率限制: {exc}")
-            raise RateLimitError(str(exc))
-        except OpenAIAPIError as exc:
-            logger.error(f"OpenAI 兼容接口 API 错误: {exc}")
-            raise APICallError(f"API 错误: {exc}")
-        except Exception as exc:
-            logger.error(f"OpenAI 兼容接口调用失败: {exc}")
-            raise APICallError(f"调用失败: {exc}")
+                    retry_response = await client.chat.completions.create(**completion_kwargs)
+                    if retry_response.choices and retry_response.choices[0].message and retry_response.choices[0].message.content:
+                        return _clean_json_output(retry_response.choices[0].message.content)
+                    raise APICallError("OpenAI 兼容接口返回空响应")
+
+                if _is_content_filter_error(error_msg):
+                    raise ContentFilterError(f"内容被安全过滤器阻止: {error_msg}")
+                raise APICallError(f"请求错误: {error_msg}")
+
+            except OpenAIAuthError as exc:
+                logger.error(f"OpenAI 兼容接口认证失败: {exc}")
+                raise AuthenticationError(str(exc))
+            except OpenAIRateLimitError as exc:
+                logger.error(f"OpenAI 兼容接口速率限制: {exc}")
+                raise RateLimitError(str(exc))
+            except OpenAIAPIError as exc:
+                logger.error(f"OpenAI 兼容接口 API 错误: {exc}")
+                raise APICallError(f"API 错误: {exc}")
+            except Exception as exc:
+                logger.error(f"OpenAI 兼容接口调用失败: {exc}")
+                raise APICallError(f"调用失败: {exc}")
 
     async def _make_api_call(self, payload: Dict[str, Any]) -> Dict[str, Any]:
         return payload

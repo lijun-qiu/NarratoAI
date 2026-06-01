@@ -3,6 +3,7 @@ import glob
 import json
 import time
 import traceback
+from copy import deepcopy
 import streamlit as st
 from loguru import logger
 
@@ -14,6 +15,11 @@ from webui.tools.generate_script_docu import generate_script_docu
 from webui.tools.generate_script_short import generate_script_short
 from webui.tools.generate_short_summary import generate_script_short_sunmmary
 from webui.tools.generate_film_tv_summary import generate_script_film_tv_summary
+from app.services.film_tv_settings import (
+    FILM_TV_DEFAULTS,
+    get_film_tv_settings,
+    save_film_tv_settings_to_config,
+)
 
 
 def render_script_panel(tr):
@@ -339,7 +345,135 @@ def short_drama_summary(tr):
 
 def film_tv_narration(tr):
     """影视解说 渲染视频主题和提示词"""
-    return render_subtitle_narration_panel(tr, work_name_label="Film Title", uploader_key="film_tv_subtitle_uploader")
+    video_theme = render_subtitle_narration_panel(
+        tr, work_name_label="Film Title", uploader_key="film_tv_subtitle_uploader"
+    )
+    render_film_tv_rules_settings(tr)
+    return video_theme
+
+
+def render_film_tv_rules_settings(tr):
+    """影视解说规则参数调节面板（默认与 config.toml [film_tv] 一致）。"""
+    defaults = get_film_tv_settings()
+    saved = st.session_state.get("film_tv_settings")
+    base = saved if isinstance(saved, dict) else defaults
+
+    with st.expander("影视解说规则参数", expanded=True):
+        st.caption("调节生成脚本与后处理规则；默认值来自 config.toml，可临时调整或保存为默认。")
+
+        c1, c2 = st.columns(2)
+        with c1:
+            target_duration_percent = st.slider(
+                "成片时长占原片比例 (%)",
+                min_value=20, max_value=80, value=int(base["target_duration_percent"]),
+                help="例如 40 表示 6 分钟原片 → 约 2.4 分钟成片",
+                key="ftv_target_duration_percent",
+            )
+            ost1_duration_min = st.slider(
+                "原声片段最短 (秒)", 5, 20, int(base["ost1_duration_min"]),
+                key="ftv_ost1_duration_min",
+            )
+            ost1_duration_max = st.slider(
+                "原声片段最长 (秒)", 8, 30, int(base["ost1_duration_max"]),
+                key="ftv_ost1_duration_max",
+            )
+            ost1_duration_long_max = st.slider(
+                "名场面原声最长 (秒)", 10, 30, int(base["ost1_duration_long_max"]),
+                key="ftv_ost1_duration_long_max",
+            )
+            original_audio_percent = st.slider(
+                "原声占比目标 (%)", 50, 90, int(base["original_audio_percent"]),
+                key="ftv_original_audio_percent",
+            )
+        with c2:
+            ost1_segment_min = st.slider(
+                "原声段数最少", 5, 20, int(base["ost1_segment_min"]),
+                key="ftv_ost1_segment_min",
+            )
+            ost1_segment_max = st.slider(
+                "原声段数最多", 8, 25, int(base["ost1_segment_max"]),
+                key="ftv_ost1_segment_max",
+            )
+            ost0_segment_min = st.slider(
+                "解说段数最少", 3, 12, int(base["ost0_segment_min"]),
+                key="ftv_ost0_segment_min",
+            )
+            ost0_segment_max = st.slider(
+                "解说段数最多", 5, 15, int(base["ost0_segment_max"]),
+                key="ftv_ost0_segment_max",
+            )
+            narration_percent = st.slider(
+                "解说占比目标 (%)", 10, 50, int(base["narration_percent"]),
+                key="ftv_narration_percent",
+            )
+
+        c3, c4, c5 = st.columns(3)
+        with c3:
+            narration_chars_min = st.slider(
+                "解说字数下限", 30, 100, int(base["narration_chars_min"]),
+                key="ftv_narration_chars_min",
+            )
+        with c4:
+            narration_chars_max = st.slider(
+                "解说字数上限", 60, 150, int(base["narration_chars_max"]),
+                key="ftv_narration_chars_max",
+            )
+        with c5:
+            opening_chars_max = st.slider(
+                "开场解说字数上限", 80, 150, int(base["opening_chars_max"]),
+                key="ftv_opening_chars_max",
+            )
+
+        allow_consecutive_ost1 = st.checkbox(
+            "允许连续多段原声（不打断）",
+            value=bool(base.get("allow_consecutive_ost1", True)),
+            key="ftv_allow_consecutive_ost1",
+        )
+        enforce_narration_after_ost1 = st.checkbox(
+            "原声播放期间禁止插入解说（自动修正脚本顺序）",
+            value=bool(base.get("enforce_narration_after_ost1", True)),
+            key="ftv_enforce_narration_after_ost1",
+        )
+
+        if ost1_duration_min > ost1_duration_max:
+            st.warning("原声最短时长不能大于最长时长，生成时将自动对调。")
+        if ost1_segment_min > ost1_segment_max:
+            st.warning("原声段数最少不能大于最多，生成时将自动对调。")
+        if ost0_segment_min > ost0_segment_max:
+            st.warning("解说段数最少不能大于最多，生成时将自动对调。")
+        if narration_chars_min > narration_chars_max:
+            st.warning("解说字数下限不能大于上限，生成时将自动对调。")
+
+        settings = {
+            "target_duration_percent": target_duration_percent,
+            "ost1_duration_min": min(ost1_duration_min, ost1_duration_max),
+            "ost1_duration_max": max(ost1_duration_min, ost1_duration_max),
+            "ost1_duration_long_max": ost1_duration_long_max,
+            "ost1_segment_min": min(ost1_segment_min, ost1_segment_max),
+            "ost1_segment_max": max(ost1_segment_min, ost1_segment_max),
+            "ost0_segment_min": min(ost0_segment_min, ost0_segment_max),
+            "ost0_segment_max": max(ost0_segment_min, ost0_segment_max),
+            "original_audio_percent": original_audio_percent,
+            "narration_percent": narration_percent,
+            "narration_chars_min": min(narration_chars_min, narration_chars_max),
+            "narration_chars_max": max(narration_chars_min, narration_chars_max),
+            "opening_chars_max": opening_chars_max,
+            "allow_consecutive_ost1": allow_consecutive_ost1,
+            "enforce_narration_after_ost1": enforce_narration_after_ost1,
+        }
+        st.session_state["film_tv_settings"] = settings
+
+        btn1, btn2 = st.columns(2)
+        with btn1:
+            if st.button("恢复默认规则", key="ftv_reset_defaults", use_container_width=True):
+                st.session_state["film_tv_settings"] = deepcopy(FILM_TV_DEFAULTS)
+                st.rerun()
+        with btn2:
+            if st.button("保存为 config.toml 默认", key="ftv_save_config", use_container_width=True):
+                if save_film_tv_settings_to_config(settings):
+                    st.success("已保存到 config.toml [film_tv]")
+                else:
+                    st.error("保存失败，请查看日志")
 
 
 def render_subtitle_narration_panel(tr, work_name_label: str, uploader_key: str):
@@ -550,7 +684,10 @@ def render_script_buttons(tr, params):
             subtitle_path = st.session_state.get('subtitle_path')
             video_theme = st.session_state.get('video_theme')
             temperature = st.session_state.get('temperature')
-            generate_script_film_tv_summary(params, subtitle_path, video_theme, temperature)
+            film_tv_settings = st.session_state.get("film_tv_settings")
+            generate_script_film_tv_summary(
+                params, subtitle_path, video_theme, temperature, film_tv_settings=film_tv_settings
+            )
         else:
             load_script(tr, script_path)
 

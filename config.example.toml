@@ -193,6 +193,10 @@ ost0_segment_max = 8
 original_audio_percent = 75
 narration_percent = 25
 allow_consecutive_ost1 = true
+enforce_narration_after_ost1 = true
+narration_chars_min = 60
+narration_chars_max = 100
+opening_chars_max = 120
 
 [frames]
     # 提取关键帧的间隔时间（秒）

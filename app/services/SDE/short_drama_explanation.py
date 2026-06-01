@@ -104,7 +104,7 @@ class SubtitleAnalyzer:
             "subtitle_content": subtitle_content,
         }
         if self.prompt_category == "film_tv_narration":
-            from app.services.film_tv_script_optimizer import get_film_tv_script_prompt_params
+            from app.services.film_tv_settings import get_film_tv_script_prompt_params
             parameters.update(get_film_tv_script_prompt_params())
             parameters["work_brief"] = work_brief or "（未提供作品调研简报）"
         parameters.update(self.script_extra_params)

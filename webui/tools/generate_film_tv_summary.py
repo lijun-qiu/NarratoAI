@@ -16,7 +16,8 @@ from loguru import logger
 
 from app.config import config
 from app.services.SDE.short_drama_explanation import analyze_subtitle, generate_narration_script, research_film_work
-from app.services.film_tv_script_optimizer import get_film_tv_script_prompt_params, optimize_film_tv_script
+from app.services.film_tv_settings import get_film_tv_script_prompt_params
+from app.services.film_tv_script_optimizer import optimize_film_tv_script
 from app.services.subtitle_text import read_subtitle_text
 from app.utils.video_processor import VideoProcessor
 import app.services.llm  # noqa: F401 — 触发 LLM 提供商注册
@@ -26,7 +27,7 @@ from webui.tools.generate_short_summary import parse_and_fix_json
 PROMPT_CATEGORY = "film_tv_narration"
 
 
-def generate_script_film_tv_summary(params, subtitle_path, video_theme, temperature):
+def generate_script_film_tv_summary(params, subtitle_path, video_theme, temperature, film_tv_settings=None):
     """
     生成电影/电视剧解说视频脚本
     要求: 提供高质量字幕（可上传 SRT 或通过 Fun-ASR 转写）
@@ -69,7 +70,9 @@ def generate_script_film_tv_summary(params, subtitle_path, video_theme, temperat
             except Exception as e:
                 logger.warning(f"无法读取原片时长: {e}")
 
-            script_extra_params = get_film_tv_script_prompt_params(source_duration_sec)
+            script_extra_params = get_film_tv_script_prompt_params(
+                source_duration_sec, settings=film_tv_settings
+            )
 
             film_name = (video_theme or "").strip()
             if not film_name:
@@ -195,6 +198,7 @@ def generate_script_film_tv_summary(params, subtitle_path, video_theme, temperat
                 narration_dict["items"],
                 subtitle_content=subtitle_content,
                 source_duration_sec=source_duration_sec or None,
+                settings=film_tv_settings,
             )
             narration_dict["items"] = optimized_items
 

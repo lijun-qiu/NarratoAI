@@ -13,6 +13,7 @@ from typing import Any, Dict, List, Optional, Tuple
 from loguru import logger
 
 from app.services.update_script import calculate_duration
+from app.services.film_tv_settings import get_film_tv_settings
 
 _SRT_BLOCK_RE = re.compile(
     r"(\d{2}:\d{2}:\d{2},\d{3})\s*-->\s*(\d{2}:\d{2}:\d{2},\d{3})",
@@ -217,47 +218,6 @@ def expand_ost1_segment(
     return start_sec, end_sec
 
 
-def get_film_tv_script_prompt_params(source_duration_sec: Optional[float] = None) -> Dict[str, str]:
-    """构建影视解说提示词所需的时长/段数参数（含默认值）。"""
-    settings = get_film_tv_settings()
-    if source_duration_sec and source_duration_sec > 0:
-        source_minutes = source_duration_sec / 60
-        target_minutes = source_duration_sec * settings["target_duration_percent"] / 100 / 60
-    else:
-        source_minutes = 5.0
-        target_minutes = 2.0
-
-    return {
-        "source_duration_minutes": f"{source_minutes:.1f}",
-        "target_output_minutes": f"{target_minutes:.1f}",
-        "ost1_duration_min": str(int(settings["ost1_duration_min"])),
-        "ost1_duration_max": str(int(settings["ost1_duration_max"])),
-        "ost1_segment_min": str(settings["ost1_segment_min"]),
-        "ost1_segment_max": str(settings["ost1_segment_max"]),
-    }
-
-
-def get_film_tv_settings() -> Dict[str, Any]:
-    from app.config import config
-
-    film_tv = getattr(config, "film_tv", None) or {}
-    if not film_tv:
-        try:
-            from app.config.config import _cfg
-            film_tv = _cfg.get("film_tv", {})
-        except Exception:
-            film_tv = {}
-
-    return {
-        "ost1_duration_min": float(film_tv.get("ost1_duration_min", 10)),
-        "ost1_duration_max": float(film_tv.get("ost1_duration_max", 15)),
-        "ost1_duration_long_max": float(film_tv.get("ost1_duration_long_max", 18)),
-        "target_duration_percent": float(film_tv.get("target_duration_percent", 40)),
-        "ost1_segment_min": int(film_tv.get("ost1_segment_min", 10)),
-        "ost1_segment_max": int(film_tv.get("ost1_segment_max", 15)),
-    }
-
-
 def enforce_narration_after_ost1(items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """
     确保 OST=0 解说不打断 OST=1 原声：将夹在两个原声段之间的解说移到后续原声段播完之后。
@@ -310,6 +270,7 @@ def optimize_film_tv_script(
     items: List[Dict[str, Any]],
     subtitle_content: str = "",
     source_duration_sec: Optional[float] = None,
+    settings: Optional[Dict[str, Any]] = None,
 ) -> List[Dict[str, Any]]:
     """
     优化影视解说脚本，扩展过短的 OST=1 原声片段。
@@ -320,7 +281,7 @@ def optimize_film_tv_script(
     if not items:
         return items
 
-    settings = get_film_tv_settings()
+    settings = get_film_tv_settings(settings)
     min_duration = settings["ost1_duration_min"]
     max_duration = settings["ost1_duration_max"]
     cues = parse_srt_cues(subtitle_content)
@@ -388,6 +349,7 @@ def optimize_film_tv_script(
         )
 
     optimized = normalize_ost_types(optimized)
-    optimized = enforce_narration_after_ost1(optimized)
+    if settings.get("enforce_narration_after_ost1", True):
+        optimized = enforce_narration_after_ost1(optimized)
 
     return optimized

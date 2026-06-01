@@ -90,8 +90,10 @@ def render_script_file(tr, params):
         default_index = mode_keys.index(tr("Short Drama Summary"))
     elif current_path == "enhanced":
         default_index = mode_keys.index(tr("Enhanced Mix Narration"))
-    else:
+    elif current_path:
         default_index = mode_keys.index(tr("Select/Upload Script"))
+    else:
+        default_index = mode_keys.index(tr("Enhanced Mix Narration"))
 
     # 1. 渲染功能选择下拉框
     # 使用 segmented_control 替代 selectbox，提供更好的视觉体验
@@ -571,7 +573,7 @@ def render_gemini_transcription(tr):
     )
     default_provider = config.gemini_asr.get("provider", "auto") or "auto"
 
-    with st.expander("Gemini 字幕转录", expanded=True):
+    with st.expander("Gemini 字幕转录", expanded=False):
         st.caption(
             "上传本地音频/视频，使用 Gemini 多模态模型转写为 SRT 字幕。"
             "若代理返回 502，将自动重试并回退到 Whisper API。"
@@ -928,7 +930,7 @@ def get_script_params():
     """获取脚本参数"""
     return {
         'video_language': st.session_state.get('video_language', ''),
-        'video_clip_json_path': st.session_state.get('video_clip_json_path', ''),
+        'video_clip_json_path': st.session_state.get('video_clip_json_path', 'enhanced'),
         'video_origin_path': st.session_state.get('video_origin_path', ''),
         'video_name': st.session_state.get('video_name', ''),
         'video_plot': st.session_state.get('video_plot', ''),

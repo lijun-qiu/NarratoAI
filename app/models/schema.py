@@ -141,8 +141,8 @@ class VideoParams(BaseModel):
     bgm_volume: Optional[float] = AudioVolumeDefaults.BGM_VOLUME
 
     subtitle_enabled: Optional[bool] = True
-    subtitle_position: Optional[str] = "bottom"  # top, bottom, center
-    custom_position: float = 70.0
+    subtitle_position: Optional[str] = "custom"  # top, bottom, center, custom
+    custom_position: float = 58.0
     font_name: Optional[str] = "STHeitiMedium.ttc"
     text_fore_color: Optional[str] = "#FFFFFF"
     text_background_color: Optional[str] = "transparent"
@@ -188,8 +188,8 @@ class VideoClipParams(BaseModel):
     text_back_color: Optional[str] = None       # 文本背景色
     stroke_color: str = "black"                 # 描边颜色
     stroke_width: float = 1.5                   # 描边宽度
-    subtitle_position: str = "bottom"   # top, bottom, center, custom
-    custom_position: float = 70.0       # 自定义位置
+    subtitle_position: str = "custom"   # top, bottom, center, custom
+    custom_position: float = 58.0       # 自定义位置
 
     n_threads: Optional[int] = Field(default=16, description="线程数")    # 线程数，有助于提升视频处理速度
 

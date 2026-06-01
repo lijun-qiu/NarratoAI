@@ -310,11 +310,12 @@ class SubtitleAnalyzerAdapter:
                             "min_duration": min_duration,
                             "max_duration": target_duration,
                             "video_duration_sec": "0",
-                            "min_segment_count": "15",
-                            "max_segment_count": "25",
-                            "narration_span_range": "8-20",
-                            "ost_span_range": "4-12",
+                            "min_segment_count": "12",
+                            "max_segment_count": "28",
+                            "narration_span_range": "4-10",
+                            "ost_span_range": "3-9",
                             "duration_plan_summary": "未检测到视频时长，请上传视频后重新生成",
+                            "source_timeline_pick_ratio": "约 45%-55%",
                         }
                     )
             prompt = PromptManager.get_prompt(

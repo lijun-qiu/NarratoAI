@@ -20,6 +20,7 @@ from app.services.subtitle_text import read_subtitle_text
 from app.utils.script_json_parser import parse_narration_script_items
 from app.utils.media_duration import get_video_duration_seconds
 from app.utils.enhanced_mix_duration import (
+    MIN_OUTPUT_RATIO,
     build_enhanced_mix_duration_plan,
     estimate_script_playback_seconds,
 )
@@ -205,7 +206,19 @@ def generate_script_short_sunmmary(
                     f"{plan.plan_summary}"
                 )
                 logger.info(span_msg)
-                st.info(span_msg)
+                if estimated > plan.max_playback_sec * 1.05:
+                    st.warning(
+                        f"{span_msg}\n\n"
+                        f"⚠️ 预计成片偏长（超过上限 {plan.max_duration}），"
+                        f"请降低 temperature 后重新生成，或在脚本中删段、缩短 timestamp 跨度。"
+                    )
+                elif estimated < plan.video_duration_sec * MIN_OUTPUT_RATIO:
+                    st.warning(
+                        f"{span_msg}\n\n"
+                        f"⚠️ 预计成片偏短，请重新生成。"
+                    )
+                else:
+                    st.info(span_msg)
 
             if script is None:
                 st.error("生成脚本失败，请检查日志")

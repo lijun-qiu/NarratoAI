@@ -172,6 +172,13 @@
     doubaotts_voice_type = "BV700_V2_streaming"
     doubaotts_rate = 1.0
 
+    # 字幕默认设置
+    font_name = "simhei.ttf"
+    font_size = 40
+    text_fore_color = "#FFFFFF"
+    subtitle_position = "custom"
+    custom_position = 62.0
+
 ##########################################
 # 代理和网络配置
 ##########################################

@@ -32,7 +32,6 @@ def generate_script_enhanced(params, subtitle_path: str, video_theme: str, tempe
         st.session_state["processing_mode"] = "enhanced"
         st.session_state["source_subtitle_path"] = subtitle_path
         st.info(
-            "脚本已按「智能混剪解说·长成片」规则生成："
-            "目标成片时长 ≥ 原片 50%；自动混入 BGM；"
-            "解说段显示 TTS 字幕，原声段显示原片对白字幕。"
+            "脚本已按「智能混剪解说·压缩混剪」规则生成："
+            "目标成片约为原片 50%；解说文案精简准确；自动混入 BGM。"
         )

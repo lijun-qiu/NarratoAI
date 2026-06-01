@@ -804,7 +804,7 @@ def render_doubaotts_settings(tr):
         "BV063_streaming": "动漫海绵",
         "BV417_streaming": "动漫海星",
         "BV050_streaming": "动漫小新",
-        "BV061_streaming": "天才童声",
+        "BV062_streaming": "天才童声",
         "BV401_streaming": "促销男声",
         "BV402_streaming": "促销女声",
         "BV006_streaming": "磁性男声",

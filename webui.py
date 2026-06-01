@@ -267,7 +267,7 @@ def get_jianying_export_params() -> VideoClipParams:
             'subtitle_position', config.ui.get('subtitle_position', 'custom')
         ),
         custom_position=st.session_state.get(
-            'custom_position', config.ui.get('custom_position', 61.0)
+            'custom_position', config.ui.get('custom_position', 62.0)
         ),
         tts_volume=st.session_state.get('tts_volume', 1.0),
         original_volume=st.session_state.get('original_volume', 0.7),

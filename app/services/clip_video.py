@@ -161,6 +161,19 @@ def get_safe_encoder_config(hwaccel_type: Optional[str] = None) -> Dict[str, str
     return config
 
 
+# 裁剪场景下使用硬件编码器时，禁用硬件解码，避免 qsv/nvenc 帧格式无法转换
+_CLIP_ENCODERS_WITHOUT_HW_DECODE = frozenset({
+    "h264_nvenc",
+    "h264_qsv",
+    "h264_amf",
+    "h264_videotoolbox",
+})
+
+
+def _should_skip_hwaccel_decode(video_codec: str) -> bool:
+    return video_codec in _CLIP_ENCODERS_WITHOUT_HW_DECODE
+
+
 def build_ffmpeg_command(
     input_path: str, 
     output_path: str, 
@@ -172,8 +185,8 @@ def build_ffmpeg_command(
     """
     构建优化的ffmpeg命令，基于测试结果使用正确的硬件加速方案
     
-    重要发现：对于视频裁剪场景，CUDA硬件解码会导致滤镜链错误，
-    应该使用纯NVENC编码器（无硬件解码）来获得最佳兼容性
+    重要发现：对于视频裁剪场景，硬件解码（QSV/NVENC 等）会导致滤镜链格式转换错误，
+    应仅使用硬件编码器、不做硬件解码，以获得最佳兼容性
     
     Args:
         input_path: 输入视频路径
@@ -188,14 +201,8 @@ def build_ffmpeg_command(
     """
     cmd = ["ffmpeg", "-y"]
     
-    # 关键修正：对于视频裁剪，不使用CUDA硬件解码，只使用NVENC编码器
-    # 这样能避免滤镜链格式转换错误，同时保持编码性能优势
-    if encoder_config["video_codec"] == "h264_nvenc":
-        # 不添加硬件解码参数，让FFmpeg自动处理
-        # 这避免了 "Impossible to convert between the formats" 错误
-        pass
-    elif hwaccel_args:
-        # 对于其他编码器，可以使用硬件解码参数
+    # 裁剪时不使用硬件解码，仅保留硬件编码（避免 qsv/nvenc 帧格式转换失败）
+    if not _should_skip_hwaccel_decode(encoder_config["video_codec"]) and hwaccel_args:
         cmd.extend(hwaccel_args)
     
     # 输入文件
@@ -566,10 +573,6 @@ def try_fallback_encoding(
     return execute_simple_command(fallback_cmd, timestamp, "通用Fallback")
 
 
-# 遮住画面底部硬字幕区域（白条），最终仅显示生成的叠加字幕
-HARD_SUBTITLE_MASK_VF = "drawbox=x=0:y=ih*0.76:w=iw:h=ih*0.24:color=white@1:t=fill"
-
-
 def _process_narration_only_segment(
     video_origin_path: str,
     script_item: Dict,
@@ -577,7 +580,6 @@ def _process_narration_only_segment(
     output_dir: str,
     encoder_config: Dict,
     hwaccel_args: List[str],
-    mask_hardcoded_subtitles: bool = True,
 ) -> Optional[str]:
     """
     处理OST=0的纯解说片段
@@ -610,7 +612,6 @@ def _process_narration_only_segment(
     cmd = _build_ffmpeg_command_with_audio_control(
         video_origin_path, output_path, ffmpeg_start_time, ffmpeg_end_time,
         encoder_config, hwaccel_args, remove_audio=True,
-        mask_hardcoded_subtitles=mask_hardcoded_subtitles,
     )
 
     # 执行命令
@@ -628,7 +629,6 @@ def _process_original_audio_segment(
     output_dir: str,
     encoder_config: Dict,
     hwaccel_args: List[str],
-    mask_hardcoded_subtitles: bool = True,
 ) -> Optional[str]:
     """
     处理OST=1的纯原声片段
@@ -655,7 +655,6 @@ def _process_original_audio_segment(
     cmd = _build_ffmpeg_command_with_audio_control(
         video_origin_path, output_path, ffmpeg_start_time, ffmpeg_end_time,
         encoder_config, hwaccel_args, remove_audio=False,
-        mask_hardcoded_subtitles=mask_hardcoded_subtitles,
     )
 
     # 执行命令
@@ -674,7 +673,6 @@ def _process_mixed_segment(
     output_dir: str,
     encoder_config: Dict,
     hwaccel_args: List[str],
-    mask_hardcoded_subtitles: bool = True,
 ) -> Optional[str]:
     """
     处理OST=2的解说+原声混合片段
@@ -706,7 +704,6 @@ def _process_mixed_segment(
     cmd = _build_ffmpeg_command_with_audio_control(
         video_origin_path, output_path, ffmpeg_start_time, ffmpeg_end_time,
         encoder_config, hwaccel_args, remove_audio=False,
-        mask_hardcoded_subtitles=mask_hardcoded_subtitles,
     )
 
     # 执行命令
@@ -726,7 +723,6 @@ def _build_ffmpeg_command_with_audio_control(
     encoder_config: Dict[str, str],
     hwaccel_args: List[str] = None,
     remove_audio: bool = False,
-    mask_hardcoded_subtitles: bool = False,
 ) -> List[str]:
     """
     构建支持音频控制的FFmpeg命令
@@ -745,11 +741,8 @@ def _build_ffmpeg_command_with_audio_control(
     """
     cmd = ["ffmpeg", "-y"]
 
-    # 硬件加速设置（参考原有逻辑）
-    if encoder_config["video_codec"] == "h264_nvenc":
-        # 对于NVENC，不使用硬件解码以避免滤镜链问题
-        pass
-    elif hwaccel_args:
+    # 裁剪时不使用硬件解码，仅保留硬件编码
+    if not _should_skip_hwaccel_decode(encoder_config["video_codec"]) and hwaccel_args:
         cmd.extend(hwaccel_args)
 
     # 输入文件
@@ -760,10 +753,6 @@ def _build_ffmpeg_command_with_audio_control(
 
     # 视频编码器设置
     cmd.extend(["-c:v", encoder_config["video_codec"]])
-
-    if mask_hardcoded_subtitles:
-        cmd.extend(["-vf", HARD_SUBTITLE_MASK_VF])
-        logger.debug("已启用底部硬字幕白条遮罩")
 
     # 音频处理
     if remove_audio:
@@ -814,7 +803,6 @@ def clip_video_unified(
         tts_results: List[Dict],
         output_dir: Optional[str] = None,
         task_id: Optional[str] = None,
-        mask_hardcoded_subtitles: bool = True,
 ) -> Dict[str, str]:
     """
     基于OST类型的统一视频裁剪策略 - 消除双重裁剪问题
@@ -885,17 +873,17 @@ def clip_video_unified(
             if ost == 0:  # 纯解说片段
                 output_path = _process_narration_only_segment(
                     video_origin_path, script_item, tts_map, output_dir,
-                    encoder_config, hwaccel_args, mask_hardcoded_subtitles
+                    encoder_config, hwaccel_args
                 )
             elif ost == 1:  # 纯原声片段
                 output_path = _process_original_audio_segment(
                     video_origin_path, script_item, output_dir,
-                    encoder_config, hwaccel_args, mask_hardcoded_subtitles
+                    encoder_config, hwaccel_args
                 )
             elif ost == 2:  # 解说+原声混合片段
                 output_path = _process_mixed_segment(
                     video_origin_path, script_item, tts_map, output_dir,
-                    encoder_config, hwaccel_args, mask_hardcoded_subtitles
+                    encoder_config, hwaccel_args
                 )
             else:
                 logger.warning(f"未知的OST类型: {ost}，跳过片段 {_id}")

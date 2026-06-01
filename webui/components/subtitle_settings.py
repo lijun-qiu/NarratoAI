@@ -11,7 +11,7 @@ def render_subtitle_panel(tr):
     with st.container(border=True):
         st.write(tr("Subtitle Settings"))
         st.info(
-            "💡 提示：解说与原声片段均烧录 **TTS 生成字幕**；裁剪时会用白条遮住原片硬字幕。"
+            "💡 提示：解说与原声片段均烧录 **TTS 生成字幕**。"
             "目前仅 **edge-tts / azure** 等引擎支持自动生成字幕。"
         )
 
@@ -123,7 +123,7 @@ def render_position_settings(tr):
 
     # 自定义位置处理
     if subtitle_position == "custom":
-        saved_custom_position = config.ui.get("custom_position", 61.0)
+        saved_custom_position = config.ui.get("custom_position", 62.0)
         custom_position = st.text_input(
             tr("Custom Position (% from top)"),
             value=str(saved_custom_position),
@@ -173,7 +173,7 @@ def get_subtitle_params():
             'subtitle_position', config.ui.get('subtitle_position', 'custom')
         ),
         'custom_position': st.session_state.get(
-            'custom_position', config.ui.get('custom_position', 61.0)
+            'custom_position', config.ui.get('custom_position', 62.0)
         ),
         'stroke_color': st.session_state.get('stroke_color', '#000000'),
         'stroke_width': st.session_state.get('stroke_width', 1.5),

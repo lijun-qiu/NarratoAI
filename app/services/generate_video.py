@@ -115,7 +115,7 @@ def merge_materials(
     subtitle_color = options.get('subtitle_color', '#FFFFFF')
     subtitle_bg_color = options.get('subtitle_bg_color', 'transparent')
     subtitle_position = options.get('subtitle_position', 'custom')
-    custom_position = options.get('custom_position', 61)
+    custom_position = options.get('custom_position', 62)
     stroke_color = options.get('stroke_color', '#000000')
     stroke_width = options.get('stroke_width', 1)
     threads = options.get('threads', 2)

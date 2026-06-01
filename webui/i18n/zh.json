@@ -165,7 +165,7 @@
     "Subtitle Transcription": "字幕转录",
     "Enhanced Mix Narration": "智能混剪解说",
     "Generate Enhanced Mix Script": "生成智能混剪解说脚本",
-    "Enhanced Mix Mode Description": "长成片模式：脚本目标为成片时长 ≥ 原片 50%。自动混入 BGM；解说段（OST=0）显示 TTS 字幕；原声段（OST=1）从原片 SRT 提取对白字幕。请先上传完整原片字幕。生成后若提示「预计成片偏短」请重新生成。",
+    "Enhanced Mix Mode Description": "压缩混剪：目标成片约为原片 50%（例：6 分半 → 约 3 分 15 秒），解说文案精简准确。自动混入 BGM；解说/原声段均烧录 TTS 字幕。生成后若提示「预计成片偏长/偏短」请重新生成。",
     "BGM Mood": "BGM 风格",
     "BGM Mood Help": "从 resource/songs/分类目录 中随机选一首；目录为空时回退到 resource/songs 根目录",
     "BGM Mood Auto": "自动（根目录随机）",

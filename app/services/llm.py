@@ -144,7 +144,7 @@ def _generate_response(prompt: str, llm_provider: str = None) -> str:
     if llm_provider == "g4f":
         model_name = config.app.get("g4f_model_name", "")
         if not model_name:
-            model_name = "gpt-3.5-turbo-16k-0613"
+            model_name = "gpt-3.5-turbo-16k-0623"
         import g4f
 
         content = g4f.ChatCompletion.create(

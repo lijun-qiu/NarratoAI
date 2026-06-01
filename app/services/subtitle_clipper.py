@@ -215,7 +215,8 @@ def enrich_generated_subtitles(
     """
     Attach generated subtitle files for OST=1 segments.
 
-    Prefer TTS-timed subtitles (same as narration segments); fall back to timed SRT from source text.
+    Uses TTS-timed subtitles (same pipeline as narration segments); falls back to
+    a single-block generated subtitle only when TTS is unavailable.
     """
     from app.utils import utils
 
@@ -253,13 +254,6 @@ def enrich_generated_subtitles(
                 voice_rate=float(tts_config.get("voice_rate", 1.0)),
                 voice_pitch=float(tts_config.get("voice_pitch", 1.0)),
                 tts_engine=tts_config.get("tts_engine", ""),
-            )
-
-        if not subtitle_path and timestamp_range and source_subtitle_path:
-            subtitle_path = clip_subtitles_from_source(
-                source_subtitle_path,
-                timestamp_range,
-                output_path,
             )
 
         if not subtitle_path and subtitle_text:

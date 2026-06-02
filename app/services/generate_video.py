@@ -126,20 +126,23 @@ def _parse_subtitle_style_options(options: Optional[Dict[str, Any]] = None) -> D
         custom_position = float(options.get("custom_position", 60))
     except (TypeError, ValueError):
         custom_position = 60.0
-    try:
-        stroke_width = float(options.get("stroke_width", 1))
-    except (TypeError, ValueError):
-        stroke_width = 1.0
+
+    def _to_int(value: Any, default: int) -> int:
+        try:
+            return int(round(float(value)))
+        except (TypeError, ValueError):
+            return default
+
     return {
         "subtitle_font": options.get("subtitle_font", ""),
-        "subtitle_font_size": options.get("subtitle_font_size", 40),
+        "subtitle_font_size": _to_int(options.get("subtitle_font_size", 40), 40),
         "subtitle_color": options.get("subtitle_color", "#FFFFFF"),
         "subtitle_bg_color": subtitle_bg_color,
         "subtitle_position": options.get("subtitle_position", "custom"),
         "custom_position": custom_position,
         "stroke_color": options.get("stroke_color", "#000000"),
-        "stroke_width": stroke_width,
-        "picture_narration_font_size": options.get("picture_narration_font_size", 44),
+        "stroke_width": _to_int(options.get("stroke_width", 1), 1),
+        "picture_narration_font_size": _to_int(options.get("picture_narration_font_size", 44), 44),
         "picture_narration_color": options.get("picture_narration_color", "#FFE066"),
         "video_aspect": options.get("video_aspect"),
     }
@@ -728,8 +731,10 @@ def wrap_text(text, max_width, font="Arial", fontsize=60):
     """
     # 创建ImageFont对象
     try:
-        font_obj = ImageFont.truetype(font, fontsize)
-    except:
+        font_obj = ImageFont.truetype(font, int(round(float(fontsize))))
+    except (TypeError, ValueError):
+        font_obj = ImageFont.load_default()
+    except Exception:
         # 如果无法加载指定字体，使用默认字体
         font_obj = ImageFont.load_default()
     

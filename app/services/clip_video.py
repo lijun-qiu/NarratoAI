@@ -13,10 +13,85 @@ import subprocess
 import json
 import hashlib
 from loguru import logger
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 from pathlib import Path
 
-from app.utils import ffmpeg_utils
+from app.utils import ffmpeg_utils, utils
+from app.services.update_script import is_valid_video_file, probe_media_duration
+
+
+def _validate_clip_output(output_path: str) -> bool:
+    if not is_valid_video_file(output_path):
+        if output_path and os.path.exists(output_path):
+            try:
+                os.remove(output_path)
+            except OSError:
+                pass
+        return False
+    return True
+
+
+def _resolve_tts_clip_duration(tts_item: Dict) -> float:
+    duration = float(tts_item.get("duration") or 0)
+    audio_file = tts_item.get("audio_file") or ""
+    if audio_file:
+        probed = probe_media_duration(audio_file)
+        if probed > duration:
+            duration = probed
+    return duration
+
+
+def _format_clip_time(seconds: float, *, with_ms: bool) -> str:
+    text = utils.seconds_to_time(max(0.0, seconds))
+    return text.replace(".", ",") if with_ms else text.split(".")[0]
+
+
+def _clamp_clip_range_to_source(
+    video_origin_path: str,
+    start_time: str,
+    end_time: str,
+    *,
+    segment_id: Any = None,
+) -> Optional[Tuple[str, str]]:
+    """
+    将裁剪区间限制在原片时长内。
+    脚本时间戳可能超出原片（如原片 19:39 但脚本写到 19:55）。
+    """
+    source_duration = probe_media_duration(video_origin_path)
+    if source_duration <= 0:
+        return start_time, end_time
+
+    start_sec = utils.time_to_seconds(start_time.replace(".", ","))
+    end_sec = utils.time_to_seconds(end_time.replace(".", ","))
+
+    if start_sec >= source_duration - 0.1:
+        logger.error(
+            f"片段 #{segment_id} 起点 {start_time} 已超过原片时长 "
+            f"{_format_clip_time(source_duration, with_ms=True)}，无法裁剪"
+        )
+        return None
+
+    max_end_sec = max(start_sec + 0.2, source_duration - 0.05)
+    if end_sec > max_end_sec:
+        logger.warning(
+            f"片段 #{segment_id} 裁剪终点 {end_time} 超出原片 "
+            f"({_format_clip_time(source_duration, with_ms=True)})，已截断到片尾"
+        )
+        end_sec = max_end_sec
+
+    if end_sec <= start_sec:
+        logger.error(
+            f"片段 #{segment_id} 裁剪区间无效: {start_time} -> {end_time} "
+            f"(原片 {source_duration:.2f}s)"
+        )
+        return None
+
+    use_ms = "," in start_time or "," in end_time
+    return (
+        _format_clip_time(start_sec, with_ms=use_ms),
+        _format_clip_time(end_sec, with_ms=use_ms),
+    )
+
 
 def parse_timestamp(timestamp: str) -> tuple:
     """
@@ -266,13 +341,10 @@ def execute_ffmpeg_with_fallback(
         
         result = subprocess.run(cmd, **process_kwargs)
         
-        # 验证输出文件
-        if os.path.exists(output_path) and os.path.getsize(output_path) > 0:
-            # logger.info(f"✓ 视频裁剪成功: {timestamp}")
+        if _validate_clip_output(output_path):
             return True
-        else:
-            logger.warning(f"输出文件无效: {output_path}")
-            return False
+        logger.warning(f"输出文件无效（无视频流或文件过小）: {output_path}")
+        return False
             
     except subprocess.CalledProcessError as e:
         error_msg = e.stderr if e.stderr else str(e)
@@ -490,12 +562,11 @@ def execute_simple_command(cmd: List[str], timestamp: str, method_name: str) -> 
         subprocess.run(cmd, **process_kwargs)
         
         output_path = cmd[-1]  # 输出路径总是最后一个参数
-        if os.path.exists(output_path) and os.path.getsize(output_path) > 0:
+        if _validate_clip_output(output_path):
             logger.info(f"✓ {method_name}成功: {timestamp}")
             return True
-        else:
-            logger.error(f"{method_name}失败，输出文件无效: {output_path}")
-            return False
+        logger.error(f"{method_name}失败，输出文件无效: {output_path}")
+        return False
             
     except subprocess.CalledProcessError as e:
         error_msg = e.stderr if e.stderr else str(e)
@@ -569,26 +640,29 @@ def _process_narration_only_segment(
 
     # 解析起始时间，使用TTS音频时长计算结束时间
     start_time, _ = parse_timestamp(timestamp)
-    duration = tts_item["duration"]
+    duration = _resolve_tts_clip_duration(tts_item)
     calculated_end_time = calculate_end_time(start_time, duration, extra_seconds=0)
 
-    # 转换为FFmpeg兼容的时间格式
+    clamped = _clamp_clip_range_to_source(
+        video_origin_path, start_time, calculated_end_time, segment_id=_id
+    )
+    if not clamped:
+        return None
+    start_time, calculated_end_time = clamped
+
     ffmpeg_start_time = start_time.replace(',', '.')
     ffmpeg_end_time = calculated_end_time.replace(',', '.')
 
-    # 生成输出文件名
     safe_start_time = start_time.replace(':', '-').replace(',', '-')
     safe_end_time = calculated_end_time.replace(':', '-').replace(',', '-')
     output_filename = f"ost0_vid_{safe_start_time}@{safe_end_time}.mp4"
     output_path = os.path.join(output_dir, output_filename)
 
-    # 构建FFmpeg命令 - 移除音频
     cmd = _build_ffmpeg_command_with_audio_control(
         video_origin_path, output_path, ffmpeg_start_time, ffmpeg_end_time,
         encoder_config, hwaccel_args, remove_audio=True
     )
 
-    # 执行命令
     success = execute_ffmpeg_with_fallback(
         cmd, timestamp, video_origin_path, output_path,
         ffmpeg_start_time, ffmpeg_end_time
@@ -612,14 +686,18 @@ def _process_original_audio_segment(
     _id = script_item["_id"]
     timestamp = script_item["timestamp"]
 
-    # 严格按照timestamp进行裁剪
     start_time, end_time = parse_timestamp(timestamp)
 
-    # 转换为FFmpeg兼容的时间格式
+    clamped = _clamp_clip_range_to_source(
+        video_origin_path, start_time, end_time, segment_id=_id
+    )
+    if not clamped:
+        return None
+    start_time, end_time = clamped
+
     ffmpeg_start_time = start_time.replace(',', '.')
     ffmpeg_end_time = end_time.replace(',', '.')
 
-    # 生成输出文件名
     safe_start_time = start_time.replace(':', '-').replace(',', '-')
     safe_end_time = end_time.replace(':', '-').replace(',', '-')
     output_filename = f"ost1_vid_{safe_start_time}@{safe_end_time}.mp4"
@@ -664,14 +742,19 @@ def _process_mixed_segment(
 
     # 解析起始时间，使用TTS音频时长计算结束时间
     start_time, _ = parse_timestamp(timestamp)
-    duration = tts_item["duration"]
+    duration = _resolve_tts_clip_duration(tts_item)
     calculated_end_time = calculate_end_time(start_time, duration, extra_seconds=0)
 
-    # 转换为FFmpeg兼容的时间格式
+    clamped = _clamp_clip_range_to_source(
+        video_origin_path, start_time, calculated_end_time, segment_id=_id
+    )
+    if not clamped:
+        return None
+    start_time, calculated_end_time = clamped
+
     ffmpeg_start_time = start_time.replace(',', '.')
     ffmpeg_end_time = calculated_end_time.replace(',', '.')
 
-    # 生成输出文件名
     safe_start_time = start_time.replace(':', '-').replace(',', '-')
     safe_end_time = calculated_end_time.replace(':', '-').replace(',', '-')
     output_filename = f"ost2_vid_{safe_start_time}@{safe_end_time}.mp4"
@@ -869,7 +952,7 @@ def clip_video_unified(
                 logger.warning(f"未知的OST类型: {ost}，跳过片段 {_id}")
                 continue
 
-            if output_path and os.path.exists(output_path) and os.path.getsize(output_path) > 0:
+            if output_path and _validate_clip_output(output_path):
                 result[_id] = output_path
                 success_count += 1
                 logger.info(f"✅ [{i}/{total_clips}] 片段处理成功: OST={ost}, ID={_id}")

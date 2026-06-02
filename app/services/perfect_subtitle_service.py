@@ -20,7 +20,9 @@ from app.config import config
 from app.services.asr_subtitle_provider import transcribe_media_to_entries
 from app.services.srt_utils import (
     SrtEntry,
+    clip_entries_to_duration,
     extract_entries_in_range,
+    fit_entries_to_video_timeline,
     merge_and_sort_entries,
     offset_entries,
     parse_edited_time_range_seconds,
@@ -31,6 +33,7 @@ from app.services.srt_utils import (
     write_srt_file,
 )
 from app.utils import utils
+from app.services.update_script import probe_media_duration
 
 
 PERFECT_SUBTITLE_DEFAULTS: dict[str, Any] = {
@@ -39,7 +42,7 @@ PERFECT_SUBTITLE_DEFAULTS: dict[str, Any] = {
     "ost1_from_source_srt": True,
     "ost1_asr_fallback": True,
     "ost0_use_asr": True,
-    "prefer_existing_tts_subtitle": False,
+    "prefer_existing_tts_subtitle": True,
     "export_separate_tracks": True,
     "narration_label": "",
     "original_label": "",
@@ -67,7 +70,13 @@ def _edited_offset_ms(segment: dict[str, Any]) -> int:
     return int(round(start_sec * 1000))
 
 
-def _segment_duration_ms(segment: dict[str, Any]) -> int:
+def _segment_video_duration_ms(segment: dict[str, Any]) -> int:
+    video_path = segment.get("video") or ""
+    if video_path:
+        video_sec = probe_media_duration(video_path)
+        if video_sec > 0:
+            return int(round(video_sec * 1000))
+
     duration = segment.get("duration")
     if isinstance(duration, (int, float)) and duration > 0:
         return int(round(float(duration) * 1000))
@@ -76,6 +85,10 @@ def _segment_duration_ms(segment: dict[str, Any]) -> int:
     if end_ms > start_ms:
         return end_ms - start_ms
     return 0
+
+
+def _segment_duration_ms(segment: dict[str, Any]) -> int:
+    return _segment_video_duration_ms(segment)
 
 
 def _load_segment_subtitle_entries(path: str) -> list[SrtEntry]:
@@ -121,6 +134,10 @@ def _build_ost1_entries(
             except Exception as exc:
                 logger.warning(f"OST=1 片段 #{segment_id} ASR 回退失败: {exc}")
 
+    video_ms = _segment_video_duration_ms(segment)
+    if video_ms > 0 and local_entries:
+        local_entries = fit_entries_to_video_timeline(local_entries, video_ms)
+
     return offset_entries(local_entries, _edited_offset_ms(segment))
 
 
@@ -136,7 +153,7 @@ def _build_narration_entries(
     local_entries: list[SrtEntry] = []
 
     existing_subtitle = segment.get("subtitle") or ""
-    if settings.get("prefer_existing_tts_subtitle") and existing_subtitle:
+    if settings.get("prefer_existing_tts_subtitle", True) and existing_subtitle:
         local_entries = _load_segment_subtitle_entries(existing_subtitle)
 
     if not local_entries and settings.get("ost0_use_asr", True):
@@ -166,6 +183,11 @@ def _build_narration_entries(
                 max_chars=int(settings.get("max_chars", 18)),
                 label=label,
             )
+
+    video_ms = _segment_video_duration_ms(segment)
+    if video_ms > 0 and local_entries:
+        local_entries = clip_entries_to_duration(local_entries, video_ms)
+        local_entries = fit_entries_to_video_timeline(local_entries, video_ms)
 
     for entry in local_entries:
         if label and not entry.label:

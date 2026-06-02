@@ -218,6 +218,57 @@ def split_text_to_entries(
     return entries
 
 
+def clip_entries_to_duration(entries: list[SrtEntry], max_duration_ms: int) -> list[SrtEntry]:
+    if not entries or max_duration_ms <= 0:
+        return []
+    clipped: list[SrtEntry] = []
+    for entry in entries:
+        if entry.start_ms >= max_duration_ms:
+            continue
+        end_ms = min(entry.end_ms, max_duration_ms)
+        if end_ms <= entry.start_ms:
+            continue
+        clipped.append(
+            SrtEntry(
+                start_ms=entry.start_ms,
+                end_ms=end_ms,
+                text=entry.text,
+                label=entry.label,
+            )
+        )
+    return clipped
+
+
+def fit_entries_to_video_timeline(entries: list[SrtEntry], video_duration_ms: int) -> list[SrtEntry]:
+    """将片段内字幕时间轴对齐到裁剪后视频的真实时长。"""
+    if not entries or video_duration_ms <= 0:
+        return entries
+
+    entries = clip_entries_to_duration(entries, video_duration_ms)
+    if not entries:
+        return entries
+
+    max_end = max(entry.end_ms for entry in entries)
+    if max_end <= 0:
+        return entries
+
+    if abs(max_end - video_duration_ms) <= 80:
+        return entries
+
+    ratio = video_duration_ms / max_end
+    fitted: list[SrtEntry] = []
+    for entry in entries:
+        start_ms = int(round(entry.start_ms * ratio))
+        end_ms = int(round(entry.end_ms * ratio))
+        end_ms = min(max(end_ms, start_ms + 80), video_duration_ms)
+        if end_ms <= start_ms:
+            continue
+        fitted.append(
+            SrtEntry(start_ms=start_ms, end_ms=end_ms, text=entry.text, label=entry.label)
+        )
+    return fitted
+
+
 def merge_and_sort_entries(groups: Iterable[Iterable[SrtEntry]]) -> list[SrtEntry]:
     merged: list[SrtEntry] = []
     for group in groups:

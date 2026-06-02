@@ -114,7 +114,17 @@ def start_export_jianying_draft(task_id: str, params: VideoClipParams):
     subclip_clip_result = {
         tts_result['_id']: tts_result['subtitle_file'] for tts_result in tts_results
     }
-    new_script_list = update_script.update_script_timestamps(list_script, video_clip_result, tts_clip_result, subclip_clip_result)
+    tts_duration_by_id = {
+        tts_result["_id"]: float(tts_result.get("duration") or 0)
+        for tts_result in tts_results
+    }
+    new_script_list = update_script.update_script_timestamps(
+        list_script,
+        video_clip_result,
+        tts_clip_result,
+        subclip_clip_result,
+        tts_duration_by_id=tts_duration_by_id,
+    )
 
     logger.info(f"统一裁剪完成，处理了 {len(video_clip_result)} 个视频片段")
 

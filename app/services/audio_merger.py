@@ -7,6 +7,17 @@ from pydub import AudioSegment
 from typing import List, Dict
 from loguru import logger
 from app.utils import utils
+from app.services.update_script import probe_media_duration
+
+
+def _segment_playback_duration(segment: dict) -> float:
+    """成片时间轴占位时长 = 裁剪视频实测时长（与 merger.mp4 / 字幕偏移一致）。"""
+    video_path = segment.get("video") or ""
+    if video_path and os.path.exists(video_path):
+        video_len = probe_media_duration(video_path)
+        if video_len > 0:
+            return video_len
+    return float(segment.get("duration") or 0)
 
 
 def check_ffmpeg():
@@ -44,33 +55,29 @@ def merge_audio_files(task_id: str, total_duration: float, list_script: list):
     # 遍历脚本中的每个片段
     for segment in list_script:
         try:
-            duration = segment['duration']
+            duration = _segment_playback_duration(segment)
             ost = segment.get('OST', 0)
 
-            # OST=1 原声段不叠加解说音轨；OST=0/2 才叠加 TTS
             if ost == 1:
                 logger.debug(f"片段 {segment.get('_id')} OST=1 原声播放，跳过解说叠加")
                 current_position += duration
                 continue
 
             if segment['audio'] and os.path.exists(segment['audio']):
-                # 加载TTS音频文件
                 tts_audio = AudioSegment.from_file(segment['audio'])
-                
-                # 将TTS音频添加到最终音频
+                slot_ms = int(max(duration, 0) * 1000)
+                if slot_ms > 0 and len(tts_audio) > slot_ms:
+                    tts_audio = tts_audio[:slot_ms]
                 final_audio = final_audio.overlay(tts_audio, position=current_position * 1000)
             else:
-                # audio为空，不添加音频，仅保留间隔
                 logger.info(f"片段 {segment.get('timestamp', '')} 没有音频文件，保留 {duration} 秒的间隔")
-            
-            # 更新下一个片段的开始位置
+
             current_position += duration
 
         except Exception as e:
             logger.error(f"处理音频片段时出错: {str(e)}")
-            # 即使处理失败，也要更新位置，确保后续片段位置正确
             if 'duration' in segment:
-                current_position += segment['duration']
+                current_position += _segment_playback_duration(segment)
             continue
 
     # 保存合并后的音频文件

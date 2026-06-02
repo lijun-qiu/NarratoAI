@@ -223,8 +223,8 @@ opening_chars_max = 120
     ost1_asr_fallback = true
     # OST=0 解说段对 TTS 音频做 ASR 获取精确时间轴
     ost0_use_asr = true
-    # 是否优先使用 TTS 引擎自带字幕（通常不如 ASR 精确）
-    prefer_existing_tts_subtitle = false
+    # 解说段优先使用 TTS 引擎字幕（与配音更同步）；原声段 ASR 后会按视频时长校正
+    prefer_existing_tts_subtitle = true
     # 额外导出解说/原文分轨 SRT（便于剪映分样式）
     export_separate_tracks = true
     narration_label = ""

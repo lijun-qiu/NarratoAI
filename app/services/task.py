@@ -1,5 +1,6 @@
 import math
 import json
+import os
 import os.path
 import re
 import traceback
@@ -12,8 +13,54 @@ from app.models import const
 from app.models.schema import VideoClipParams
 from app.services import (voice, audio_merger, subtitle_merger, clip_video, merger_video, update_script, generate_video)
 from app.services.perfect_subtitle_service import build_merged_subtitle_path
+from app.services.update_script import is_valid_video_file
 from app.services import state as sm
 from app.utils import utils
+
+_SCRIPT_PATH_MODES = frozenset({
+    "auto",
+    "short",
+    "summary",
+    "film_tv",
+    "file_selection",
+})
+
+
+def _is_writable_script_json_path(script_path: str) -> bool:
+    if not script_path or script_path in _SCRIPT_PATH_MODES:
+        return False
+    if not str(script_path).lower().endswith(".json"):
+        return False
+    return bool(path.dirname(path.abspath(script_path)))
+
+
+def _persist_synced_script(
+    task_id: str,
+    script_list: list,
+    source_script_path: str = "",
+) -> str:
+    """裁剪并 update_script 后回写 JSON，使 duration / editedTimeRange / video 等与成片一致。"""
+    task_script_path = path.join(utils.task_dir(task_id), "script_after_clip.json")
+    os.makedirs(path.dirname(task_script_path), exist_ok=True)
+
+    def _write_json(target: str) -> None:
+        with open(target, "w", encoding="utf-8") as fp:
+            json.dump(script_list, fp, ensure_ascii=False, indent=2)
+
+    _write_json(task_script_path)
+    logger.info(f"已回写任务脚本 -> {task_script_path}")
+
+    if _is_writable_script_json_path(source_script_path):
+        abs_source = path.abspath(source_script_path)
+        try:
+            os.makedirs(path.dirname(abs_source), exist_ok=True)
+            _write_json(abs_source)
+            logger.info(f"已回写源脚本 -> {abs_source}")
+            return abs_source
+        except OSError as exc:
+            logger.warning(f"回写源脚本失败 ({abs_source}): {exc}")
+
+    return task_script_path
 
 
 def _merge_task_subtitles(
@@ -146,7 +193,18 @@ def start_subclip(task_id: str, params: VideoClipParams, subclip_path_videos: di
     subclip_clip_result = {
         tts_result['_id']: tts_result['subtitle_file'] for tts_result in tts_results
     }
-    new_script_list = update_script.update_script_timestamps(list_script, video_clip_result, tts_clip_result, subclip_clip_result)
+    tts_duration_by_id = {
+        tts_result["_id"]: float(tts_result.get("duration") or 0)
+        for tts_result in tts_results
+    }
+    new_script_list = update_script.update_script_timestamps(
+        list_script,
+        video_clip_result,
+        tts_clip_result,
+        subclip_clip_result,
+        tts_duration_by_id=tts_duration_by_id,
+    )
+    _persist_synced_script(task_id, new_script_list, video_script_path)
 
     logger.info(f"统一裁剪完成，处理了 {len(video_clip_result)} 个视频片段")
 
@@ -189,14 +247,14 @@ def start_subclip(task_id: str, params: VideoClipParams, subclip_path_videos: di
     video_clips = []
     for new_script in new_script_list:
         video_path = new_script.get('video')
-        if video_path and os.path.exists(video_path):
+        if video_path and is_valid_video_file(video_path):
             video_clips.append(video_path)
         else:
-            logger.warning(f"片段 {new_script.get('_id')} 的视频文件不存在或未生成: {video_path}")
+            logger.warning(f"片段 {new_script.get('_id')} 的视频文件不存在、损坏或未生成: {video_path}")
             # 如果统一裁剪失败，尝试使用备用方案（如果提供了subclip_path_videos）
             if subclip_path_videos and new_script.get('_id') in subclip_path_videos:
                 backup_video = subclip_path_videos[new_script.get('_id')]
-                if os.path.exists(backup_video):
+                if is_valid_video_file(backup_video):
                     video_clips.append(backup_video)
                     logger.info(f"使用备用视频: {backup_video}")
                 else:
@@ -362,7 +420,18 @@ def start_subclip_unified(task_id: str, params: VideoClipParams):
     subclip_clip_result = {
         tts_result['_id']: tts_result['subtitle_file'] for tts_result in tts_results
     }
-    new_script_list = update_script.update_script_timestamps(list_script, video_clip_result, tts_clip_result, subclip_clip_result)
+    tts_duration_by_id = {
+        tts_result["_id"]: float(tts_result.get("duration") or 0)
+        for tts_result in tts_results
+    }
+    new_script_list = update_script.update_script_timestamps(
+        list_script,
+        video_clip_result,
+        tts_clip_result,
+        subclip_clip_result,
+        tts_duration_by_id=tts_duration_by_id,
+    )
+    _persist_synced_script(task_id, new_script_list, video_script_path)
 
     logger.info(f"统一裁剪完成，处理了 {len(video_clip_result)} 个视频片段")
 
@@ -405,10 +474,10 @@ def start_subclip_unified(task_id: str, params: VideoClipParams):
     video_clips = []
     for new_script in new_script_list:
         video_path = new_script.get('video')
-        if video_path and os.path.exists(video_path):
+        if video_path and is_valid_video_file(video_path):
             video_clips.append(video_path)
         else:
-            logger.error(f"片段 {new_script.get('_id')} 的视频文件不存在: {video_path}")
+            logger.error(f"片段 {new_script.get('_id')} 的视频文件不存在、损坏或未生成: {video_path}")
 
     logger.info(f"准备合并 {len(video_clips)} 个视频片段")
 

@@ -12,6 +12,8 @@ import re
 import os
 from datetime import datetime, timedelta
 
+from app.utils import utils
+
 
 def parse_time(time_str):
     """解析时间字符串为timedelta对象"""
@@ -47,16 +49,11 @@ def parse_edited_time_range(time_range_str):
     if len(parts) != 2:
         return None, None
     
-    start_time_str, end_time_str = parts
-    
-    # 将HH:MM:SS格式转换为timedelta
-    start_h, start_m, start_s = map(int, start_time_str.split(':'))
-    end_h, end_m, end_s = map(int, end_time_str.split(':'))
-    
-    start_time = timedelta(hours=start_h, minutes=start_m, seconds=start_s)
-    end_time = timedelta(hours=end_h, minutes=end_m, seconds=end_s)
-    
-    return start_time, end_time
+    start_time_str, end_time_str = parts[0].strip(), parts[1].strip()
+
+    start_sec = utils.time_to_seconds(start_time_str.replace(".", ","))
+    end_sec = utils.time_to_seconds(end_time_str.replace(".", ","))
+    return timedelta(seconds=start_sec), timedelta(seconds=end_sec)
 
 
 def merge_subtitle_files(subtitle_items, output_file=None):

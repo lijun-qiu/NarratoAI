@@ -1763,6 +1763,9 @@ def tts_multiple(task_id: str, list_script: list, voice_name: str, voice_rate: f
                     subtitle_file = ""
                 else:
                     _, duration = create_subtitle(sub_maker=sub_maker, text=text, subtitle_file=subtitle_file)
+                    file_duration = get_audio_duration_from_file(audio_file)
+                    if file_duration > duration:
+                        duration = file_duration
 
             tts_results.append({
                 "_id": item['_id'],

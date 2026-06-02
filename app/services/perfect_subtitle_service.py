@@ -48,6 +48,7 @@ PERFECT_SUBTITLE_DEFAULTS: dict[str, Any] = {
     "ost0_use_asr": True,
     "prefer_existing_tts_subtitle": True,
     "export_separate_tracks": True,
+    "defer_asr_until_final": False,
     "narration_label": "",
     "original_label": "",
     "max_chars": 18,
@@ -67,6 +68,14 @@ def get_perfect_subtitle_settings() -> dict[str, Any]:
 
 def is_perfect_subtitle_enabled() -> bool:
     return bool(get_perfect_subtitle_settings().get("enabled", True))
+
+
+def is_deferred_subtitle_enabled() -> bool:
+    """先合成成片（含水印/旁白），最后再 API 转写并烧录主字幕。"""
+    settings = get_perfect_subtitle_settings()
+    if not settings.get("enabled", True):
+        return False
+    return bool(settings.get("defer_asr_until_final", False))
 
 
 def _edited_offset_ms(segment: dict[str, Any]) -> int:

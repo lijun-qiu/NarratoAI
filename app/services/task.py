@@ -16,6 +16,8 @@ from app.services import (voice, audio_merger, subtitle_merger, clip_video, merg
 from app.services.perfect_subtitle_service import (
     build_merged_subtitle_path,
     build_picture_narration_subtitle_path,
+    is_deferred_subtitle_enabled,
+    is_perfect_subtitle_enabled,
 )
 from app.services.video_output_settings import get_video_output_settings
 from app.services.update_script import is_valid_video_file
@@ -130,6 +132,8 @@ def _build_merge_video_options(
         'subtitle_bg_color': None,
         'subtitle_position': params.subtitle_position,
         'custom_position': params.custom_position,
+        'stroke_color': getattr(params, 'stroke_color', '#000000'),
+        'stroke_width': getattr(params, 'stroke_width', 1.5),
         'threads': params.n_threads,
         'watermark_text': video_output.get('watermark_text', ''),
         'enable_picture_narration': bool(video_output.get('enable_picture_narration', True)),
@@ -140,12 +144,23 @@ def _build_merge_video_options(
     }
 
 
+def _should_defer_subtitle_asr(params: VideoClipParams) -> bool:
+    """完美字幕开启且配置延迟转写时，合成阶段跳过 ASR。"""
+    return is_perfect_subtitle_enabled() and is_deferred_subtitle_enabled()
+
+
 def _merge_task_subtitles(
     task_id: str,
     new_script_list: list,
     params: VideoClipParams,
+    *,
+    force: bool = False,
 ) -> str:
     """Generate merged subtitles (perfect dual-track preferred, legacy fallback)."""
+    if not force and _should_defer_subtitle_asr(params):
+        logger.info("延迟字幕模式：跳过同步字幕合并，将在成片合成后通过 API 转写并烧录")
+        return ""
+
     source_subtitle_path = (getattr(params, "source_subtitle_path", None) or "").strip()
     if not source_subtitle_path:
         source_subtitle_path = (config.app.get("source_subtitle_path") or "").strip()
@@ -276,6 +291,82 @@ def _build_picture_narration_path(
     except Exception as exc:
         logger.warning(f"原声旁白字幕生成失败: {exc}")
         return ""
+
+
+def _produce_final_video(
+    task_id: str,
+    params: VideoClipParams,
+    *,
+    combined_video_path: str,
+    merged_audio_path: str,
+    merged_subtitle_path: str,
+    picture_narration_path: str,
+    list_script: list,
+    new_script_list: list,
+) -> str:
+    """合并 BGM/配音/旁白/水印，并在延迟模式下于最后 API 转写后烧录主字幕。"""
+    task_dir = utils.task_dir(task_id)
+    output_video_path = path.join(task_dir, "combined.mp4")
+    bgm_path = utils.get_bgm_file()
+    options = _build_merge_video_options(
+        params,
+        list_script=list_script,
+        picture_narration_path=picture_narration_path,
+    )
+
+    if _should_defer_subtitle_asr(params):
+        base_output_path = path.join(task_dir, "combined_base.mp4")
+        logger.info(
+            f"\n\n## 6. 合成成片（无主字幕）: 水印/旁白/BGM/配音 -> {base_output_path}"
+        )
+        merge_options = dict(options)
+        merge_options["subtitle_enabled"] = False
+
+        generate_video.merge_materials(
+            video_path=combined_video_path,
+            audio_path=merged_audio_path,
+            subtitle_path=None,
+            bgm_path=bgm_path,
+            output_path=base_output_path,
+            options=merge_options,
+        )
+
+        if not getattr(params, "subtitle_enabled", True):
+            logger.info("主字幕已禁用，跳过延迟 API 转写")
+            os.replace(base_output_path, output_video_path)
+            return output_video_path
+
+        logger.info("\n\n## 7. 延迟字幕：API 转写")
+        sm.state.update_task(task_id, state=const.TASK_STATE_PROCESSING, progress=90)
+        deferred_subtitle_path = _merge_task_subtitles(
+            task_id, new_script_list, params, force=True
+        )
+
+        if not deferred_subtitle_path:
+            logger.warning("延迟字幕转写未生成有效字幕，保留无主字幕成片")
+            os.replace(base_output_path, output_video_path)
+            return output_video_path
+
+        logger.info(f"\n\n## 8. 烧录主字幕 -> {output_video_path}")
+        sm.state.update_task(task_id, state=const.TASK_STATE_PROCESSING, progress=95)
+        generate_video.burn_subtitles_on_video(
+            video_path=base_output_path,
+            subtitle_path=deferred_subtitle_path,
+            output_path=output_video_path,
+            options=options,
+        )
+        return output_video_path
+
+    logger.info(f"\n\n## 6. 最后一步: 合并字幕/BGM/配音/视频 -> {output_video_path}")
+    generate_video.merge_materials(
+        video_path=combined_video_path,
+        audio_path=merged_audio_path,
+        subtitle_path=merged_subtitle_path,
+        bgm_path=bgm_path,
+        output_path=output_video_path,
+        options=options,
+    )
+    return output_video_path
 
 
 def start_subclip(task_id: str, params: VideoClipParams, subclip_path_videos: dict = None):
@@ -419,25 +510,17 @@ def start_subclip(task_id: str, params: VideoClipParams, subclip_path_videos: di
     sm.state.update_task(task_id, state=const.TASK_STATE_PROCESSING, progress=85)
 
     """
-    6. 合并字幕/BGM/配音/视频
+    6. 合并字幕/BGM/配音/视频（延迟模式下先合成再 API 转写烧字幕）
     """
-    output_video_path = path.join(utils.task_dir(task_id), f"combined.mp4")
-    logger.info(f"\n\n## 6. 最后一步: 合并字幕/BGM/配音/视频 -> {output_video_path}")
-
-    bgm_path = utils.get_bgm_file()
-
-    options = _build_merge_video_options(
+    output_video_path = _produce_final_video(
+        task_id,
         params,
-        list_script=list_script,
+        combined_video_path=combined_video_path,
+        merged_audio_path=merged_audio_path,
+        merged_subtitle_path=merged_subtitle_path,
         picture_narration_path=picture_narration_path,
-    )
-    generate_video.merge_materials(
-        video_path=combined_video_path,
-        audio_path=merged_audio_path,
-        subtitle_path=merged_subtitle_path,
-        bgm_path=bgm_path,
-        output_path=output_video_path,
-        options=options
+        list_script=list_script,
+        new_script_list=new_script_list,
     )
 
     final_video_paths.append(output_video_path)
@@ -572,25 +655,17 @@ def start_subclip_unified(task_id: str, params: VideoClipParams):
     sm.state.update_task(task_id, state=const.TASK_STATE_PROCESSING, progress=85)
 
     """
-    6. 合并字幕/BGM/配音/视频
+    6. 合并字幕/BGM/配音/视频（延迟模式下先合成再 API 转写烧字幕）
     """
-    output_video_path = path.join(utils.task_dir(task_id), f"combined.mp4")
-    logger.info(f"\n\n## 6. 最后一步: 合并字幕/BGM/配音/视频 -> {output_video_path}")
-
-    bgm_path = utils.get_bgm_file()
-
-    options = _build_merge_video_options(
+    output_video_path = _produce_final_video(
+        task_id,
         params,
-        list_script=list_script,
+        combined_video_path=combined_video_path,
+        merged_audio_path=merged_audio_path,
+        merged_subtitle_path=merged_subtitle_path,
         picture_narration_path=picture_narration_path,
-    )
-    generate_video.merge_materials(
-        video_path=combined_video_path,
-        audio_path=merged_audio_path,
-        subtitle_path=merged_subtitle_path,
-        bgm_path=bgm_path,
-        output_path=output_video_path,
-        options=options
+        list_script=list_script,
+        new_script_list=new_script_list,
     )
 
     final_video_paths.append(output_video_path)

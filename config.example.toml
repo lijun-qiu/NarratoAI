@@ -179,26 +179,26 @@
 ##########################################
 
 [film_tv]
-# 影视解说（原声为主）成片时长与片段控制
-# target_duration_percent: 成片时长 = 原片时长 × 该比例（如 40 表示 6 分钟原片 → 约 2.4 分钟成片）
-target_duration_percent = 40
+# 影视解说 · 方案 B：高燃精剪（长剧单集约 45 分钟 → 约 10–12 分钟成片）
+# target_duration_percent: 成片时长 = 原片时长 × 该比例（25 表示 45 分钟 → 约 11 分钟）
+target_duration_percent = 25
 # OST=1 原声片段时长（秒），剪辑引擎按时间戳裁剪，过短会导致成片极短
-ost1_duration_min = 10
+ost1_duration_min = 8
 ost1_duration_max = 15
-ost1_duration_long_max = 18
+ost1_duration_long_max = 20
 # 原声/解说段数建议
-ost1_segment_min = 10
-ost1_segment_max = 15
-ost0_segment_min = 5
-ost0_segment_max = 8
+ost1_segment_min = 30
+ost1_segment_max = 42
+ost0_segment_min = 6
+ost0_segment_max = 10
 # 原声占比目标（%）
-original_audio_percent = 75
-narration_percent = 25
+original_audio_percent = 80
+narration_percent = 20
 allow_consecutive_ost1 = true
 enforce_narration_after_ost1 = true
-narration_chars_min = 60
-narration_chars_max = 100
-opening_chars_max = 120
+narration_chars_min = 35
+narration_chars_max = 60
+opening_chars_max = 80
 
 [frames]
     # 提取关键帧的间隔时间（秒）
@@ -229,6 +229,8 @@ opening_chars_max = 120
     prefer_existing_tts_subtitle = true
     # 额外导出解说/原文分轨 SRT（便于剪映分样式）
     export_separate_tracks = true
+    # 先合成成片（水印/旁白/BGM 正常），最后再 API 转写并烧录主字幕
+    defer_asr_until_final = false
     narration_label = ""
     original_label = ""
     max_chars = 18

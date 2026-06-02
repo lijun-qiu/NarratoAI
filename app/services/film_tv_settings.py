@@ -15,21 +15,22 @@ import toml
 from loguru import logger
 
 FILM_TV_DEFAULTS: Dict[str, Any] = {
-    "target_duration_percent": 40,
-    "ost1_duration_min": 10,
+    # 方案 B：高燃精剪（长剧单集约 45 分钟 → 约 10–12 分钟成片）
+    "target_duration_percent": 25,
+    "ost1_duration_min": 8,
     "ost1_duration_max": 15,
-    "ost1_duration_long_max": 18,
-    "ost1_segment_min": 10,
-    "ost1_segment_max": 15,
-    "ost0_segment_min": 5,
-    "ost0_segment_max": 8,
-    "original_audio_percent": 75,
-    "narration_percent": 25,
+    "ost1_duration_long_max": 20,
+    "ost1_segment_min": 30,
+    "ost1_segment_max": 42,
+    "ost0_segment_min": 6,
+    "ost0_segment_max": 10,
+    "original_audio_percent": 80,
+    "narration_percent": 20,
     "allow_consecutive_ost1": True,
     "enforce_narration_after_ost1": True,
-    "narration_chars_min": 60,
-    "narration_chars_max": 100,
-    "opening_chars_max": 120,
+    "narration_chars_min": 35,
+    "narration_chars_max": 60,
+    "opening_chars_max": 80,
 }
 
 

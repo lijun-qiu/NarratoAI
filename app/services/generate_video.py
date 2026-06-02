@@ -107,6 +107,190 @@ def is_valid_subtitle_file(subtitle_path: str) -> bool:
         return False
 
 
+def _resolve_subtitle_font_path(subtitle_font: str) -> Optional[str]:
+    if not subtitle_font:
+        return None
+    font_path = os.path.join(utils.font_dir(), subtitle_font)
+    if os.name == "nt":
+        font_path = font_path.replace("\\", "/")
+    return font_path
+
+
+def _parse_subtitle_style_options(options: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    """解析字幕样式选项，供合成与延迟烧录共用。"""
+    options = options or {}
+    subtitle_bg_color = options.get("subtitle_bg_color", "transparent")
+    if subtitle_bg_color == "transparent":
+        subtitle_bg_color = None
+    try:
+        custom_position = float(options.get("custom_position", 60))
+    except (TypeError, ValueError):
+        custom_position = 60.0
+    try:
+        stroke_width = float(options.get("stroke_width", 1))
+    except (TypeError, ValueError):
+        stroke_width = 1.0
+    return {
+        "subtitle_font": options.get("subtitle_font", ""),
+        "subtitle_font_size": options.get("subtitle_font_size", 40),
+        "subtitle_color": options.get("subtitle_color", "#FFFFFF"),
+        "subtitle_bg_color": subtitle_bg_color,
+        "subtitle_position": options.get("subtitle_position", "custom"),
+        "custom_position": custom_position,
+        "stroke_color": options.get("stroke_color", "#000000"),
+        "stroke_width": stroke_width,
+        "picture_narration_font_size": options.get("picture_narration_font_size", 44),
+        "picture_narration_color": options.get("picture_narration_color", "#FFE066"),
+        "video_aspect": options.get("video_aspect"),
+    }
+
+
+def _position_subtitle_clip(
+    clip,
+    *,
+    video_width: float,
+    video_height: float,
+    subtitle_position: str,
+    custom_position: float,
+    position_mode: str = "default",
+):
+    """主字幕/旁白字幕的统一位置计算（与 merge_materials 保持一致）。"""
+    if position_mode == "picture_narration":
+        pic_x, pic_y = _fixed_center_left_position(
+            clip.w, clip.h, video_width, video_height
+        )
+        return clip.with_position((pic_x, pic_y))
+    if subtitle_position == "bottom":
+        return clip.with_position(("center", video_height * 0.95 - clip.h))
+    if subtitle_position == "top":
+        return clip.with_position(("center", video_height * 0.05))
+    if subtitle_position == "custom":
+        margin = 10
+        max_y = video_height - clip.h - margin
+        min_y = margin
+        custom_y = (video_height - clip.h) * (custom_position / 100)
+        custom_y = max(min_y, min(custom_y, max_y))
+        return clip.with_position(("center", custom_y))
+    return clip.with_position(("center", "center"))
+
+
+def _create_timed_subtitle_clip(
+    subtitle_item,
+    *,
+    video_width: float,
+    video_height: float,
+    font_path: Optional[str],
+    style: Dict[str, Any],
+    position_mode: str = "default",
+    is_landscape: bool = False,
+):
+    phrase = subtitle_item[1]
+    font_size = style["subtitle_font_size"]
+    color = style["subtitle_color"]
+    max_width_ratio = 0.9
+    clip_stroke_color = style["stroke_color"]
+    clip_stroke_width = style["stroke_width"]
+    subtitle_bg_color = style["subtitle_bg_color"]
+
+    if position_mode == "picture_narration":
+        font_size = style["picture_narration_font_size"]
+        color = style["picture_narration_color"]
+        max_width_ratio = 0.42 if is_landscape else 0.45
+        clip_stroke_color = "#000000"
+        clip_stroke_width = max(2, style["stroke_width"])
+
+    max_width = video_width * max_width_ratio
+    wrapped_txt = phrase
+    if font_path:
+        wrapped_txt, _ = wrap_text(
+            phrase,
+            max_width=max_width,
+            font=font_path,
+            fontsize=font_size,
+        )
+
+    try:
+        clip = TextClip(
+            text=wrapped_txt,
+            font=font_path,
+            font_size=font_size,
+            color=color,
+            bg_color=subtitle_bg_color,
+            stroke_color=clip_stroke_color,
+            stroke_width=clip_stroke_width,
+        )
+    except Exception as e:
+        logger.error(f"创建字幕片段失败: {str(e)}, 使用简化参数重试")
+        clip = TextClip(
+            text=wrapped_txt,
+            font=font_path,
+            font_size=font_size,
+            color=color,
+        )
+
+    duration = subtitle_item[0][1] - subtitle_item[0][0]
+    clip = clip.with_start(subtitle_item[0][0])
+    clip = clip.with_end(subtitle_item[0][1])
+    clip = clip.with_duration(duration)
+    return _position_subtitle_clip(
+        clip,
+        video_width=video_width,
+        video_height=video_height,
+        subtitle_position=style["subtitle_position"],
+        custom_position=style["custom_position"],
+        position_mode=position_mode,
+    )
+
+
+def load_subtitle_overlay_clips(
+    subtitle_path: str,
+    *,
+    video_width: float,
+    video_height: float,
+    options: Optional[Dict[str, Any]] = None,
+    position_mode: str = "default",
+) -> list:
+    """从 SRT 加载字幕叠加层，位置/样式与 merge_materials 主字幕一致。"""
+    if not subtitle_path or not is_valid_subtitle_file(subtitle_path):
+        return []
+
+    style = _parse_subtitle_style_options(options)
+    font_path = _resolve_subtitle_font_path(style["subtitle_font"])
+    is_landscape = _is_landscape_video(video_width, video_height, style.get("video_aspect"))
+
+    def make_textclip(text):
+        return TextClip(
+            text=text,
+            font=font_path,
+            font_size=style["subtitle_font_size"],
+            color=style["subtitle_color"],
+        )
+
+    try:
+        sub = SubtitlesClip(
+            subtitles=subtitle_path,
+            encoding="utf-8",
+            make_textclip=make_textclip,
+        )
+        clips = []
+        for item in sub.subtitles:
+            clips.append(
+                _create_timed_subtitle_clip(
+                    item,
+                    video_width=video_width,
+                    video_height=video_height,
+                    font_path=font_path,
+                    style=style,
+                    position_mode=position_mode,
+                    is_landscape=is_landscape,
+                )
+            )
+        return clips
+    except Exception as e:
+        logger.error(f"处理字幕失败 ({subtitle_path}): \n{traceback.format_exc()}")
+        return []
+
+
 def merge_materials(
     video_path: str,
     audio_path: str,
@@ -324,120 +508,30 @@ def merge_materials(
     else:
         logger.warning("没有可用的音频轨道，输出视频将没有声音")
     
-    # 处理字体路径
-    font_path = None
-    if subtitle_font:
-        font_path = os.path.join(utils.font_dir(), subtitle_font)
-        if os.name == "nt":
-            font_path = font_path.replace("\\", "/")
+    font_path = _resolve_subtitle_font_path(subtitle_font)
+    if font_path:
         logger.info(f"使用字体: {font_path}")
-    
-    # 处理视频尺寸
+
     video_width, video_height = video_clip.size
     is_landscape = _is_landscape_video(video_width, video_height, video_aspect)
     if is_landscape:
         logger.info("画幅 16:9：旁白字幕居中靠左，水印居中靠右（上下 10% 缓慢浮动）")
     else:
         logger.info("画幅 9:16：旁白字幕居中靠左，水印居中靠右（上下 10% 缓慢浮动）")
-    
-    # 字幕处理函数
-    def create_text_clip(subtitle_item, *, position_mode: str = "default"):
-        """创建单个字幕片段"""
-        phrase = subtitle_item[1]
-        font_size = subtitle_font_size
-        color = subtitle_color
-        max_width_ratio = 0.9
-        pos_mode = position_mode
 
-        clip_stroke_color = stroke_color
-        clip_stroke_width = stroke_width
-        if pos_mode == "picture_narration":
-            font_size = picture_narration_font_size
-            color = picture_narration_color
-            max_width_ratio = 0.42 if is_landscape else 0.45
-            clip_stroke_color = "#000000"
-            clip_stroke_width = max(2, stroke_width)
-
-        max_width = video_width * max_width_ratio
-        
-        # 如果有字体路径，进行文本换行处理
-        wrapped_txt = phrase
-        txt_height = 0
-        if font_path:
-            wrapped_txt, txt_height = wrap_text(
-                phrase, 
-                max_width=max_width, 
-                font=font_path, 
-                fontsize=font_size
-            )
-        
-        # 创建文本片段
-        try:
-            _clip = TextClip(
-                text=wrapped_txt,
-                font=font_path,
-                font_size=font_size,
-                color=color,
-                bg_color=subtitle_bg_color,  # 这里已经在前面处理过，None表示透明
-                stroke_color=clip_stroke_color,
-                stroke_width=clip_stroke_width,
-            )
-        except Exception as e:
-            logger.error(f"创建字幕片段失败: {str(e)}, 使用简化参数重试")
-            # 如果上面的方法失败，尝试使用更简单的参数
-            _clip = TextClip(
-                text=wrapped_txt,
-                font=font_path,
-                font_size=font_size,
-                color=color,
-            )
-        
-        # 设置字幕时间
-        duration = subtitle_item[0][1] - subtitle_item[0][0]
-        _clip = _clip.with_start(subtitle_item[0][0])
-        _clip = _clip.with_end(subtitle_item[0][1])
-        _clip = _clip.with_duration(duration)
-        
-        # 设置字幕位置
-        if pos_mode == "picture_narration":
-            pic_x, pic_y = _fixed_center_left_position(
-                _clip.w, _clip.h, video_width, video_height
-            )
-            _clip = _clip.with_position((pic_x, pic_y))
-        elif subtitle_position == "bottom":
-            _clip = _clip.with_position(("center", video_height * 0.95 - _clip.h))
-        elif subtitle_position == "top":
-            _clip = _clip.with_position(("center", video_height * 0.05))
-        elif subtitle_position == "custom":
-            margin = 10
-            max_y = video_height - _clip.h - margin
-            min_y = margin
-            custom_y = (video_height - _clip.h) * (custom_position / 100)
-            custom_y = max(
-                min_y, min(custom_y, max_y)
-            )
-            _clip = _clip.with_position(("center", custom_y))
-        else:  # center
-            _clip = _clip.with_position(("center", "center"))
-            
-        return _clip
-
-    def _load_subtitle_clips(sub_path: str, position_mode: str = "default") -> list:
-        if not sub_path or not is_valid_subtitle_file(sub_path):
-            return []
-        try:
-            sub = SubtitlesClip(
-                subtitles=sub_path,
-                encoding="utf-8",
-                make_textclip=make_textclip,
-            )
-            clips = []
-            for item in sub.subtitles:
-                clips.append(create_text_clip(subtitle_item=item, position_mode=position_mode))
-            return clips
-        except Exception as e:
-            logger.error(f"处理字幕失败 ({sub_path}): \n{traceback.format_exc()}")
-            return []
+    subtitle_overlay_options = {
+        "subtitle_font": subtitle_font,
+        "subtitle_font_size": subtitle_font_size,
+        "subtitle_color": subtitle_color,
+        "subtitle_bg_color": subtitle_bg_color,
+        "subtitle_position": subtitle_position,
+        "custom_position": custom_position,
+        "stroke_color": stroke_color,
+        "stroke_width": stroke_width,
+        "picture_narration_font_size": picture_narration_font_size,
+        "picture_narration_color": picture_narration_color,
+        "video_aspect": video_aspect,
+    }
 
     def create_watermark_clip():
         if not watermark_text:
@@ -478,25 +572,23 @@ def merge_materials(
         wm_clip = wm_clip.with_position(floating_position)
         wm_clip = wm_clip.with_start(0).with_end(video_clip.duration).with_duration(video_clip.duration)
         return wm_clip
-        
-    # 创建TextClip工厂函数
-    def make_textclip(text):
-        return TextClip(
-            text=text,
-            font=font_path,
-            font_size=subtitle_font_size,
-            color=subtitle_color,
-        )
-    
+
     # 处理字幕、旁白字幕与水印
     overlay_clips = []
 
     if subtitle_enabled and subtitle_path:
         if is_valid_subtitle_file(subtitle_path):
             logger.info("字幕已启用，开始处理字幕文件")
-            overlay_clips.extend(_load_subtitle_clips(subtitle_path, position_mode="default"))
-            if overlay_clips:
-                logger.info(f"已添加 {len(overlay_clips)} 个主字幕片段")
+            main_subtitle_clips = load_subtitle_overlay_clips(
+                subtitle_path,
+                video_width=video_width,
+                video_height=video_height,
+                options=subtitle_overlay_options,
+                position_mode="default",
+            )
+            overlay_clips.extend(main_subtitle_clips)
+            if main_subtitle_clips:
+                logger.info(f"已添加 {len(main_subtitle_clips)} 个主字幕片段")
         else:
             logger.warning(f"字幕文件无效或为空: {subtitle_path}，跳过字幕处理")
     elif not subtitle_enabled:
@@ -510,7 +602,13 @@ def merge_materials(
         logger.info(f"已添加水印: {watermark_text}")
 
     if picture_narration_enabled and picture_narration_path:
-        pic_clips = _load_subtitle_clips(picture_narration_path, position_mode="picture_narration")
+        pic_clips = load_subtitle_overlay_clips(
+            picture_narration_path,
+            video_width=video_width,
+            video_height=video_height,
+            options=subtitle_overlay_options,
+            position_mode="picture_narration",
+        )
         if pic_clips:
             overlay_clips.extend(pic_clips)
             logger.info(f"已添加 {len(pic_clips)} 个原声旁白字幕片段")
@@ -538,6 +636,80 @@ def merge_materials(
         video_clip.close()
         del video_clip
     
+    return output_path
+
+
+def burn_subtitles_on_video(
+    video_path: str,
+    subtitle_path: str,
+    output_path: str,
+    options: Optional[Dict[str, Any]] = None,
+) -> str:
+    """
+    在已合成视频上仅叠加主字幕，保留原有音轨及已烧录的水印/旁白字幕。
+
+    用于「先合成 → API 转写 → 再烧主字幕」流程的最后一步。
+    """
+    if options is None:
+        options = {}
+
+    if not is_valid_subtitle_file(subtitle_path):
+        raise ValueError(f"无效字幕文件: {subtitle_path}")
+
+    style = _parse_subtitle_style_options(options)
+    threads = options.get("threads", 2)
+    fps = options.get("fps", 30)
+
+    output_dir = os.path.dirname(output_path) or "."
+    os.makedirs(output_dir, exist_ok=True)
+
+    write_path = output_path
+    if os.path.abspath(video_path) == os.path.abspath(output_path):
+        fd, write_path = tempfile.mkstemp(suffix=".mp4", dir=output_dir)
+        os.close(fd)
+
+    logger.info(
+        f"在成片上烧录主字幕: {video_path} -> {output_path} "
+        f"(位置={style['subtitle_position']}, custom={style['custom_position']})"
+    )
+
+    video_clip = VideoFileClip(video_path)
+    video_width, video_height = video_clip.size
+
+    subtitle_clips = load_subtitle_overlay_clips(
+        subtitle_path,
+        video_width=video_width,
+        video_height=video_height,
+        options=options,
+        position_mode="default",
+    )
+    if not subtitle_clips:
+        video_clip.close()
+        raise RuntimeError(f"加载字幕失败: {subtitle_path}")
+    logger.info(f"已加载 {len(subtitle_clips)} 个主字幕片段")
+
+    if subtitle_clips:
+        final_video = CompositeVideoClip([video_clip, *subtitle_clips])
+    else:
+        final_video = video_clip
+
+    try:
+        final_video.write_videofile(
+            write_path,
+            audio_codec="aac",
+            temp_audiofile_path=output_dir,
+            threads=threads,
+            fps=fps,
+        )
+        logger.success(f"主字幕烧录完成: {output_path}")
+    finally:
+        if final_video is not video_clip:
+            final_video.close()
+        video_clip.close()
+
+    if write_path != output_path:
+        os.replace(write_path, output_path)
+
     return output_path
 
 

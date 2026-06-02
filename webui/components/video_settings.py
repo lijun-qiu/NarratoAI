@@ -67,7 +67,7 @@ def render_video_output_settings(tr):
     base = saved if isinstance(saved, dict) else defaults
 
     with st.expander("成片输出（水印 / 原声旁白）", expanded=False):
-        st.caption("16:9 与 9:16 下，旁白字幕固定居中靠左；水印固定居中靠右，并带较大幅度上下浮动。")
+        st.caption("16:9 与 9:16 下，旁白字幕固定居中靠左；水印居中靠右，上下浮动约 10% 画面高度，缓慢漂移。")
 
         watermark_text = st.text_input(
             "水印文字",

@@ -13,6 +13,8 @@ import os
 import subprocess
 from typing import Dict, List, Any, Tuple, Union
 
+from loguru import logger
+
 from app.utils import utils
 
 # 统一裁剪输出: ost0_vid_00-00-00-000@00-00-20-250.mp4；旧版: vid_... / vid-...
@@ -188,6 +190,77 @@ def rebuild_edited_time_ranges(script_list: List[Dict[str, Any]]) -> List[Dict[s
         item["editedTimeRange"] = format_edited_time_range(start_sec, end_sec)
         accumulated = end_sec
     return script_list
+
+
+def collect_processed_segment_durations(task_id: str, clip_count: int) -> List[float]:
+    """读取 merger 重编码后的 processed_*.mp4 时长（与 video_clips 顺序一致）。"""
+    if clip_count <= 0:
+        return []
+    temp_dir = os.path.join(utils.task_dir(task_id), "temp_videos")
+    durations: List[float] = []
+    for index in range(clip_count):
+        processed_path = os.path.join(temp_dir, f"processed_{index}.mp4")
+        probed = probe_media_duration(processed_path) if os.path.isfile(processed_path) else 0.0
+        durations.append(probed if probed > 0 else 0.0)
+    return durations
+
+
+def rebuild_edited_time_ranges_from_processed(
+    script_list: List[Dict[str, Any]],
+    processed_durations: List[float],
+) -> List[Dict[str, Any]]:
+    """用 merger 重编码后的片段时长重建时间轴，与 merger.mp4 原声对齐。"""
+    duration_index = 0
+    accumulated = 0.0
+    for item in script_list:
+        video_path = item.get("video") or ""
+        if not video_path or not is_valid_video_file(video_path):
+            continue
+
+        duration = 0.0
+        if duration_index < len(processed_durations) and processed_durations[duration_index] > 0:
+            duration = processed_durations[duration_index]
+        if duration <= 0:
+            duration = probe_segment_video_duration(item)
+        if duration <= 0:
+            duration = float(item.get("duration") or 0)
+        duration_index += 1
+
+        if duration <= 0:
+            logger.warning(
+                f"片段 {item.get('_id')} 无法确定成片时长，跳过 editedTimeRange 更新"
+            )
+            continue
+
+        item["duration"] = round(duration, 3)
+        start_sec = accumulated
+        end_sec = accumulated + duration
+        item["editedTimeRange"] = format_edited_time_range(start_sec, end_sec)
+        accumulated = end_sec
+
+    return script_list
+
+
+def sync_script_timeline_after_video_merge(
+    task_id: str,
+    script_list: List[Dict[str, Any]],
+    video_clip_count: int,
+) -> List[Dict[str, Any]]:
+    """视频合并后按 processed 片段时长校正成片时间轴。"""
+    processed = collect_processed_segment_durations(task_id, video_clip_count)
+    if not processed or all(value <= 0 for value in processed):
+        logger.warning("未找到 processed 片段时长，保留裁剪后时间轴")
+        return script_list
+
+    before_total = sum(float(item.get("duration") or 0) for item in script_list)
+    updated = rebuild_edited_time_ranges_from_processed(script_list, processed)
+    after_total = sum(float(item.get("duration") or 0) for item in script_list)
+    delta = round(after_total - before_total, 3)
+    if abs(delta) >= 0.05:
+        logger.info(
+            f"成片时间轴已按 merger 重编码校正: {before_total:.3f}s -> {after_total:.3f}s (Δ{delta:+.3f}s)"
+        )
+    return updated
 
 
 def resolve_segment_timeline_duration(

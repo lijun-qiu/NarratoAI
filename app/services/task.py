@@ -168,6 +168,97 @@ def _merge_task_subtitles(
     return ""
 
 
+def _collect_video_clips_from_script(
+    new_script_list: list,
+    subclip_path_videos: dict = None,
+) -> list:
+    """收集可合并的视频片段路径（与脚本顺序一致）。"""
+    video_clips = []
+    for new_script in new_script_list:
+        video_path = new_script.get("video")
+        if video_path and is_valid_video_file(video_path):
+            video_clips.append(video_path)
+            continue
+
+        logger.warning(
+            f"片段 {new_script.get('_id')} 的视频文件不存在、损坏或未生成: {video_path}"
+        )
+        if subclip_path_videos and new_script.get("_id") in subclip_path_videos:
+            backup_video = subclip_path_videos[new_script.get("_id")]
+            if is_valid_video_file(backup_video):
+                video_clips.append(backup_video)
+                logger.info(f"使用备用视频: {backup_video}")
+            else:
+                logger.error(f"备用视频也不存在: {backup_video}")
+        else:
+            logger.error(f"无法找到片段 {new_script.get('_id')} 的视频文件")
+    return video_clips
+
+
+def _merge_video_clips_and_sync_timeline(
+    task_id: str,
+    new_script_list: list,
+    video_clips: list,
+    video_ost: list,
+    params: VideoClipParams,
+    source_script_path: str = "",
+) -> tuple[str, list]:
+    """合并视频片段，并按重编码后的 processed 时长校正成片时间轴。"""
+    combined_video_path = path.join(utils.task_dir(task_id), "merger.mp4")
+    logger.info(f"\n\n## 合并视频: => {combined_video_path}")
+    logger.info(f"准备合并 {len(video_clips)} 个视频片段")
+
+    merger_video.combine_clip_videos(
+        output_video_path=combined_video_path,
+        video_paths=video_clips,
+        video_ost_list=video_ost,
+        video_aspect=params.video_aspect,
+        threads=params.n_threads,
+    )
+
+    new_script_list = update_script.sync_script_timeline_after_video_merge(
+        task_id,
+        new_script_list,
+        len(video_clips),
+    )
+    _persist_synced_script(task_id, new_script_list, source_script_path)
+    return combined_video_path, new_script_list
+
+
+def _merge_audio_and_subtitles(
+    task_id: str,
+    new_script_list: list,
+    params: VideoClipParams,
+    *,
+    tts_segments: list,
+) -> tuple[str, str, str]:
+    """在成片时间轴校正后合并 TTS 音轨与字幕。"""
+    logger.info("\n\n## 合并音频和字幕")
+    total_duration = sum(script["duration"] for script in new_script_list)
+    merged_audio_path = ""
+    merged_subtitle_path = ""
+    picture_narration_path = ""
+    try:
+        if tts_segments:
+            merged_audio_path = audio_merger.merge_audio_files(
+                task_id=task_id,
+                total_duration=total_duration,
+                list_script=new_script_list,
+            )
+            logger.info(f"音频文件合并成功->{merged_audio_path}")
+
+        merged_subtitle_path = _merge_task_subtitles(task_id, new_script_list, params)
+        video_output = get_video_output_settings()
+        if hasattr(params, "enable_picture_narration") and params.enable_picture_narration is not None:
+            video_output["enable_picture_narration"] = params.enable_picture_narration
+        picture_narration_path = _build_picture_narration_path(
+            task_id, new_script_list, video_output=video_output
+        )
+    except Exception as e:
+        logger.error(f"合并音频/字幕文件失败: {str(e)}")
+    return merged_audio_path, merged_subtitle_path, picture_narration_path
+
+
 def _build_picture_narration_path(
     task_id: str,
     new_script_list: list,
@@ -308,75 +399,24 @@ def start_subclip(task_id: str, params: VideoClipParams, subclip_path_videos: di
     sm.state.update_task(task_id, state=const.TASK_STATE_PROCESSING, progress=60)
 
     """
-    4. 合并音频和字幕
-    """
-    logger.info("\n\n## 4. 合并音频和字幕")
-    total_duration = sum([script["duration"] for script in new_script_list])
-    merged_audio_path = ""
-    merged_subtitle_path = ""
-    picture_narration_path = ""
-    try:
-        if tts_segments:
-            merged_audio_path = audio_merger.merge_audio_files(
-                task_id=task_id,
-                total_duration=total_duration,
-                list_script=new_script_list
-            )
-            logger.info(f"音频文件合并成功->{merged_audio_path}")
-
-        merged_subtitle_path = _merge_task_subtitles(task_id, new_script_list, params)
-        video_output = get_video_output_settings()
-        if hasattr(params, 'enable_picture_narration') and params.enable_picture_narration is not None:
-            video_output["enable_picture_narration"] = params.enable_picture_narration
-        picture_narration_path = _build_picture_narration_path(
-            task_id, new_script_list, video_output=video_output
-        )
-    except Exception as e:
-        logger.error(f"合并音频/字幕文件失败: {str(e)}")
-        if not merged_audio_path:
-            merged_audio_path = ""
-        if not merged_subtitle_path:
-            merged_subtitle_path = ""
-        picture_narration_path = ""
-
-    """
-    5. 合并视频
+    4. 合并视频（先合并，再按重编码后时长校正时间轴）
     """
     final_video_paths = []
     combined_video_paths = []
 
-    combined_video_path = path.join(utils.task_dir(task_id), f"merger.mp4")
-    logger.info(f"\n\n## 5. 合并视频: => {combined_video_path}")
-
-    # 使用统一裁剪后的视频片段
-    video_clips = []
-    for new_script in new_script_list:
-        video_path = new_script.get('video')
-        if video_path and is_valid_video_file(video_path):
-            video_clips.append(video_path)
-        else:
-            logger.warning(f"片段 {new_script.get('_id')} 的视频文件不存在、损坏或未生成: {video_path}")
-            # 如果统一裁剪失败，尝试使用备用方案（如果提供了subclip_path_videos）
-            if subclip_path_videos and new_script.get('_id') in subclip_path_videos:
-                backup_video = subclip_path_videos[new_script.get('_id')]
-                if is_valid_video_file(backup_video):
-                    video_clips.append(backup_video)
-                    logger.info(f"使用备用视频: {backup_video}")
-                else:
-                    logger.error(f"备用视频也不存在: {backup_video}")
-            else:
-                logger.error(f"无法找到片段 {new_script.get('_id')} 的视频文件")
-
-    logger.info(f"准备合并 {len(video_clips)} 个视频片段")
-
-    merger_video.combine_clip_videos(
-        output_video_path=combined_video_path,
-        video_paths=video_clips,
-        video_ost_list=video_ost,
-        video_aspect=params.video_aspect,
-        threads=params.n_threads
+    video_clips = _collect_video_clips_from_script(new_script_list, subclip_path_videos)
+    combined_video_path, new_script_list = _merge_video_clips_and_sync_timeline(
+        task_id, new_script_list, video_clips, video_ost, params, video_script_path
     )
-    sm.state.update_task(task_id, state=const.TASK_STATE_PROCESSING, progress=80)
+    sm.state.update_task(task_id, state=const.TASK_STATE_PROCESSING, progress=75)
+
+    """
+    5. 合并音频和字幕（使用与 merger.mp4 一致的时间轴）
+    """
+    merged_audio_path, merged_subtitle_path, picture_narration_path = _merge_audio_and_subtitles(
+        task_id, new_script_list, params, tts_segments=tts_segments
+    )
+    sm.state.update_task(task_id, state=const.TASK_STATE_PROCESSING, progress=85)
 
     """
     6. 合并字幕/BGM/配音/视频
@@ -384,7 +424,6 @@ def start_subclip(task_id: str, params: VideoClipParams, subclip_path_videos: di
     output_video_path = path.join(utils.task_dir(task_id), f"combined.mp4")
     logger.info(f"\n\n## 6. 最后一步: 合并字幕/BGM/配音/视频 -> {output_video_path}")
 
-    # bgm_path = '/Users/apple/Desktop/home/NarratoAI/resource/songs/bgm.mp3'
     bgm_path = utils.get_bgm_file()
 
     options = _build_merge_video_options(
@@ -513,65 +552,24 @@ def start_subclip_unified(task_id: str, params: VideoClipParams):
     sm.state.update_task(task_id, state=const.TASK_STATE_PROCESSING, progress=60)
 
     """
-    4. 合并音频和字幕
-    """
-    logger.info("\n\n## 4. 合并音频和字幕")
-    total_duration = sum([script["duration"] for script in new_script_list])
-    merged_audio_path = ""
-    merged_subtitle_path = ""
-    picture_narration_path = ""
-    try:
-        if tts_segments:
-            merged_audio_path = audio_merger.merge_audio_files(
-                task_id=task_id,
-                total_duration=total_duration,
-                list_script=new_script_list
-            )
-            logger.info(f"音频文件合并成功->{merged_audio_path}")
-
-        merged_subtitle_path = _merge_task_subtitles(task_id, new_script_list, params)
-        video_output = get_video_output_settings()
-        if hasattr(params, 'enable_picture_narration') and params.enable_picture_narration is not None:
-            video_output["enable_picture_narration"] = params.enable_picture_narration
-        picture_narration_path = _build_picture_narration_path(
-            task_id, new_script_list, video_output=video_output
-        )
-    except Exception as e:
-        logger.error(f"合并音频/字幕文件失败: {str(e)}")
-        if not merged_audio_path:
-            merged_audio_path = ""
-        if not merged_subtitle_path:
-            merged_subtitle_path = ""
-        picture_narration_path = ""
-
-    """
-    5. 合并视频
+    4. 合并视频（先合并，再按重编码后时长校正时间轴）
     """
     final_video_paths = []
     combined_video_paths = []
 
-    combined_video_path = path.join(utils.task_dir(task_id), f"merger.mp4")
-    logger.info(f"\n\n## 5. 合并视频: => {combined_video_path}")
-
-    # 使用统一裁剪后的视频片段
-    video_clips = []
-    for new_script in new_script_list:
-        video_path = new_script.get('video')
-        if video_path and is_valid_video_file(video_path):
-            video_clips.append(video_path)
-        else:
-            logger.error(f"片段 {new_script.get('_id')} 的视频文件不存在、损坏或未生成: {video_path}")
-
-    logger.info(f"准备合并 {len(video_clips)} 个视频片段")
-
-    merger_video.combine_clip_videos(
-        output_video_path=combined_video_path,
-        video_paths=video_clips,
-        video_ost_list=video_ost,
-        video_aspect=params.video_aspect,
-        threads=params.n_threads
+    video_clips = _collect_video_clips_from_script(new_script_list)
+    combined_video_path, new_script_list = _merge_video_clips_and_sync_timeline(
+        task_id, new_script_list, video_clips, video_ost, params, video_script_path
     )
-    sm.state.update_task(task_id, state=const.TASK_STATE_PROCESSING, progress=80)
+    sm.state.update_task(task_id, state=const.TASK_STATE_PROCESSING, progress=75)
+
+    """
+    5. 合并音频和字幕（使用与 merger.mp4 一致的时间轴）
+    """
+    merged_audio_path, merged_subtitle_path, picture_narration_path = _merge_audio_and_subtitles(
+        task_id, new_script_list, params, tts_segments=tts_segments
+    )
+    sm.state.update_task(task_id, state=const.TASK_STATE_PROCESSING, progress=85)
 
     """
     6. 合并字幕/BGM/配音/视频

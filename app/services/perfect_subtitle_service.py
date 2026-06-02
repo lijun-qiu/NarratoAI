@@ -74,6 +74,15 @@ def _edited_offset_ms(segment: dict[str, Any]) -> int:
     return int(round(start_sec * 1000))
 
 
+def _segment_clip_range_ms(segment: dict[str, Any]) -> tuple[int, int]:
+    """片段在源片上的裁剪范围；优先 sourceTimeRange（与 ffmpeg 输出文件名一致）。"""
+    for key in ("sourceTimeRange", "timestamp"):
+        start_ms, end_ms = parse_timestamp_range(segment.get(key, ""))
+        if end_ms > start_ms:
+            return start_ms, end_ms
+    return 0, 0
+
+
 def _segment_video_duration_ms(segment: dict[str, Any]) -> int:
     video_path = segment.get("video") or ""
     if video_path:
@@ -144,9 +153,7 @@ def _build_ost1_entries(
     settings: dict[str, Any],
 ) -> list[SrtEntry]:
     segment_id = segment.get("_id", "unknown")
-    clip_start_ms, clip_end_ms = parse_timestamp_range(segment.get("timestamp", ""))
-    if clip_end_ms <= clip_start_ms:
-        clip_start_ms, clip_end_ms = parse_timestamp_range(segment.get("sourceTimeRange", ""))
+    clip_start_ms, clip_end_ms = _segment_clip_range_ms(segment)
 
     label = str(settings.get("original_label") or "")
     local_entries: list[SrtEntry] = []

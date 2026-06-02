@@ -336,9 +336,9 @@ def merge_materials(
     video_width, video_height = video_clip.size
     is_landscape = _is_landscape_video(video_width, video_height, video_aspect)
     if is_landscape:
-        logger.info("画幅 16:9：旁白字幕居中靠左，水印居中靠右（上下浮动）")
+        logger.info("画幅 16:9：旁白字幕居中靠左，水印居中靠右（上下 10% 缓慢浮动）")
     else:
-        logger.info("画幅 9:16：旁白字幕居中靠左，水印居中靠右（上下浮动）")
+        logger.info("画幅 9:16：旁白字幕居中靠左，水印居中靠右（上下 10% 缓慢浮动）")
     
     # 字幕处理函数
     def create_text_clip(subtitle_item, *, position_mode: str = "default"):
@@ -464,10 +464,10 @@ def merge_materials(
             wm_clip.w, wm_clip.h, video_width, video_height
         )
         margin = max(12, int(min(video_width, video_height) * 0.02))
-        float_amplitude = max(36, int(video_height * 0.16))
+        float_amplitude = video_height * 0.10
         min_y = max(margin, base_y - float_amplitude)
         max_y = min(video_height - wm_clip.h - margin, base_y + float_amplitude)
-        float_period = 4.0
+        float_period = 30.0
 
         def floating_position(t):
             offset_y = float_amplitude * math.sin(2 * math.pi * t / float_period)

@@ -206,7 +206,7 @@ def process_single_video(
     pad_filter = f"pad={target_width}:{target_height}:(ow-iw)/2:(oh-ih)/2"
     command.extend([
         '-vf', f"{scale_filter},{pad_filter}",
-        '-r', '30',  # 设置帧率为30fps
+        '-fps_mode', 'passthrough',
     ])
 
     # 关键修复：选择编码器时优先使用纯NVENC（无硬件解码）
@@ -286,7 +286,7 @@ def process_single_video(
                 # 保持原有的视频过滤器
                 fallback_cmd.extend([
                     '-vf', f"{scale_filter},{pad_filter}",
-                    '-r', '30',
+                    '-fps_mode', 'passthrough',
                     '-c:v', 'libx264',
                     '-preset', 'medium',
                     '-profile:v', 'high',

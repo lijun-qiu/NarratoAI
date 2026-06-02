@@ -1,5 +1,11 @@
 import streamlit as st
+from app.config import config
 from app.models.schema import VideoClipParams, VideoAspect, AudioVolumeDefaults
+from app.services.video_output_settings import (
+    VIDEO_OUTPUT_DEFAULTS,
+    get_video_output_settings,
+    save_video_output_settings_to_config,
+)
 
 
 def render_video_panel(tr):
@@ -8,6 +14,7 @@ def render_video_panel(tr):
         st.write(tr("Video Settings"))
         params = VideoClipParams()
         render_video_config(tr, params)
+        render_video_output_settings(tr)
 
 
 def render_video_config(tr, params):
@@ -53,10 +60,66 @@ def render_video_config(tr, params):
     st.session_state['original_volume'] = params.original_volume
 
 
+def render_video_output_settings(tr):
+    """成片输出：水印与原声旁白字幕。"""
+    defaults = get_video_output_settings()
+    saved = st.session_state.get("video_output_settings")
+    base = saved if isinstance(saved, dict) else defaults
+
+    with st.expander("成片输出（水印 / 原声旁白）", expanded=False):
+        st.caption("水印烧录在成片右上角 1/3 区域并上下浮动；原声旁白字幕显示在画面左侧偏上区域，内容来自脚本 picture 字段。")
+
+        watermark_text = st.text_input(
+            "水印文字",
+            value=str(base.get("watermark_text", VIDEO_OUTPUT_DEFAULTS["watermark_text"])),
+            help="留空则不添加水印",
+            key="vo_watermark_text",
+        )
+        enable_picture_narration = st.checkbox(
+            "原声段显示旁白描述字幕",
+            value=bool(base.get("enable_picture_narration", True)),
+            help="开启后，OST=1 原声段在画面左侧上方显示画面/动作/情绪描述（picture 字段）",
+            key="vo_enable_picture_narration",
+        )
+
+        c1, c2 = st.columns(2)
+        with c1:
+            picture_narration_font_size = st.slider(
+                "旁白字幕字号",
+                min_value=20,
+                max_value=60,
+                value=int(base.get("picture_narration_font_size", 32)),
+                key="vo_picture_narration_font_size",
+            )
+        with c2:
+            picture_narration_color = st.color_picker(
+                "旁白字幕颜色",
+                value=str(base.get("picture_narration_color", "#FFE066")),
+                key="vo_picture_narration_color",
+            )
+
+        settings = {
+            "watermark_text": watermark_text.strip(),
+            "enable_picture_narration": enable_picture_narration,
+            "picture_narration_font_size": picture_narration_font_size,
+            "picture_narration_color": picture_narration_color,
+            "picture_narration_max_chars": int(base.get("picture_narration_max_chars", 16)),
+        }
+        st.session_state["video_output_settings"] = settings
+        config.video_output = settings
+
+        if st.button("保存为默认配置", key="vo_save_defaults"):
+            if save_video_output_settings_to_config(settings):
+                st.success("已保存到 config.toml [video_output]")
+
+
 def get_video_params():
     """获取视频参数"""
+    vo = st.session_state.get("video_output_settings") or get_video_output_settings()
     return {
         'video_aspect': st.session_state.get('video_aspect', VideoAspect.portrait.value),
         'video_quality': st.session_state.get('video_quality', '1080p'),
-        'original_volume': st.session_state.get('original_volume', AudioVolumeDefaults.ORIGINAL_VOLUME)
+        'original_volume': st.session_state.get('original_volume', AudioVolumeDefaults.ORIGINAL_VOLUME),
+        'watermark_text': vo.get('watermark_text', VIDEO_OUTPUT_DEFAULTS['watermark_text']),
+        'enable_picture_narration': vo.get('enable_picture_narration', True),
     }

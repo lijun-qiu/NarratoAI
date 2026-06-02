@@ -9,6 +9,7 @@
 '''
 
 import os
+import math
 import traceback
 import tempfile
 from typing import Optional, Dict, Any
@@ -121,6 +122,11 @@ def merge_materials(
     threads = options.get('threads', 2)
     fps = options.get('fps', 30)
     subtitle_enabled = options.get('subtitle_enabled', True)
+    watermark_text = str(options.get('watermark_text') or '').strip()
+    picture_narration_path = options.get('picture_narration_path')
+    picture_narration_enabled = options.get('enable_picture_narration', False)
+    picture_narration_font_size = options.get('picture_narration_font_size', 32)
+    picture_narration_color = options.get('picture_narration_color', '#FFE066')
 
     # 配置日志 - 便于调试问题
     logger.info(f"音量配置详情:")
@@ -131,6 +137,9 @@ def merge_materials(
     logger.info(f"字幕配置详情:")
     logger.info(f"  - 是否启用字幕: {subtitle_enabled}")
     logger.info(f"  - 字幕文件路径: {subtitle_path}")
+    logger.info(f"成片输出配置:")
+    logger.info(f"  - 水印: {watermark_text or '未启用'}")
+    logger.info(f"  - 原声旁白字幕: {picture_narration_enabled}")
 
     # 音量参数验证
     def validate_volume(volume, name):
@@ -271,7 +280,7 @@ def merge_materials(
     
     # 处理字体路径
     font_path = None
-    if subtitle_path and subtitle_font:
+    if subtitle_font:
         font_path = os.path.join(utils.font_dir(), subtitle_font)
         if os.name == "nt":
             font_path = font_path.replace("\\", "/")
@@ -281,10 +290,20 @@ def merge_materials(
     video_width, video_height = video_clip.size
     
     # 字幕处理函数
-    def create_text_clip(subtitle_item):
+    def create_text_clip(subtitle_item, *, position_mode: str = "default"):
         """创建单个字幕片段"""
         phrase = subtitle_item[1]
-        max_width = video_width * 0.9
+        font_size = subtitle_font_size
+        color = subtitle_color
+        max_width_ratio = 0.9
+        pos_mode = position_mode
+
+        if pos_mode == "picture_narration":
+            font_size = picture_narration_font_size
+            color = picture_narration_color
+            max_width_ratio = 0.42
+
+        max_width = video_width * max_width_ratio
         
         # 如果有字体路径，进行文本换行处理
         wrapped_txt = phrase
@@ -294,7 +313,7 @@ def merge_materials(
                 phrase, 
                 max_width=max_width, 
                 font=font_path, 
-                fontsize=subtitle_font_size
+                fontsize=font_size
             )
         
         # 创建文本片段
@@ -302,8 +321,8 @@ def merge_materials(
             _clip = TextClip(
                 text=wrapped_txt,
                 font=font_path,
-                font_size=subtitle_font_size,
-                color=subtitle_color,
+                font_size=font_size,
+                color=color,
                 bg_color=subtitle_bg_color,  # 这里已经在前面处理过，None表示透明
                 stroke_color=stroke_color,
                 stroke_width=stroke_width,
@@ -314,8 +333,8 @@ def merge_materials(
             _clip = TextClip(
                 text=wrapped_txt,
                 font=font_path,
-                font_size=subtitle_font_size,
-                color=subtitle_color,
+                font_size=font_size,
+                color=color,
             )
         
         # 设置字幕时间
@@ -325,7 +344,13 @@ def merge_materials(
         _clip = _clip.with_duration(duration)
         
         # 设置字幕位置
-        if subtitle_position == "bottom":
+        if pos_mode == "picture_narration":
+            margin_x = max(12, int(video_width * 0.03))
+            margin_y = max(12, int(video_height * 0.08))
+            upper_limit = int(video_height * 0.66) - _clip.h
+            pos_y = min(margin_y, max(margin_y, upper_limit))
+            _clip = _clip.with_position((margin_x, pos_y))
+        elif subtitle_position == "bottom":
             _clip = _clip.with_position(("center", video_height * 0.95 - _clip.h))
         elif subtitle_position == "top":
             _clip = _clip.with_position(("center", video_height * 0.05))
@@ -342,6 +367,66 @@ def merge_materials(
             _clip = _clip.with_position(("center", "center"))
             
         return _clip
+
+    def _load_subtitle_clips(sub_path: str, position_mode: str = "default") -> list:
+        if not sub_path or not is_valid_subtitle_file(sub_path):
+            return []
+        try:
+            sub = SubtitlesClip(
+                subtitles=sub_path,
+                encoding="utf-8",
+                make_textclip=make_textclip,
+            )
+            clips = []
+            for item in sub.subtitles:
+                clips.append(create_text_clip(subtitle_item=item, position_mode=position_mode))
+            return clips
+        except Exception as e:
+            logger.error(f"处理字幕失败 ({sub_path}): \n{traceback.format_exc()}")
+            return []
+
+    def create_watermark_clip():
+        if not watermark_text:
+            return None
+        wm_font_size = max(18, int(subtitle_font_size * 0.55))
+        try:
+            wm_clip = TextClip(
+                text=watermark_text,
+                font=font_path,
+                font_size=wm_font_size,
+                color="#FFFFFF",
+                stroke_color="#000000",
+                stroke_width=1,
+            )
+        except Exception:
+            wm_clip = TextClip(
+                text=watermark_text,
+                font=font_path,
+                font_size=wm_font_size,
+                color="#FFFFFF",
+            )
+        margin = max(12, int(min(video_width, video_height) * 0.02))
+        wm_clip = wm_clip.with_opacity(0.72)
+
+        anchor_x = video_width - wm_clip.w - margin
+        upper_third_center_y = video_height / 6
+        base_y = upper_third_center_y - wm_clip.h / 2
+        min_y = margin
+        max_y = max(min_y, video_height / 3 - wm_clip.h - margin)
+        base_y = max(min_y, min(base_y, max_y))
+
+        float_amplitude = max(8, int(video_height * 0.018))
+        float_period = 3.5
+
+        def floating_position(t):
+            offset_y = float_amplitude * math.sin(2 * math.pi * t / float_period)
+            y = base_y + offset_y
+            y = max(min_y, min(y, max_y))
+            return (anchor_x, y)
+
+        wm_clip = wm_clip.with_position(floating_position)
+        wm_clip = wm_clip.with_start(0).with_end(video_clip.duration).with_duration(video_clip.duration)
+        return wm_clip
         
     # 创建TextClip工厂函数
     def make_textclip(text):
@@ -352,36 +437,37 @@ def merge_materials(
             color=subtitle_color,
         )
     
-    # 处理字幕 - 修复字幕开关bug和空字幕文件问题
+    # 处理字幕、旁白字幕与水印
+    overlay_clips = []
+
     if subtitle_enabled and subtitle_path:
         if is_valid_subtitle_file(subtitle_path):
             logger.info("字幕已启用，开始处理字幕文件")
-            try:
-                # 加载字幕文件
-                sub = SubtitlesClip(
-                    subtitles=subtitle_path,
-                    encoding="utf-8",
-                    make_textclip=make_textclip
-                )
-
-                # 创建每个字幕片段
-                text_clips = []
-                for item in sub.subtitles:
-                    clip = create_text_clip(subtitle_item=item)
-                    text_clips.append(clip)
-
-                # 合成视频和字幕
-                video_clip = CompositeVideoClip([video_clip, *text_clips])
-                logger.info(f"已添加{len(text_clips)}个字幕片段")
-            except Exception as e:
-                logger.error(f"处理字幕失败: \n{traceback.format_exc()}")
-                logger.warning("字幕处理失败，继续生成无字幕视频")
+            overlay_clips.extend(_load_subtitle_clips(subtitle_path, position_mode="default"))
+            if overlay_clips:
+                logger.info(f"已添加 {len(overlay_clips)} 个主字幕片段")
         else:
             logger.warning(f"字幕文件无效或为空: {subtitle_path}，跳过字幕处理")
     elif not subtitle_enabled:
         logger.info("字幕已禁用，跳过字幕处理")
     elif not subtitle_path:
         logger.info("未提供字幕文件路径，跳过字幕处理")
+
+    if picture_narration_enabled and picture_narration_path:
+        pic_clips = _load_subtitle_clips(picture_narration_path, position_mode="picture_narration")
+        if pic_clips:
+            overlay_clips.extend(pic_clips)
+            logger.info(f"已添加 {len(pic_clips)} 个原声旁白字幕片段")
+
+    watermark_clip = create_watermark_clip()
+    if watermark_clip:
+        overlay_clips.append(watermark_clip)
+        logger.info(f"已添加水印: {watermark_text}")
+
+    if overlay_clips:
+        video_clip = CompositeVideoClip([video_clip, *overlay_clips])
+    else:
+        logger.info("警告：没有叠加层被添加到视频中")
     
     # 导出最终视频
     try:

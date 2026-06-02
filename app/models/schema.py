@@ -198,6 +198,8 @@ class VideoClipParams(BaseModel):
     bgm_volume: Optional[float] = Field(default=AudioVolumeDefaults.BGM_VOLUME, description="背景音乐音量")
     draft_name: Optional[str] = Field(default="", description="剪映草稿名称")
     source_subtitle_path: Optional[str] = Field(default="", description="原视频字幕路径（用于原声段字幕切片）")
+    watermark_text: Optional[str] = Field(default=None, description="成片水印文字，空则使用 config 默认值")
+    enable_picture_narration: Optional[bool] = Field(default=None, description="原声段是否显示旁白描述字幕")
 
 
 

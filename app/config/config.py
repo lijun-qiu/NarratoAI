@@ -88,6 +88,7 @@ def save_config():
         _cfg["gemini_asr"] = gemini_asr
         _cfg["transcription"] = transcription
         _cfg["perfect_subtitle"] = perfect_subtitle
+        _cfg["video_output"] = video_output
         f.write(toml.dumps(_cfg))
 
 
@@ -106,6 +107,7 @@ indextts2 = _cfg.get("indextts2", {})
 doubaotts = _cfg.get("doubaotts", {})
 film_tv = _cfg.get("film_tv", {})
 perfect_subtitle = _cfg.get("perfect_subtitle", {})
+video_output = _cfg.get("video_output", {})
 whisper_asr = _cfg.get("whisper_asr", {})
 gemini_asr = _cfg.get("gemini_asr", {})
 transcription = _cfg.get("transcription", {})

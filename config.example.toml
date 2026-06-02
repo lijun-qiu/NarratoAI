@@ -3,7 +3,9 @@
 
     # LLM API 超时配置（秒）
     llm_vision_timeout = 120  # 视觉模型基础超时时间
-    llm_text_timeout = 180    # 文本模型基础超时时间（解说文案生成等复杂任务需要更长时间）
+    llm_text_timeout = 180    # 普通文本生成超时（秒）
+    llm_script_timeout = 600  # 解说脚本生成超时（秒，prompt 较长）
+    llm_timeout_retries = 2   # 超时后额外重试次数
     llm_max_retries = 3       # API 重试次数
 
     ##########################################
@@ -231,6 +233,15 @@ opening_chars_max = 120
     original_label = ""
     max_chars = 18
     max_duration = 4.0
+
+[video_output]
+    # 成片水印文字（留空则不添加水印；右上角 1/3 区域，上下浮动）
+    watermark_text = "@小超剪辑"
+    # 原声段（OST=1）是否在画面左侧上方显示旁白字幕（画面/动作/情绪描述，取自脚本 picture 字段）
+    enable_picture_narration = true
+    picture_narration_font_size = 32
+    picture_narration_color = "#FFE066"
+    picture_narration_max_chars = 16
 
 [transcription]
     enable_fallback = true

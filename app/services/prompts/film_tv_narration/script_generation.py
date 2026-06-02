@@ -147,6 +147,7 @@ OST=1 → OST=1 → OST=0 → OST=1 → OST=1 → OST=0   ✅ 连续原声播完
 - 每段包住**一句或多句连贯对话**，跨度 **${ost1_duration_min}–${ost1_duration_max} 秒**
 - 重要冲突可给到 **12–18 秒**（仍须来自字幕真实范围）
 - `narration` 固定：`播放原片+序号`
+- **`picture` 字段（重要）**：写画面/动作/角色神情与情绪的旁白描述（非对白复述），例如「胡队怒目圆睁，一字一句硬刚赵家势力」「反派冷笑威胁，气氛骤然紧张」；可结合前后情节做一句总结，供原声段左侧旁白字幕使用
 
 ### 解说段（OST=0）怎么写
 - 每段 **${narration_chars_min}–${narration_chars_max} 字**（上限 ${opening_chars_max} 字），**不要超过 ${narration_chars_max} 字为佳**

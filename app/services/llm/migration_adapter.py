@@ -402,7 +402,8 @@ class SubtitleAnalyzerAdapter:
                 temperature=temperature,
                 response_format="json",
                 api_key=self.api_key,
-                api_base=self.base_url
+                api_base=self.base_url,
+                for_script=True,
             )
             
             # 清理JSON输出

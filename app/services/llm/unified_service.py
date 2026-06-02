@@ -137,6 +137,7 @@ class UnifiedLLMService:
                 provider=provider,
                 temperature=temperature,
                 response_format="json",
+                for_script=True,
                 **kwargs
             )
             

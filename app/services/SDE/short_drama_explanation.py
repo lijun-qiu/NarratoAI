@@ -688,8 +688,9 @@ class SubtitleAnalyzer:
             # 构建请求地址
             url = f"{self.base_url}/chat/completions"
 
-            # 发送HTTP请求
-            response = requests.post(url, headers=self.headers, json=payload, timeout=120)
+            from app.services.llm.openai_compatible_provider import resolve_llm_timeout
+            script_timeout = int(resolve_llm_timeout(for_script=True))
+            response = requests.post(url, headers=self.headers, json=payload, timeout=script_timeout)
 
             # 解析响应
             if response.status_code == 200:

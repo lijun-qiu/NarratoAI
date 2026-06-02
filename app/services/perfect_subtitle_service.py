@@ -18,6 +18,10 @@ from loguru import logger
 
 from app.config import config
 from app.services.asr_subtitle_provider import transcribe_media_to_entries
+from app.services.video_output_settings import (
+    get_video_output_settings,
+    is_picture_narration_enabled,
+)
 from app.services.srt_utils import (
     SrtEntry,
     clip_entries_to_duration,
@@ -193,6 +197,70 @@ def _build_narration_entries(
         if label and not entry.label:
             entry.label = label
     return offset_entries(local_entries, _edited_offset_ms(segment))
+
+
+def _build_ost1_picture_narration_entries(
+    segment: dict[str, Any],
+    *,
+    video_output: dict[str, Any],
+) -> list[SrtEntry]:
+    """原声段旁白字幕：画面/动作/情绪描述，取自脚本 picture 字段。"""
+    picture = str(segment.get("picture") or "").strip()
+    if not picture:
+        return []
+
+    duration_ms = _segment_duration_ms(segment)
+    if duration_ms <= 0:
+        return []
+
+    max_chars = int(video_output.get("picture_narration_max_chars", 16))
+    local_entries = split_text_to_entries(
+        picture,
+        duration_ms,
+        max_chars=max_chars,
+        label="picture_narration",
+    )
+    return offset_entries(local_entries, _edited_offset_ms(segment))
+
+
+def build_picture_narration_subtitle_path(
+    script_list: list[dict[str, Any]],
+    *,
+    task_id: str,
+    video_output: Optional[dict[str, Any]] = None,
+) -> Optional[str]:
+    """为 OST=1 原声段生成左侧旁白描述字幕轨。"""
+    cfg = video_output or get_video_output_settings()
+    if not is_picture_narration_enabled(cfg):
+        return None
+
+    sorted_segments = sorted(
+        script_list,
+        key=lambda item: (
+            _edited_offset_ms(item),
+            int(item.get("_id", 0) or 0),
+        ),
+    )
+
+    picture_groups: list[list[SrtEntry]] = []
+    for segment in sorted_segments:
+        if int(segment.get("OST", 0) or 0) != 1:
+            continue
+        entries = _build_ost1_picture_narration_entries(segment, video_output=cfg)
+        if entries:
+            picture_groups.append(entries)
+
+    if not picture_groups:
+        return None
+
+    merged = resolve_overlaps(merge_and_sort_entries(picture_groups))
+    if not merged:
+        return None
+
+    task_dir = utils.task_dir(task_id)
+    output_path = write_srt_file(merged, os.path.join(task_dir, "picture_narration.srt"))
+    logger.info(f"原声段旁白字幕已生成: {output_path} ({len(merged)} 条)")
+    return output_path
 
 
 def build_perfect_subtitles(

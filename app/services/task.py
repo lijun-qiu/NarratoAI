@@ -12,7 +12,11 @@ from app.config.audio_config import AudioConfig, get_recommended_volumes_for_con
 from app.models import const
 from app.models.schema import VideoClipParams
 from app.services import (voice, audio_merger, subtitle_merger, clip_video, merger_video, update_script, generate_video)
-from app.services.perfect_subtitle_service import build_merged_subtitle_path
+from app.services.perfect_subtitle_service import (
+    build_merged_subtitle_path,
+    build_picture_narration_subtitle_path,
+)
+from app.services.video_output_settings import get_video_output_settings
 from app.services.update_script import is_valid_video_file
 from app.services import state as sm
 from app.utils import utils
@@ -63,6 +67,65 @@ def _persist_synced_script(
     return task_script_path
 
 
+def _build_merge_video_options(
+    params: VideoClipParams,
+    *,
+    list_script: list,
+    picture_narration_path: str = "",
+) -> dict:
+    """构建 merge_materials 的 options 字典。"""
+    optimized_volumes = get_recommended_volumes_for_content('mixed')
+    has_original_audio_segments = any(segment.get('OST') == 1 for segment in list_script)
+
+    final_tts_volume = (
+        params.tts_volume
+        if hasattr(params, 'tts_volume') and params.tts_volume != 1.0
+        else optimized_volumes['tts_volume']
+    )
+    if has_original_audio_segments:
+        final_original_volume = 1.0
+        logger.info("检测到原声片段，原声音量设置为1.0以保持与原视频一致")
+    else:
+        final_original_volume = (
+            params.original_volume
+            if hasattr(params, 'original_volume') and params.original_volume != 0.7
+            else optimized_volumes['original_volume']
+        )
+    final_bgm_volume = (
+        params.bgm_volume
+        if hasattr(params, 'bgm_volume') and params.bgm_volume != 0.3
+        else optimized_volumes['bgm_volume']
+    )
+
+    video_output = get_video_output_settings()
+    if hasattr(params, 'watermark_text') and params.watermark_text is not None:
+        video_output["watermark_text"] = params.watermark_text
+    if hasattr(params, 'enable_picture_narration') and params.enable_picture_narration is not None:
+        video_output["enable_picture_narration"] = params.enable_picture_narration
+
+    logger.info(f"音量配置 - TTS: {final_tts_volume}, 原声: {final_original_volume}, BGM: {final_bgm_volume}")
+
+    return {
+        'voice_volume': final_tts_volume,
+        'bgm_volume': final_bgm_volume,
+        'original_audio_volume': final_original_volume,
+        'keep_original_audio': True,
+        'subtitle_enabled': params.subtitle_enabled,
+        'subtitle_font': params.font_name,
+        'subtitle_font_size': params.font_size,
+        'subtitle_color': params.text_fore_color,
+        'subtitle_bg_color': None,
+        'subtitle_position': params.subtitle_position,
+        'custom_position': params.custom_position,
+        'threads': params.n_threads,
+        'watermark_text': video_output.get('watermark_text', ''),
+        'enable_picture_narration': bool(video_output.get('enable_picture_narration', True)),
+        'picture_narration_path': picture_narration_path,
+        'picture_narration_font_size': int(video_output.get('picture_narration_font_size', 32)),
+        'picture_narration_color': video_output.get('picture_narration_color', '#FFE066'),
+    }
+
+
 def _merge_task_subtitles(
     task_id: str,
     new_script_list: list,
@@ -89,6 +152,17 @@ def _merge_task_subtitles(
 
     logger.warning("没有有效的字幕内容，将生成无字幕视频")
     return ""
+
+
+def _build_picture_narration_path(task_id: str, new_script_list: list) -> str:
+    try:
+        path = build_picture_narration_subtitle_path(new_script_list, task_id=task_id)
+        if path:
+            logger.info(f"原声旁白字幕生成成功 -> {path}")
+        return path or ""
+    except Exception as exc:
+        logger.warning(f"原声旁白字幕生成失败: {exc}")
+        return ""
 
 
 def start_subclip(task_id: str, params: VideoClipParams, subclip_path_videos: dict = None):
@@ -217,6 +291,7 @@ def start_subclip(task_id: str, params: VideoClipParams, subclip_path_videos: di
     total_duration = sum([script["duration"] for script in new_script_list])
     merged_audio_path = ""
     merged_subtitle_path = ""
+    picture_narration_path = ""
     try:
         if tts_segments:
             merged_audio_path = audio_merger.merge_audio_files(
@@ -227,12 +302,14 @@ def start_subclip(task_id: str, params: VideoClipParams, subclip_path_videos: di
             logger.info(f"音频文件合并成功->{merged_audio_path}")
 
         merged_subtitle_path = _merge_task_subtitles(task_id, new_script_list, params)
+        picture_narration_path = _build_picture_narration_path(task_id, new_script_list)
     except Exception as e:
         logger.error(f"合并音频/字幕文件失败: {str(e)}")
         if not merged_audio_path:
             merged_audio_path = ""
         if not merged_subtitle_path:
             merged_subtitle_path = ""
+        picture_narration_path = ""
 
     """
     5. 合并视频
@@ -282,42 +359,11 @@ def start_subclip(task_id: str, params: VideoClipParams, subclip_path_videos: di
     # bgm_path = '/Users/apple/Desktop/home/NarratoAI/resource/songs/bgm.mp3'
     bgm_path = utils.get_bgm_file()
 
-    # 获取优化的音量配置
-    optimized_volumes = get_recommended_volumes_for_content('mixed')
-
-    # 检查是否有OST=1的原声片段，如果有，则保持原声音量为1.0不变
-    has_original_audio_segments = any(segment['OST'] == 1 for segment in list_script)
-
-    # 应用用户设置和优化建议的组合
-    # 如果用户设置了非默认值，优先使用用户设置
-    final_tts_volume = params.tts_volume if hasattr(params, 'tts_volume') and params.tts_volume != 1.0 else optimized_volumes['tts_volume']
-
-    # 关键修复：如果有原声片段，保持原声音量为1.0，确保与原视频音量一致
-    if has_original_audio_segments:
-        final_original_volume = 1.0  # 保持原声音量不变
-        logger.info("检测到原声片段，原声音量设置为1.0以保持与原视频一致")
-    else:
-        final_original_volume = params.original_volume if hasattr(params, 'original_volume') and params.original_volume != 0.7 else optimized_volumes['original_volume']
-
-    final_bgm_volume = params.bgm_volume if hasattr(params, 'bgm_volume') and params.bgm_volume != 0.3 else optimized_volumes['bgm_volume']
-
-    logger.info(f"音量配置 - TTS: {final_tts_volume}, 原声: {final_original_volume}, BGM: {final_bgm_volume}")
-
-    # 调用示例
-    options = {
-        'voice_volume': final_tts_volume,  # 配音音量（优化后）
-        'bgm_volume': final_bgm_volume,  # 背景音乐音量（优化后）
-        'original_audio_volume': final_original_volume,  # 视频原声音量（优化后）
-        'keep_original_audio': True,  # 是否保留原声
-        'subtitle_enabled': params.subtitle_enabled,  # 是否启用字幕 - 修复字幕开关bug
-        'subtitle_font': params.font_name,  # 这里使用相对字体路径，会自动在 font_dir() 目录下查找
-        'subtitle_font_size': params.font_size,
-        'subtitle_color': params.text_fore_color,
-        'subtitle_bg_color': None,  # 直接使用None表示透明背景
-        'subtitle_position': params.subtitle_position,
-        'custom_position': params.custom_position,
-        'threads': params.n_threads
-    }
+    options = _build_merge_video_options(
+        params,
+        list_script=list_script,
+        picture_narration_path=picture_narration_path,
+    )
     generate_video.merge_materials(
         video_path=combined_video_path,
         audio_path=merged_audio_path,
@@ -444,6 +490,7 @@ def start_subclip_unified(task_id: str, params: VideoClipParams):
     total_duration = sum([script["duration"] for script in new_script_list])
     merged_audio_path = ""
     merged_subtitle_path = ""
+    picture_narration_path = ""
     try:
         if tts_segments:
             merged_audio_path = audio_merger.merge_audio_files(
@@ -454,12 +501,14 @@ def start_subclip_unified(task_id: str, params: VideoClipParams):
             logger.info(f"音频文件合并成功->{merged_audio_path}")
 
         merged_subtitle_path = _merge_task_subtitles(task_id, new_script_list, params)
+        picture_narration_path = _build_picture_narration_path(task_id, new_script_list)
     except Exception as e:
         logger.error(f"合并音频/字幕文件失败: {str(e)}")
         if not merged_audio_path:
             merged_audio_path = ""
         if not merged_subtitle_path:
             merged_subtitle_path = ""
+        picture_narration_path = ""
 
     """
     5. 合并视频
@@ -498,41 +547,11 @@ def start_subclip_unified(task_id: str, params: VideoClipParams):
 
     bgm_path = utils.get_bgm_file()
 
-    # 获取优化的音量配置
-    optimized_volumes = get_recommended_volumes_for_content('mixed')
-
-    # 检查是否有OST=1的原声片段，如果有，则保持原声音量为1.0不变
-    has_original_audio_segments = any(segment['OST'] == 1 for segment in list_script)
-
-    # 应用用户设置和优化建议的组合
-    final_tts_volume = params.tts_volume if hasattr(params, 'tts_volume') and params.tts_volume != 1.0 else optimized_volumes['tts_volume']
-
-    # 关键修复：如果有原声片段，保持原声音量为1.0，确保与原视频音量一致
-    if has_original_audio_segments:
-        final_original_volume = 1.0  # 保持原声音量不变
-        logger.info("检测到原声片段，原声音量设置为1.0以保持与原视频一致")
-    else:
-        final_original_volume = params.original_volume if hasattr(params, 'original_volume') and params.original_volume != 0.7 else optimized_volumes['original_volume']
-
-    final_bgm_volume = params.bgm_volume if hasattr(params, 'bgm_volume') and params.bgm_volume != 0.3 else optimized_volumes['bgm_volume']
-
-    logger.info(f"音量配置 - TTS: {final_tts_volume}, 原声: {final_original_volume}, BGM: {final_bgm_volume}")
-
-    # 调用示例
-    options = {
-        'voice_volume': final_tts_volume,
-        'bgm_volume': final_bgm_volume,
-        'original_audio_volume': final_original_volume,
-        'keep_original_audio': True,
-        'subtitle_enabled': params.subtitle_enabled,
-        'subtitle_font': params.font_name,
-        'subtitle_font_size': params.font_size,
-        'subtitle_color': params.text_fore_color,
-        'subtitle_bg_color': None,
-        'subtitle_position': params.subtitle_position,
-        'custom_position': params.custom_position,
-        'threads': params.n_threads
-    }
+    options = _build_merge_video_options(
+        params,
+        list_script=list_script,
+        picture_narration_path=picture_narration_path,
+    )
     generate_video.merge_materials(
         video_path=combined_video_path,
         audio_path=merged_audio_path,

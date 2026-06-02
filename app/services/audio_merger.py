@@ -11,13 +11,16 @@ from app.services.update_script import probe_media_duration
 
 
 def _segment_playback_duration(segment: dict) -> float:
-    """成片时间轴占位时长 = 裁剪视频实测时长（与 merger.mp4 / 字幕偏移一致）。"""
+    """成片时间轴占位时长：优先用 merger 校正后的 duration，与 merger.mp4 对齐。"""
+    synced = float(segment.get("duration") or 0)
+    if synced > 0:
+        return synced
     video_path = segment.get("video") or ""
     if video_path and os.path.exists(video_path):
         video_len = probe_media_duration(video_path)
         if video_len > 0:
             return video_len
-    return float(segment.get("duration") or 0)
+    return 0.0
 
 
 def check_ffmpeg():
@@ -46,16 +49,26 @@ def merge_audio_files(task_id: str, total_duration: float, list_script: list):
         logger.error("FFmpeg未安装，无法合并音频文件")
         return None
 
-    # 创建一个空的音频片段
-    final_audio = AudioSegment.silent(duration=total_duration * 1000)  # 总时长以毫秒为单位
+    segment_durations = [_segment_playback_duration(seg) for seg in list_script]
+    timeline_duration = sum(segment_durations)
+    if total_duration and abs(timeline_duration - total_duration) >= 0.05:
+        logger.info(
+            f"TTS 音轨总时长校正: 脚本合计 {total_duration:.3f}s -> 时间轴 {timeline_duration:.3f}s"
+        )
+    total_duration = max(float(total_duration or 0), timeline_duration)
+    if total_duration <= 0:
+        logger.error("无法确定合并音频总时长")
+        return None
 
-    # 计算每个片段的开始位置（基于duration字段）
-    current_position = 0  # 初始位置（秒）
+    # 创建一个空的音频片段
+    final_audio = AudioSegment.silent(duration=int(round(total_duration * 1000)))
+
+    # 计算每个片段的开始位置
+    current_position = 0.0
     
     # 遍历脚本中的每个片段
-    for segment in list_script:
+    for segment, duration in zip(list_script, segment_durations):
         try:
-            duration = _segment_playback_duration(segment)
             ost = segment.get('OST', 0)
 
             if ost == 1:
@@ -82,8 +95,10 @@ def merge_audio_files(task_id: str, total_duration: float, list_script: list):
 
     # 保存合并后的音频文件
     output_audio_path = os.path.join(utils.task_dir(task_id), "merger_audio.mp3")
-    final_audio.export(output_audio_path, format="mp3")
-    logger.info(f"合并后的音频文件已保存: {output_audio_path}")
+    final_audio.export(output_audio_path, format="mp3", bitrate="192k")
+    logger.info(
+        f"合并后的音频文件已保存: {output_audio_path} (时长 {total_duration:.3f}s)"
+    )
 
     return output_audio_path
 

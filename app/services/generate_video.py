@@ -12,6 +12,7 @@ import os
 import math
 import traceback
 import tempfile
+import subprocess
 from typing import Optional, Dict, Any
 from loguru import logger
 from moviepy import (
@@ -28,6 +29,8 @@ from PIL import ImageFont
 from app.utils import utils
 from app.models.schema import AudioVolumeDefaults, VideoAspect
 from app.services.audio_normalizer import AudioNormalizer, normalize_audio_for_mixing
+from app.services.update_script import probe_media_duration
+from app.services.srt_utils import strip_subtitle_punctuation
 
 
 def _is_landscape_video(video_width: float, video_height: float, video_aspect: Any = None) -> bool:
@@ -187,7 +190,9 @@ def _create_timed_subtitle_clip(
     position_mode: str = "default",
     is_landscape: bool = False,
 ):
-    phrase = subtitle_item[1]
+    phrase = strip_subtitle_punctuation(subtitle_item[1])
+    if not phrase:
+        return None
     font_size = style["subtitle_font_size"]
     color = style["subtitle_color"]
     max_width_ratio = 0.9
@@ -277,17 +282,17 @@ def load_subtitle_overlay_clips(
         )
         clips = []
         for item in sub.subtitles:
-            clips.append(
-                _create_timed_subtitle_clip(
-                    item,
-                    video_width=video_width,
-                    video_height=video_height,
-                    font_path=font_path,
-                    style=style,
-                    position_mode=position_mode,
-                    is_landscape=is_landscape,
-                )
+            clip = _create_timed_subtitle_clip(
+                item,
+                video_width=video_width,
+                video_height=video_height,
+                font_path=font_path,
+                style=style,
+                position_mode=position_mode,
+                is_landscape=is_landscape,
             )
+            if clip is not None:
+                clips.append(clip)
         return clips
     except Exception as e:
         logger.error(f"处理字幕失败 ({subtitle_path}): \n{traceback.format_exc()}")
@@ -506,6 +511,16 @@ def merge_materials(
     # 合成最终的音频轨道
     if audio_tracks:
         final_audio = CompositeAudioClip(audio_tracks)
+        video_duration = float(video_clip.duration or 0)
+        audio_duration = float(final_audio.duration or 0)
+        if video_duration > 0 and abs(audio_duration - video_duration) >= 0.05:
+            logger.info(
+                f"音轨与视频时长对齐: 视频 {video_duration:.3f}s, 音轨 {audio_duration:.3f}s"
+            )
+            if audio_duration > video_duration:
+                final_audio = final_audio.subclipped(0, video_duration)
+            else:
+                final_audio = final_audio.with_duration(video_duration)
         video_clip = video_clip.with_audio(final_audio)
         logger.info(f"已合成所有音频轨道，共{len(audio_tracks)}个")
     else:
@@ -696,19 +711,56 @@ def burn_subtitles_on_video(
     else:
         final_video = video_clip
 
+    source_duration = float(probe_media_duration(video_path) or video_clip.duration or 0)
+    video_only_path = write_path + ".novocal.mp4" if write_path.endswith(".mp4") else write_path + "_novocal.mp4"
+
     try:
         final_video.write_videofile(
-            write_path,
-            audio_codec="aac",
+            video_only_path,
+            audio=False,
             temp_audiofile_path=output_dir,
             threads=threads,
             fps=fps,
         )
-        logger.success(f"主字幕烧录完成: {output_path}")
+        mux_cmd = [
+            "ffmpeg",
+            "-y",
+            "-i",
+            video_only_path,
+            "-i",
+            video_path,
+            "-map",
+            "0:v:0",
+            "-map",
+            "1:a:0?",
+            "-c:v",
+            "copy",
+            "-c:a",
+            "copy",
+            "-shortest",
+        ]
+        if source_duration > 0:
+            mux_cmd.extend(["-t", f"{source_duration:.3f}"])
+        mux_cmd.append(write_path)
+        result = subprocess.run(
+            mux_cmd,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+        )
+        if result.returncode != 0:
+            raise RuntimeError(result.stderr[-800:] or "ffmpeg 合并音轨失败")
+        logger.success(f"主字幕烧录完成（音轨原样复制）: {output_path}")
     finally:
         if final_video is not video_clip:
             final_video.close()
         video_clip.close()
+        if os.path.isfile(video_only_path):
+            try:
+                os.remove(video_only_path)
+            except OSError:
+                pass
 
     if write_path != output_path:
         os.replace(write_path, output_path)

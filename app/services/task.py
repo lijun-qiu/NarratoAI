@@ -13,6 +13,7 @@ from app.config.audio_config import AudioConfig, get_recommended_volumes_for_con
 from app.models import const
 from app.models.schema import VideoClipParams
 from app.services import (voice, audio_merger, subtitle_merger, clip_video, merger_video, update_script, generate_video)
+from app.services.update_script import probe_media_duration
 from app.services.perfect_subtitle_service import (
     build_merged_subtitle_path,
     build_picture_narration_subtitle_path,
@@ -249,7 +250,14 @@ def _merge_audio_and_subtitles(
 ) -> tuple[str, str, str]:
     """在成片时间轴校正后合并 TTS 音轨与字幕。"""
     logger.info("\n\n## 合并音频和字幕")
-    total_duration = sum(script["duration"] for script in new_script_list)
+    merger_video_path = path.join(utils.task_dir(task_id), "merger.mp4")
+    probed_merger = probe_media_duration(merger_video_path) if os.path.isfile(merger_video_path) else 0.0
+    script_total = sum(float(script.get("duration") or 0) for script in new_script_list)
+    total_duration = probed_merger or script_total
+    if probed_merger > 0 and abs(probed_merger - script_total) >= 0.05:
+        logger.info(
+            f"配音轨对齐 merger.mp4: 脚本 {script_total:.3f}s, 实测 {probed_merger:.3f}s"
+        )
     merged_audio_path = ""
     merged_subtitle_path = ""
     picture_narration_path = ""

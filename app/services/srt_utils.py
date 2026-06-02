@@ -10,6 +10,7 @@ import re
 from dataclasses import dataclass
 from typing import Iterable, Optional
 
+from app.models import const
 from app.utils import utils
 
 _TIME_LINE_RE = re.compile(
@@ -32,6 +33,16 @@ def clean_subtitle_dialogue_text(text: str) -> str:
     for pattern in _SPEAKER_PREFIX_PATTERNS:
         cleaned = pattern.sub("", cleaned, count=1).strip()
     return cleaned
+
+
+def strip_subtitle_punctuation(text: str) -> str:
+    """Remove punctuation marks for on-screen subtitle display."""
+    cleaned = (text or "").strip()
+    if not cleaned:
+        return ""
+    for punct in sorted(const.PUNCTUATIONS, key=len, reverse=True):
+        cleaned = cleaned.replace(punct, "")
+    return re.sub(r"\s+", " ", cleaned).strip()
 
 
 @dataclass

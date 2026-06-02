@@ -225,7 +225,7 @@ def enforce_narration_after_ost1(items: List[Dict[str, Any]]) -> List[Dict[str, 
     """
     确保 OST=0 解说不打断 OST=1 原声：将夹在两个原声段之间的解说移到后续原声段播完之后。
     """
-    result = [dict(item) for item in sorted(items, key=lambda x: x.get("_id", 0))]
+    result = [dict(item) for item in sorted(items, key=_timestamp_sort_key)]
     moved_count = 0
 
     changed = True
@@ -374,17 +374,54 @@ def _picture_hint_from_subtitle(
     return text or "剧情过渡"
 
 
-def _renumber_items_by_time(items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    def sort_key(item: Dict[str, Any]) -> Tuple[float, int]:
-        try:
-            start, _ = parse_timestamp_range(item["timestamp"])
-            return start, int(item.get("_id", 0) or 0)
-        except (ValueError, AttributeError, KeyError):
-            return 0.0, int(item.get("_id", 0) or 0)
+def _timestamp_sort_key(item: Dict[str, Any]) -> Tuple[float, int]:
+    try:
+        start, _ = parse_timestamp_range(item["timestamp"])
+        return start, int(item.get("_id", 0) or 0)
+    except (ValueError, AttributeError, KeyError):
+        return 0.0, int(item.get("_id", 0) or 0)
 
-    ordered = sorted(items, key=sort_key)
+
+def _renumber_items_by_time(items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    ordered = sorted(items, key=_timestamp_sort_key)
     for idx, item in enumerate(ordered, 1):
         item["_id"] = idx
+    return ordered
+
+
+def is_ost_grouped_by_type(items: List[Dict[str, Any]]) -> bool:
+    """检测脚本是否按 OST 类型分组（先全部原声再全部解说，或反之）。"""
+    if len(items) < 2:
+        return False
+    has0 = has1 = False
+    seen_ost0 = False
+    for item in items:
+        ost = item.get("OST")
+        if ost == 0:
+            has0 = True
+            seen_ost0 = True
+        elif ost == 1:
+            has1 = True
+            if seen_ost0:
+                return False
+    if not (has0 and has1):
+        return False
+    first_ost = items[0].get("OST")
+    last_ost = items[-1].get("OST")
+    return first_ost != last_ost
+
+
+def finalize_film_tv_playback_order(
+    items: List[Dict[str, Any]],
+    settings: Optional[Dict[str, Any]] = None,
+) -> List[Dict[str, Any]]:
+    """按原片时间轴重排 _id 播放顺序，使 OST=0 与 OST=1 穿插排列。"""
+    if not items:
+        return items
+    settings = get_film_tv_settings(settings)
+    ordered = _renumber_items_by_time([dict(item) for item in items])
+    if settings.get("enforce_narration_after_ost1", True):
+        ordered = enforce_narration_after_ost1(ordered)
     return ordered
 
 
@@ -634,8 +671,7 @@ def optimize_film_tv_script(
         )
 
     optimized = normalize_ost_types(optimized)
-    if settings.get("enforce_narration_after_ost1", True):
-        optimized = enforce_narration_after_ost1(optimized)
+    optimized = finalize_film_tv_playback_order(optimized, settings)
 
     validation = validate_film_tv_script_counts(optimized, settings)
     if not validation["ok"]:

@@ -15,9 +15,10 @@ from loguru import logger
 VIDEO_OUTPUT_DEFAULTS: Dict[str, Any] = {
     "watermark_text": "@小超剪辑",
     "enable_picture_narration": True,
-    "picture_narration_font_size": 32,
+    "picture_narration_font_size": 44,
     "picture_narration_color": "#FFE066",
     "picture_narration_max_chars": 16,
+    "picture_narration_duration": 2.0,
 }
 
 

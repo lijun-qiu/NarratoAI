@@ -239,34 +239,85 @@ def clip_entries_to_duration(entries: list[SrtEntry], max_duration_ms: int) -> l
     return clipped
 
 
-def fit_entries_to_video_timeline(entries: list[SrtEntry], video_duration_ms: int) -> list[SrtEntry]:
-    """将片段内字幕时间轴对齐到裁剪后视频的真实时长。"""
-    if not entries or video_duration_ms <= 0:
+def extend_entries_to_speech_end(
+    entries: list[SrtEntry],
+    speech_duration_ms: int,
+    *,
+    inter_gap_ms: int = 50,
+) -> list[SrtEntry]:
+    """将每条字幕延续到下一条开始或语音结束，避免话未说完字幕先消失。"""
+    if not entries or speech_duration_ms <= 0:
         return entries
 
-    entries = clip_entries_to_duration(entries, video_duration_ms)
-    if not entries:
+    sorted_entries = sorted(entries, key=lambda e: (e.start_ms, e.end_ms))
+    extended: list[SrtEntry] = []
+    for i, entry in enumerate(sorted_entries):
+        start_ms = max(0, entry.start_ms)
+        if i + 1 < len(sorted_entries):
+            next_start = sorted_entries[i + 1].start_ms
+            end_ms = max(entry.end_ms, next_start - inter_gap_ms)
+        else:
+            end_ms = max(entry.end_ms, speech_duration_ms)
+
+        end_ms = min(end_ms, speech_duration_ms)
+        if end_ms <= start_ms:
+            continue
+        extended.append(
+            SrtEntry(start_ms=start_ms, end_ms=end_ms, text=entry.text, label=entry.label)
+        )
+    return extended
+
+
+def align_entries_to_speech_duration(
+    entries: list[SrtEntry],
+    speech_duration_ms: int,
+    video_duration_ms: int = 0,
+) -> list[SrtEntry]:
+    """对齐字幕与语音时长。
+
+    - 字幕偏短：整体拉伸放慢（解决出现太快、过早消失）
+    - 字幕偏长：截断到边界，绝不压缩时间轴（压缩会导致字幕抢跑）
+    """
+    if not entries or speech_duration_ms <= 0:
         return entries
+
+    cap_ms = speech_duration_ms
+    if video_duration_ms > 0:
+        cap_ms = min(speech_duration_ms, video_duration_ms)
 
     max_end = max(entry.end_ms for entry in entries)
     if max_end <= 0:
         return entries
 
-    if abs(max_end - video_duration_ms) <= 80:
-        return entries
+    # 字幕总时长 < 语音：等比拉伸，让出现/切换与语速同步
+    if max_end < cap_ms - 80:
+        ratio = cap_ms / max_end
+        stretched: list[SrtEntry] = []
+        for entry in entries:
+            start_ms = int(round(entry.start_ms * ratio))
+            end_ms = min(int(round(entry.end_ms * ratio)), cap_ms)
+            if end_ms <= start_ms:
+                continue
+            stretched.append(
+                SrtEntry(start_ms=start_ms, end_ms=end_ms, text=entry.text, label=entry.label)
+            )
+        return extend_entries_to_speech_end(stretched, cap_ms)
 
-    ratio = video_duration_ms / max_end
-    fitted: list[SrtEntry] = []
-    for entry in entries:
-        start_ms = int(round(entry.start_ms * ratio))
-        end_ms = int(round(entry.end_ms * ratio))
-        end_ms = min(max(end_ms, start_ms + 80), video_duration_ms)
-        if end_ms <= start_ms:
-            continue
-        fitted.append(
-            SrtEntry(start_ms=start_ms, end_ms=end_ms, text=entry.text, label=entry.label)
-        )
-    return fitted
+    # 字幕总时长 > 边界：截断，不压缩（压缩会让字幕跑得比说话快）
+    if max_end > cap_ms + 80:
+        clipped = clip_entries_to_duration(entries, cap_ms)
+        return extend_entries_to_speech_end(clipped, cap_ms)
+
+    return extend_entries_to_speech_end(entries, cap_ms)
+
+
+def fit_entries_to_video_timeline(entries: list[SrtEntry], video_duration_ms: int) -> list[SrtEntry]:
+    """将片段内字幕时间轴对齐到裁剪后视频的真实时长。"""
+    return align_entries_to_speech_duration(
+        entries,
+        speech_duration_ms=video_duration_ms,
+        video_duration_ms=video_duration_ms,
+    )
 
 
 def merge_and_sort_entries(groups: Iterable[Iterable[SrtEntry]]) -> list[SrtEntry]:

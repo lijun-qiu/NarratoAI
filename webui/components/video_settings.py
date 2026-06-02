@@ -67,7 +67,7 @@ def render_video_output_settings(tr):
     base = saved if isinstance(saved, dict) else defaults
 
     with st.expander("成片输出（水印 / 原声旁白）", expanded=False):
-        st.caption("水印烧录在成片右上角 1/3 区域并上下浮动；原声旁白字幕显示在画面左侧偏上区域，内容来自脚本 picture 字段。")
+        st.caption("16:9 与 9:16 下，旁白字幕固定居中靠左；水印固定居中靠右，并带较大幅度上下浮动。")
 
         watermark_text = st.text_input(
             "水印文字",
@@ -78,7 +78,7 @@ def render_video_output_settings(tr):
         enable_picture_narration = st.checkbox(
             "原声段显示旁白描述字幕",
             value=bool(base.get("enable_picture_narration", True)),
-            help="开启后，OST=1 原声段在画面左侧上方显示画面/动作/情绪描述（picture 字段）",
+            help="开启后，OST=1 原声段在画面居中靠左显示 picture 描述字幕",
             key="vo_enable_picture_narration",
         )
 
@@ -86,9 +86,9 @@ def render_video_output_settings(tr):
         with c1:
             picture_narration_font_size = st.slider(
                 "旁白字幕字号",
-                min_value=20,
-                max_value=60,
-                value=int(base.get("picture_narration_font_size", 32)),
+                min_value=24,
+                max_value=72,
+                value=int(base.get("picture_narration_font_size", 44)),
                 key="vo_picture_narration_font_size",
             )
         with c2:
@@ -98,12 +98,23 @@ def render_video_output_settings(tr):
                 key="vo_picture_narration_color",
             )
 
+        picture_narration_duration = st.slider(
+            "旁白字幕停留时长（秒）",
+            min_value=1.0,
+            max_value=15.0,
+            value=float(base.get("picture_narration_duration", 2.0)),
+            step=0.5,
+            help="每段 OST=1 原声开始时显示 picture 描述字幕的时长；原声段更长时字幕不会全程显示",
+            key="vo_picture_narration_duration",
+        )
+
         settings = {
             "watermark_text": watermark_text.strip(),
             "enable_picture_narration": enable_picture_narration,
             "picture_narration_font_size": picture_narration_font_size,
             "picture_narration_color": picture_narration_color,
             "picture_narration_max_chars": int(base.get("picture_narration_max_chars", 16)),
+            "picture_narration_duration": picture_narration_duration,
         }
         st.session_state["video_output_settings"] = settings
         config.video_output = settings

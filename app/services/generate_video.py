@@ -26,8 +26,51 @@ from moviepy.video.tools.subtitles import SubtitlesClip
 from PIL import ImageFont
 
 from app.utils import utils
-from app.models.schema import AudioVolumeDefaults
+from app.models.schema import AudioVolumeDefaults, VideoAspect
 from app.services.audio_normalizer import AudioNormalizer, normalize_audio_for_mixing
+
+
+def _is_landscape_video(video_width: float, video_height: float, video_aspect: Any = None) -> bool:
+    """根据用户选择的画幅比例判断横屏/竖屏布局。"""
+    aspect_value = video_aspect.value if hasattr(video_aspect, "value") else video_aspect
+    aspect_text = str(aspect_value or "").strip().lower()
+    if aspect_text in {VideoAspect.landscape.value, VideoAspect.landscape_2.value, "16:9", "4:3"}:
+        return True
+    if aspect_text in {VideoAspect.portrait.value, VideoAspect.portrait_2.value, "9:16", "3:4"}:
+        return False
+    if video_width > 0 and video_height > 0:
+        return video_width / video_height >= 1.55
+    return False
+
+
+def _fixed_center_right_position(
+    clip_w: float,
+    clip_h: float,
+    canvas_w: float,
+    canvas_h: float,
+) -> tuple[float, float]:
+    """垂直居中、水平靠右半区中部（16:9 / 9:16 通用）。"""
+    margin = max(12, int(min(canvas_w, canvas_h) * 0.02))
+    pos_y = (canvas_h - clip_h) / 2
+    right_zone_center_x = canvas_w * 0.75
+    pos_x = right_zone_center_x - clip_w / 2
+    pos_x = max(canvas_w * 0.5 + margin, min(pos_x, canvas_w - clip_w - margin))
+    return pos_x, pos_y
+
+
+def _fixed_center_left_position(
+    clip_w: float,
+    clip_h: float,
+    canvas_w: float,
+    canvas_h: float,
+) -> tuple[float, float]:
+    """垂直居中、水平靠左半区中部（16:9 / 9:16 通用）。"""
+    margin = max(12, int(min(canvas_w, canvas_h) * 0.02))
+    pos_y = (canvas_h - clip_h) / 2
+    left_zone_center_x = canvas_w * 0.25
+    pos_x = left_zone_center_x - clip_w / 2
+    pos_x = max(margin, min(pos_x, canvas_w * 0.5 - clip_w - margin))
+    return pos_x, pos_y
 
 
 def is_valid_subtitle_file(subtitle_path: str) -> bool:
@@ -125,8 +168,9 @@ def merge_materials(
     watermark_text = str(options.get('watermark_text') or '').strip()
     picture_narration_path = options.get('picture_narration_path')
     picture_narration_enabled = options.get('enable_picture_narration', False)
-    picture_narration_font_size = options.get('picture_narration_font_size', 32)
+    picture_narration_font_size = options.get('picture_narration_font_size', 44)
     picture_narration_color = options.get('picture_narration_color', '#FFE066')
+    video_aspect = options.get('video_aspect')
 
     # 配置日志 - 便于调试问题
     logger.info(f"音量配置详情:")
@@ -140,6 +184,8 @@ def merge_materials(
     logger.info(f"成片输出配置:")
     logger.info(f"  - 水印: {watermark_text or '未启用'}")
     logger.info(f"  - 原声旁白字幕: {picture_narration_enabled}")
+    if picture_narration_enabled:
+        logger.info(f"  - 旁白字幕路径: {picture_narration_path or '未生成'}")
 
     # 音量参数验证
     def validate_volume(volume, name):
@@ -288,6 +334,11 @@ def merge_materials(
     
     # 处理视频尺寸
     video_width, video_height = video_clip.size
+    is_landscape = _is_landscape_video(video_width, video_height, video_aspect)
+    if is_landscape:
+        logger.info("画幅 16:9：旁白字幕居中靠左，水印居中靠右（上下浮动）")
+    else:
+        logger.info("画幅 9:16：旁白字幕居中靠左，水印居中靠右（上下浮动）")
     
     # 字幕处理函数
     def create_text_clip(subtitle_item, *, position_mode: str = "default"):
@@ -298,10 +349,14 @@ def merge_materials(
         max_width_ratio = 0.9
         pos_mode = position_mode
 
+        clip_stroke_color = stroke_color
+        clip_stroke_width = stroke_width
         if pos_mode == "picture_narration":
             font_size = picture_narration_font_size
             color = picture_narration_color
-            max_width_ratio = 0.42
+            max_width_ratio = 0.42 if is_landscape else 0.45
+            clip_stroke_color = "#000000"
+            clip_stroke_width = max(2, stroke_width)
 
         max_width = video_width * max_width_ratio
         
@@ -324,8 +379,8 @@ def merge_materials(
                 font_size=font_size,
                 color=color,
                 bg_color=subtitle_bg_color,  # 这里已经在前面处理过，None表示透明
-                stroke_color=stroke_color,
-                stroke_width=stroke_width,
+                stroke_color=clip_stroke_color,
+                stroke_width=clip_stroke_width,
             )
         except Exception as e:
             logger.error(f"创建字幕片段失败: {str(e)}, 使用简化参数重试")
@@ -345,11 +400,10 @@ def merge_materials(
         
         # 设置字幕位置
         if pos_mode == "picture_narration":
-            margin_x = max(12, int(video_width * 0.03))
-            margin_y = max(12, int(video_height * 0.08))
-            upper_limit = int(video_height * 0.66) - _clip.h
-            pos_y = min(margin_y, max(margin_y, upper_limit))
-            _clip = _clip.with_position((margin_x, pos_y))
+            pic_x, pic_y = _fixed_center_left_position(
+                _clip.w, _clip.h, video_width, video_height
+            )
+            _clip = _clip.with_position((pic_x, pic_y))
         elif subtitle_position == "bottom":
             _clip = _clip.with_position(("center", video_height * 0.95 - _clip.h))
         elif subtitle_position == "top":
@@ -405,24 +459,21 @@ def merge_materials(
                 font_size=wm_font_size,
                 color="#FFFFFF",
             )
-        margin = max(12, int(min(video_width, video_height) * 0.02))
         wm_clip = wm_clip.with_opacity(0.72)
-
-        anchor_x = video_width - wm_clip.w - margin
-        upper_third_center_y = video_height / 6
-        base_y = upper_third_center_y - wm_clip.h / 2
-        min_y = margin
-        max_y = max(min_y, video_height / 3 - wm_clip.h - margin)
-        base_y = max(min_y, min(base_y, max_y))
-
-        float_amplitude = max(8, int(video_height * 0.018))
-        float_period = 3.5
+        wm_x, base_y = _fixed_center_right_position(
+            wm_clip.w, wm_clip.h, video_width, video_height
+        )
+        margin = max(12, int(min(video_width, video_height) * 0.02))
+        float_amplitude = max(36, int(video_height * 0.16))
+        min_y = max(margin, base_y - float_amplitude)
+        max_y = min(video_height - wm_clip.h - margin, base_y + float_amplitude)
+        float_period = 4.0
 
         def floating_position(t):
             offset_y = float_amplitude * math.sin(2 * math.pi * t / float_period)
             y = base_y + offset_y
             y = max(min_y, min(y, max_y))
-            return (anchor_x, y)
+            return (wm_x, y)
 
         wm_clip = wm_clip.with_position(floating_position)
         wm_clip = wm_clip.with_start(0).with_end(video_clip.duration).with_duration(video_clip.duration)
@@ -453,16 +504,16 @@ def merge_materials(
     elif not subtitle_path:
         logger.info("未提供字幕文件路径，跳过字幕处理")
 
+    watermark_clip = create_watermark_clip()
+    if watermark_clip:
+        overlay_clips.append(watermark_clip)
+        logger.info(f"已添加水印: {watermark_text}")
+
     if picture_narration_enabled and picture_narration_path:
         pic_clips = _load_subtitle_clips(picture_narration_path, position_mode="picture_narration")
         if pic_clips:
             overlay_clips.extend(pic_clips)
             logger.info(f"已添加 {len(pic_clips)} 个原声旁白字幕片段")
-
-    watermark_clip = create_watermark_clip()
-    if watermark_clip:
-        overlay_clips.append(watermark_clip)
-        logger.info(f"已添加水印: {watermark_text}")
 
     if overlay_clips:
         video_clip = CompositeVideoClip([video_clip, *overlay_clips])

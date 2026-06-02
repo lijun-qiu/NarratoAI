@@ -5,6 +5,7 @@ import os.path
 import re
 import traceback
 from os import path
+from typing import Optional
 from loguru import logger
 
 from app.config import config
@@ -20,6 +21,10 @@ from app.services.video_output_settings import get_video_output_settings
 from app.services.update_script import is_valid_video_file
 from app.services import state as sm
 from app.utils import utils
+from app.services.film_tv_script_optimizer import (
+    finalize_film_tv_playback_order,
+    is_ost_grouped_by_type,
+)
 
 _SCRIPT_PATH_MODES = frozenset({
     "auto",
@@ -65,6 +70,14 @@ def _persist_synced_script(
             logger.warning(f"回写源脚本失败 ({abs_source}): {exc}")
 
     return task_script_path
+
+
+def _prepare_video_script_list(list_script: list) -> list:
+    """若 OST 按类型分组排列，则按原片时间轴重排为穿插播放顺序。"""
+    if is_ost_grouped_by_type(list_script):
+        logger.info("检测到 OST 分组排列，按原片时间轴重排播放顺序")
+        return finalize_film_tv_playback_order(list_script)
+    return list_script
 
 
 def _build_merge_video_options(
@@ -121,8 +134,9 @@ def _build_merge_video_options(
         'watermark_text': video_output.get('watermark_text', ''),
         'enable_picture_narration': bool(video_output.get('enable_picture_narration', True)),
         'picture_narration_path': picture_narration_path,
-        'picture_narration_font_size': int(video_output.get('picture_narration_font_size', 32)),
+        'picture_narration_font_size': int(video_output.get('picture_narration_font_size', 44)),
         'picture_narration_color': video_output.get('picture_narration_color', '#FFE066'),
+        'video_aspect': getattr(params, 'video_aspect', None),
     }
 
 
@@ -154,9 +168,17 @@ def _merge_task_subtitles(
     return ""
 
 
-def _build_picture_narration_path(task_id: str, new_script_list: list) -> str:
+def _build_picture_narration_path(
+    task_id: str,
+    new_script_list: list,
+    video_output: Optional[dict] = None,
+) -> str:
     try:
-        path = build_picture_narration_subtitle_path(new_script_list, task_id=task_id)
+        path = build_picture_narration_subtitle_path(
+            new_script_list,
+            task_id=task_id,
+            video_output=video_output,
+        )
         if path:
             logger.info(f"原声旁白字幕生成成功 -> {path}")
         return path or ""
@@ -194,6 +216,7 @@ def start_subclip(task_id: str, params: VideoClipParams, subclip_path_videos: di
         try:
             with open(video_script_path, "r", encoding="utf-8") as f:
                 list_script = json.load(f)
+                list_script = _prepare_video_script_list(list_script)
                 video_list = [i['narration'] for i in list_script]
                 video_ost = [i['OST'] for i in list_script]
                 time_list = [i['timestamp'] for i in list_script]
@@ -302,7 +325,12 @@ def start_subclip(task_id: str, params: VideoClipParams, subclip_path_videos: di
             logger.info(f"音频文件合并成功->{merged_audio_path}")
 
         merged_subtitle_path = _merge_task_subtitles(task_id, new_script_list, params)
-        picture_narration_path = _build_picture_narration_path(task_id, new_script_list)
+        video_output = get_video_output_settings()
+        if hasattr(params, 'enable_picture_narration') and params.enable_picture_narration is not None:
+            video_output["enable_picture_narration"] = params.enable_picture_narration
+        picture_narration_path = _build_picture_narration_path(
+            task_id, new_script_list, video_output=video_output
+        )
     except Exception as e:
         logger.error(f"合并音频/字幕文件失败: {str(e)}")
         if not merged_audio_path:
@@ -412,6 +440,7 @@ def start_subclip_unified(task_id: str, params: VideoClipParams):
         try:
             with open(video_script_path, "r", encoding="utf-8") as f:
                 list_script = json.load(f)
+                list_script = _prepare_video_script_list(list_script)
                 video_list = [i['narration'] for i in list_script]
                 video_ost = [i['OST'] for i in list_script]
                 time_list = [i['timestamp'] for i in list_script]
@@ -501,7 +530,12 @@ def start_subclip_unified(task_id: str, params: VideoClipParams):
             logger.info(f"音频文件合并成功->{merged_audio_path}")
 
         merged_subtitle_path = _merge_task_subtitles(task_id, new_script_list, params)
-        picture_narration_path = _build_picture_narration_path(task_id, new_script_list)
+        video_output = get_video_output_settings()
+        if hasattr(params, 'enable_picture_narration') and params.enable_picture_narration is not None:
+            video_output["enable_picture_narration"] = params.enable_picture_narration
+        picture_narration_path = _build_picture_narration_path(
+            task_id, new_script_list, video_output=video_output
+        )
     except Exception as e:
         logger.error(f"合并音频/字幕文件失败: {str(e)}")
         if not merged_audio_path:

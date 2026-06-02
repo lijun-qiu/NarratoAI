@@ -1628,6 +1628,51 @@ def create_subtitle(sub_maker: submaker.SubMaker, text: str, subtitle_file: str)
 
     sub_line = ""
 
+    def _extend_subtitle_end_times(items: list[str], total_duration_sec: float) -> list[str]:
+        """延长每条字幕到下一条开始或语音结束，避免提前消失。"""
+        if not items or total_duration_sec <= 0:
+            return items
+
+        parsed: list[tuple[float, float, str, str]] = []
+        for block in items:
+            lines = [line for line in block.strip().splitlines() if line.strip()]
+            if len(lines) < 2:
+                continue
+            idx_line = lines[0]
+            time_match = re.search(
+                r"(\d{2}:\d{2}:\d{2}[,.]\d{3})\s*-->\s*(\d{2}:\d{2}:\d{2}[,.]\d{3})",
+                lines[1],
+            )
+            if not time_match:
+                continue
+            start_sec = utils.time_to_seconds(time_match.group(1).replace(".", ","))
+            end_sec = utils.time_to_seconds(time_match.group(2).replace(".", ","))
+            text = "\n".join(lines[2:]).strip()
+            parsed.append((start_sec, end_sec, text, idx_line))
+
+        if not parsed:
+            return items
+
+        extended: list[str] = []
+        for i, (start_sec, end_sec, text, idx_line) in enumerate(parsed):
+            if i + 1 < len(parsed):
+                next_start = parsed[i + 1][0]
+                end_sec = max(end_sec, next_start - 0.05)
+            else:
+                end_sec = max(end_sec, total_duration_sec)
+            end_sec = min(end_sec, total_duration_sec)
+            if end_sec <= start_sec:
+                continue
+            extended.append(
+                formatter(
+                    idx=int(idx_line) if str(idx_line).isdigit() else i + 1,
+                    start_time=start_sec,
+                    end_time=end_sec,
+                    sub_text=text,
+                )
+            )
+        return extended or items
+
     try:
         for _, (offset, sub) in enumerate(zip(sub_maker.offset, sub_maker.subs)):
             _start_time, end_time = offset
@@ -1652,6 +1697,24 @@ def create_subtitle(sub_maker: submaker.SubMaker, text: str, subtitle_file: str)
                 sub_items.append(line)
                 start_time = -1.0
                 sub_line = ""
+
+        speech_duration = max(get_audio_duration(sub_maker), 0.0)
+        if speech_duration <= 0 and sub_items:
+            try:
+                last_block = sub_items[-1].strip().splitlines()
+                if len(last_block) >= 2:
+                    time_match = re.search(
+                        r"-->\s*(\d{2}:\d{2}:\d{2}[,.]\d{3})",
+                        last_block[1],
+                    )
+                    if time_match:
+                        speech_duration = utils.time_to_seconds(
+                            time_match.group(1).replace(".", ",")
+                        )
+            except Exception:
+                pass
+
+        sub_items = _extend_subtitle_end_times(sub_items, speech_duration)
 
         if len(sub_items) == len(script_lines):
             with open(subtitle_file, "w", encoding="utf-8") as file:

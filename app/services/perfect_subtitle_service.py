@@ -25,8 +25,8 @@ from app.services.video_output_settings import (
 from app.services.srt_utils import (
     SrtEntry,
     clip_entries_to_duration,
+    align_entries_to_speech_duration,
     extract_entries_in_range,
-    fit_entries_to_video_timeline,
     merge_and_sort_entries,
     offset_entries,
     parse_edited_time_range_seconds,
@@ -51,7 +51,7 @@ PERFECT_SUBTITLE_DEFAULTS: dict[str, Any] = {
     "narration_label": "",
     "original_label": "",
     "max_chars": 18,
-    "max_duration": 4.0,
+    "max_duration": 6.0,
 }
 
 
@@ -93,6 +93,41 @@ def _segment_video_duration_ms(segment: dict[str, Any]) -> int:
 
 def _segment_duration_ms(segment: dict[str, Any]) -> int:
     return _segment_video_duration_ms(segment)
+
+
+def _segment_audio_duration_ms(segment: dict[str, Any]) -> int:
+    audio_path = segment.get("audio") or ""
+    if audio_path and os.path.exists(audio_path):
+        audio_sec = probe_media_duration(audio_path)
+        if audio_sec > 0:
+            return int(round(audio_sec * 1000))
+    return 0
+
+
+def _align_segment_subtitle_entries(
+    entries: list[SrtEntry],
+    segment: dict[str, Any],
+) -> list[SrtEntry]:
+    video_ms = _segment_video_duration_ms(segment)
+    audio_ms = _segment_audio_duration_ms(segment)
+    if not entries:
+        return entries
+
+    # 解说段以 TTS 音频时长为基准，避免被较短的视频时长压缩导致字幕抢跑
+    if audio_ms > 0:
+        speech_ms = audio_ms
+        video_cap = video_ms if video_ms > 0 else audio_ms
+    elif video_ms > 0:
+        speech_ms = video_ms
+        video_cap = video_ms
+    else:
+        return entries
+
+    return align_entries_to_speech_duration(
+        entries,
+        speech_duration_ms=speech_ms,
+        video_duration_ms=video_cap,
+    )
 
 
 def _load_segment_subtitle_entries(path: str) -> list[SrtEntry]:
@@ -140,7 +175,7 @@ def _build_ost1_entries(
 
     video_ms = _segment_video_duration_ms(segment)
     if video_ms > 0 and local_entries:
-        local_entries = fit_entries_to_video_timeline(local_entries, video_ms)
+        local_entries = _align_segment_subtitle_entries(local_entries, segment)
 
     return offset_entries(local_entries, _edited_offset_ms(segment))
 
@@ -191,7 +226,7 @@ def _build_narration_entries(
     video_ms = _segment_video_duration_ms(segment)
     if video_ms > 0 and local_entries:
         local_entries = clip_entries_to_duration(local_entries, video_ms)
-        local_entries = fit_entries_to_video_timeline(local_entries, video_ms)
+        local_entries = _align_segment_subtitle_entries(local_entries, segment)
 
     for entry in local_entries:
         if label and not entry.label:
@@ -213,10 +248,14 @@ def _build_ost1_picture_narration_entries(
     if duration_ms <= 0:
         return []
 
+    display_sec = float(video_output.get("picture_narration_duration", 2.0))
+    display_ms = int(max(0.5, display_sec) * 1000)
+    display_ms = min(display_ms, duration_ms)
+
     max_chars = int(video_output.get("picture_narration_max_chars", 16))
     local_entries = split_text_to_entries(
         picture,
-        duration_ms,
+        display_ms,
         max_chars=max_chars,
         label="picture_narration",
     )

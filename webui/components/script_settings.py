@@ -10,6 +10,12 @@ from loguru import logger
 from app.config import config
 from app.models.schema import VideoClipParams
 from app.services.subtitle_text import decode_subtitle_bytes
+from app.services.subtitle_video_pairing import (
+    find_paired_subtitle_path,
+    get_transcription_subtitle_path,
+    load_subtitle_content,
+    resolve_transcription_media_path,
+)
 from app.utils import utils, check_script
 from webui.tools.generate_script_docu import generate_script_docu
 from webui.tools.generate_script_short import generate_script_short
@@ -19,6 +25,12 @@ from app.services.film_tv_settings import (
     FILM_TV_DEFAULTS,
     get_film_tv_settings,
     save_film_tv_settings_to_config,
+)
+from app.services.film_tv_rule_presets import (
+    apply_preset_to_settings,
+    get_film_tv_preset,
+    get_preset_default_work_name,
+    list_film_tv_presets,
 )
 
 
@@ -238,6 +250,49 @@ def render_script_file(tr, params):
         params.video_clip_json_path = selected_mode
 
 
+def _sync_subtitle_with_video(video_path: str) -> None:
+    """所选视频变更时，自动关联同名/已转录字幕。"""
+    video_path = (video_path or "").strip()
+    if not video_path or not os.path.isfile(video_path):
+        return
+
+    last_video = st.session_state.get("_subtitle_synced_video_path")
+    if last_video == video_path and st.session_state.get("subtitle_path"):
+        return
+
+    st.session_state["_subtitle_synced_video_path"] = video_path
+    paired = find_paired_subtitle_path(video_path)
+    if paired:
+        content = load_subtitle_content(paired)
+        if content.strip():
+            st.session_state["subtitle_path"] = paired
+            st.session_state["subtitle_content"] = content
+            st.session_state["subtitle_file_processed"] = True
+            return
+
+    if last_video and last_video != video_path:
+        st.session_state["subtitle_path"] = None
+        st.session_state["subtitle_content"] = None
+        st.session_state["subtitle_file_processed"] = False
+
+
+def _resolve_active_subtitle_path() -> str:
+    """当前生效的字幕路径（session 或视频配对字幕）。"""
+    subtitle_path = (st.session_state.get("subtitle_path") or "").strip()
+    if subtitle_path and os.path.isfile(subtitle_path):
+        return subtitle_path
+    video_path = (st.session_state.get("video_origin_path") or "").strip()
+    if video_path:
+        _sync_subtitle_with_video(video_path)
+        subtitle_path = (st.session_state.get("subtitle_path") or "").strip()
+        if subtitle_path:
+            return subtitle_path
+        paired = find_paired_subtitle_path(video_path)
+        if paired:
+            return paired
+    return ""
+
+
 def render_video_file(tr, params):
     """渲染视频文件选择"""
     video_list = [(tr("None"), ""), (tr("Upload Local Files"), "upload_local")]
@@ -257,8 +312,15 @@ def render_video_file(tr, params):
     )
 
     video_path = video_list[selected_video_index][1]
-    st.session_state['video_origin_path'] = video_path
-    params.video_origin_path = video_path
+    if video_path and video_path not in ("", "upload_local") and os.path.isfile(video_path):
+        st.session_state['video_origin_path'] = video_path
+        params.video_origin_path = video_path
+        _sync_subtitle_with_video(video_path)
+    elif video_path == "upload_local":
+        params.video_origin_path = st.session_state.get('video_origin_path', '')
+    else:
+        st.session_state['video_origin_path'] = ''
+        params.video_origin_path = ''
 
     if video_path == "upload_local":
         uploaded_file = st.file_uploader(
@@ -282,6 +344,7 @@ def render_video_file(tr, params):
                 st.success(tr("File Uploaded Successfully"))
                 st.session_state['video_origin_path'] = video_file_path
                 params.video_origin_path = video_file_path
+                _sync_subtitle_with_video(video_file_path)
                 time.sleep(1)
                 st.rerun()
 
@@ -345,26 +408,101 @@ def short_drama_summary(tr):
 
 def film_tv_narration(tr):
     """影视解说 渲染视频主题和提示词"""
-    video_theme = render_subtitle_narration_panel(
-        tr, work_name_label="Film Title", uploader_key="film_tv_subtitle_uploader"
+    render_subtitle_narration_panel(
+        tr,
+        work_name_label="Film Title",
+        uploader_key="film_tv_subtitle_uploader",
+        show_work_name=False,
+        show_temperature=False,
     )
-    render_film_tv_rules_settings(tr)
+    selected_preset_id = render_film_tv_rules_settings(tr)
+    video_theme = render_film_tv_work_name(tr, selected_preset_id)
+    temperature = st.slider(
+        "temperature",
+        0.0,
+        2.0,
+        float(st.session_state.get("temperature", 0.7)),
+        key="film_tv_temperature",
+    )
+    st.session_state["temperature"] = temperature
     return video_theme
 
 
-def render_film_tv_rules_settings(tr):
-    """影视解说规则参数调节面板（默认与 config.toml [film_tv] 一致）。"""
+def _sync_work_name_from_preset(preset_id: str) -> None:
+    """切换专题方案时，自动填入该方案绑定的默认作品名。"""
+    default_name = get_preset_default_work_name(preset_id)
+    last_preset_id = st.session_state.get("film_tv_last_preset_id")
+    if preset_id != last_preset_id:
+        st.session_state["film_tv_last_preset_id"] = preset_id
+        if default_name:
+            st.session_state["film_tv_video_theme"] = default_name
+            st.session_state["video_theme"] = default_name
+    elif default_name and not str(st.session_state.get("video_theme") or "").strip():
+        st.session_state.setdefault("film_tv_video_theme", default_name)
+        st.session_state["video_theme"] = default_name
+
+
+def render_film_tv_work_name(tr, preset_id: str) -> str:
+    """影视作品名称输入（随专题方案自动填充默认剧名）。"""
+    if "film_tv_video_theme" not in st.session_state:
+        st.session_state["film_tv_video_theme"] = st.session_state.get("video_theme", "")
+    _sync_work_name_from_preset(preset_id)
+    default_hint = get_preset_default_work_name(preset_id)
+    if default_hint:
+        st.caption(f"当前方案默认作品名：**{default_hint}**（可手动修改）")
+    video_theme = st.text_input(
+        tr("Film Title"),
+        key="film_tv_video_theme",
+    )
+    st.session_state["video_theme"] = video_theme
+    return video_theme
+
+
+def render_film_tv_rules_settings(tr) -> str:
+    """影视解说规则参数调节面板（模块化方案 + 细调）。"""
     defaults = get_film_tv_settings()
     saved = st.session_state.get("film_tv_settings")
     base = saved if isinstance(saved, dict) else defaults
+    current_preset_id = base.get("preset_id") or defaults.get("preset_id")
 
     def _clamp(value, lo, hi):
         return max(lo, min(hi, int(value)))
 
-    with st.expander("影视解说规则参数", expanded=True):
+    with st.expander("影视解说规则方案", expanded=True):
+        st.caption("勾选一套方案后，数值参数与 AI 剪辑法则一并生效；下方滑块可微调。")
+
+        presets = list_film_tv_presets()
+        preset_ids = [p["id"] for p in presets]
+        if current_preset_id not in preset_ids:
+            current_preset_id = preset_ids[0]
+
+        selected_preset_id = st.radio(
+            "选择剪辑方案",
+            options=preset_ids,
+            index=preset_ids.index(current_preset_id),
+            format_func=lambda pid: next(p["name"] for p in presets if p["id"] == pid),
+            key="ftv_preset_radio",
+            horizontal=True,
+        )
+
+        active_preset = get_film_tv_preset(selected_preset_id) or {}
+        st.info(f"**{active_preset.get('name', '')}** · {active_preset.get('subtitle', '')}")
+        st.markdown(active_preset.get("description", ""))
+
+        if st.checkbox("展开查看本方案剪辑师法则（将写入 AI 提示词）", key="ftv_show_preset_law"):
+            st.markdown(f"**剪辑师身份**\n\n{active_preset.get('editor_persona', '')}")
+            st.markdown(f"**专项法则**\n\n{active_preset.get('style_directive', '')}")
+
+        if selected_preset_id != base.get("preset_id"):
+            base = apply_preset_to_settings(base, selected_preset_id)
+
+        default_work = get_preset_default_work_name(selected_preset_id)
+        if default_work:
+            st.caption(f"作品名将默认填入：**{default_work}**")
+
+    with st.expander("影视解说规则参数", expanded=False):
         st.caption(
-            "调节生成脚本与后处理规则；默认值来自 config.toml，可临时调整或保存为默认。"
-            "「最少段数」会写入 AI 提示词并在生成后校验，未达标时自动重试一次。"
+            "调节生成脚本与后处理规则；「最少段数」会写入 AI 提示词并在生成后校验，未达标时自动重试。"
         )
 
         c1, c2 = st.columns(2)
@@ -451,6 +589,7 @@ def render_film_tv_rules_settings(tr):
             st.warning("解说字数下限不能大于上限，生成时将自动对调。")
 
         settings = {
+            "preset_id": selected_preset_id,
             "target_duration_percent": target_duration_percent,
             "ost1_duration_min": min(ost1_duration_min, ost1_duration_max),
             "ost1_duration_max": max(ost1_duration_min, ost1_duration_max),
@@ -472,7 +611,9 @@ def render_film_tv_rules_settings(tr):
         btn1, btn2 = st.columns(2)
         with btn1:
             if st.button("恢复默认规则", key="ftv_reset_defaults", use_container_width=True):
-                st.session_state["film_tv_settings"] = deepcopy(FILM_TV_DEFAULTS)
+                st.session_state["film_tv_settings"] = apply_preset_to_settings(
+                    deepcopy(FILM_TV_DEFAULTS), FILM_TV_DEFAULTS.get("preset_id")
+                )
                 st.rerun()
         with btn2:
             if st.button("保存为 config.toml 默认", key="ftv_save_config", use_container_width=True):
@@ -481,8 +622,17 @@ def render_film_tv_rules_settings(tr):
                 else:
                     st.error("保存失败，请查看日志")
 
+    return selected_preset_id
 
-def render_subtitle_narration_panel(tr, work_name_label: str, uploader_key: str):
+
+def render_subtitle_narration_panel(
+    tr,
+    work_name_label: str,
+    uploader_key: str,
+    *,
+    show_work_name: bool = True,
+    show_temperature: bool = True,
+):
     """字幕解说类模式共用面板（短剧解说 / 影视解说）"""
     # 检查是否已经处理过字幕文件
     if 'subtitle_file_processed' not in st.session_state:
@@ -555,11 +705,13 @@ def render_subtitle_narration_panel(tr, work_name_label: str, uploader_key: str)
             st.error(f"{tr('Upload failed')}: {str(e)}")
 
     # 名称输入框
-    video_theme = st.text_input(tr(work_name_label))
-    st.session_state['video_theme'] = video_theme
-    # 数字输入框
-    temperature = st.slider("temperature", 0.0, 2.0, 0.7)
-    st.session_state['temperature'] = temperature
+    video_theme = ""
+    if show_work_name:
+        video_theme = st.text_input(tr(work_name_label))
+        st.session_state['video_theme'] = video_theme
+    if show_temperature:
+        temperature = st.slider("temperature", 0.0, 2.0, 0.7)
+        st.session_state['temperature'] = temperature
     return video_theme
 
 
@@ -625,8 +777,22 @@ def render_fun_asr_transcription(tr):
             key="transcription_enable_fallback",
         )
 
+        video_origin_path = (st.session_state.get("video_origin_path") or "").strip()
+        use_selected_video = st.checkbox(
+            "未单独上传时，默认使用上方已选视频转写",
+            value=st.session_state.get("transcription_use_selected_video", True),
+            key="transcription_use_selected_video",
+        )
+        if use_selected_video and video_origin_path and os.path.isfile(video_origin_path):
+            st.caption(
+                f"默认转录: {os.path.basename(video_origin_path)} → "
+                f"{os.path.basename(get_transcription_subtitle_path(video_origin_path))}"
+            )
+        elif use_selected_video:
+            st.warning("请先在上方选择或上传视频文件（也可在下方单独上传转录）")
+
         uploaded_media = st.file_uploader(
-            tr("上传需要转录的音频/视频"),
+            tr("上传需要转录的音频/视频（可选，上传后将优先于默认视频）"),
             type=[
                 "aac", "amr", "avi", "flac", "flv", "m4a", "mkv", "mov",
                 "mp3", "mp4", "mpeg", "ogg", "opus", "wav", "webm", "wma", "wmv",
@@ -634,6 +800,8 @@ def render_fun_asr_transcription(tr):
             accept_multiple_files=False,
             key="media_transcription_uploader",
         )
+        if uploaded_media is not None:
+            st.info(f"将优先转录上传文件: {uploaded_media.name}")
 
         provider_choice = st.radio(
             "转录方式",
@@ -655,9 +823,29 @@ def render_fun_asr_transcription(tr):
         )
 
         if st.button("转写生成字幕", key="media_transcribe_btn", use_container_width=True):
-            if uploaded_media is None:
+            uploaded_temp_path = ""
+            if uploaded_media is not None:
+                temp_dir = utils.temp_dir("transcription")
+                safe_filename = os.path.basename(uploaded_media.name)
+                uploaded_temp_path = os.path.join(temp_dir, safe_filename)
+                file_name, file_extension = os.path.splitext(safe_filename)
+                if os.path.exists(uploaded_temp_path):
+                    timestamp = time.strftime("%Y%m%d%H%M%S")
+                    uploaded_temp_path = os.path.join(
+                        temp_dir, f"{file_name}_{timestamp}{file_extension}"
+                    )
+                with open(uploaded_temp_path, "wb") as f:
+                    f.write(uploaded_media.getbuffer())
+
+            media_path = resolve_transcription_media_path(
+                video_origin_path,
+                uploaded_temp_path,
+                prefer_video=use_selected_video,
+                uploaded_first=True,
+            )
+            if not media_path:
                 clear_subtitle_state()
-                st.error("请先上传需要转录的音频或视频文件")
+                st.error("请先上传转录文件，或在上方选择视频并勾选默认使用视频转写")
                 return
 
             if provider_choice == PROVIDER_FUN_ASR and not fun_key.strip():
@@ -689,19 +877,8 @@ def render_fun_asr_transcription(tr):
                     config.transcription["enable_fallback"] = enable_fallback
                 config.save_config()
 
-                temp_dir = utils.temp_dir("transcription")
-                safe_filename = os.path.basename(uploaded_media.name)
-                media_path = os.path.join(temp_dir, safe_filename)
-                file_name, file_extension = os.path.splitext(safe_filename)
-                if os.path.exists(media_path):
-                    timestamp = time.strftime("%Y%m%d%H%M%S")
-                    media_path = os.path.join(temp_dir, f"{file_name}_{timestamp}{file_extension}")
-
-                with open(media_path, "wb") as f:
-                    f.write(uploaded_media.getbuffer())
-
-                subtitle_name = f"{os.path.splitext(os.path.basename(media_path))[0]}_transcribed.srt"
-                subtitle_path = os.path.join(utils.subtitle_dir(), subtitle_name)
+                subtitle_path = get_transcription_subtitle_path(media_path)
+                os.makedirs(os.path.dirname(subtitle_path) or utils.subtitle_dir(), exist_ok=True)
 
                 with st.spinner("正在转写字幕，失败时将自动切换其他方式..."):
                     generated_path, used_provider = media_transcription.transcribe_media_to_srt(
@@ -712,7 +889,8 @@ def render_fun_asr_transcription(tr):
                     )
 
                 label = PROVIDER_LABELS.get(used_provider, used_provider)
-                _apply_subtitle_result(generated_path, label)
+                if _apply_subtitle_result(generated_path, label):
+                    st.session_state["_subtitle_synced_video_path"] = video_origin_path or media_path
             except Exception as e:
                 clear_subtitle_state()
                 logger.error(f"字幕转写失败: {traceback.format_exc()}")
@@ -748,13 +926,13 @@ def render_script_buttons(tr, params):
             generate_script_short(tr, params, custom_clips)
         elif script_path == "summary":
             # 执行 短剧解说 脚本生成
-            subtitle_path = st.session_state.get('subtitle_path')
+            subtitle_path = _resolve_active_subtitle_path()
             video_theme = st.session_state.get('video_theme')
             temperature = st.session_state.get('temperature')
             generate_script_short_sunmmary(params, subtitle_path, video_theme, temperature)
         elif script_path == "film_tv":
             # 执行 影视解说 脚本生成
-            subtitle_path = st.session_state.get('subtitle_path')
+            subtitle_path = _resolve_active_subtitle_path()
             video_theme = st.session_state.get('video_theme')
             temperature = st.session_state.get('temperature')
             film_tv_settings = st.session_state.get("film_tv_settings")
@@ -871,11 +1049,19 @@ def save_script_with_validation(tr, video_clip_json_details):
 
 def get_script_params():
     """获取脚本参数"""
+    video_origin_path = st.session_state.get('video_origin_path', '')
+    if video_origin_path and os.path.isfile(video_origin_path):
+        _sync_subtitle_with_video(video_origin_path)
+
+    subtitle_path = st.session_state.get('subtitle_path', '')
+    if not subtitle_path and video_origin_path:
+        subtitle_path = find_paired_subtitle_path(video_origin_path) or ""
+
     return {
         'video_language': st.session_state.get('video_language', ''),
         'video_clip_json_path': st.session_state.get('video_clip_json_path', ''),
-        'video_origin_path': st.session_state.get('video_origin_path', ''),
+        'video_origin_path': video_origin_path,
         'video_name': st.session_state.get('video_name', ''),
         'video_plot': st.session_state.get('video_plot', ''),
-        'source_subtitle_path': st.session_state.get('subtitle_path', ''),
+        'source_subtitle_path': subtitle_path,
     }

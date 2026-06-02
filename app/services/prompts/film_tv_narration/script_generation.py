@@ -17,35 +17,38 @@ class ScriptGenerationPrompt(ParameterizedPrompt):
         metadata = PromptMetadata(
             name="script_generation",
             category="film_tv_narration",
-            version="v1.4",
-            description="专家级剪辑师：原声为主解说脚本",
+            version="v1.5",
+            description="模块化剪辑方案：均衡解说 / 原声燃剪 / 专题规则",
             model_type=ModelType.TEXT,
             output_format=OutputFormat.JSON,
-            tags=["电影", "电视剧", "影视解说", "解说脚本", "原声片段"],
+            tags=["电影", "电视剧", "影视解说", "解说脚本", "原声片段", "罚罪2"],
             parameters=["film_name", "plot_analysis", "subtitle_content", "work_brief",
                         "source_duration_minutes", "target_output_minutes", "target_duration_percent",
                         "ost1_duration_min", "ost1_duration_max", "ost1_duration_long_max",
                         "ost1_segment_min", "ost1_segment_max",
                         "ost0_segment_min", "ost0_segment_max",
                         "original_audio_percent", "narration_percent",
-                        "narration_chars_min", "narration_chars_max", "opening_chars_max"],
+                        "narration_chars_min", "narration_chars_max", "opening_chars_max",
+                        "total_segment_min", "editing_mode_name", "editor_persona", "style_directive"],
         )
         super().__init__(metadata, required_parameters=["film_name", "plot_analysis"])
 
         self._system_prompt = (
-            "你是一位专家级影视剪辑师（10 年+ 精剪经验），精通「原声为主、解说点睛」的高燃精剪风格。"
-            "你像院线预告片剪辑师一样选时刻、控节奏：成片以原片对白和名场面为主，解说只做简短串联。"
+            "你是一位资深影视剪辑师，根据当前选定的剪辑方案生成 JSON 脚本。"
             "原声 OST=1 播放期间禁止插入解说，解说 OST=0 必须等当前原声段完全结束后再出现。"
             "你必须理解：OST=0 时长由解说字数决定，OST=1 时长由时间戳跨度决定。"
             "你必须严格按照 JSON 格式输出，绝不能包含任何其他文字、说明或代码块标记。"
         )
 
     def get_template(self) -> str:
-        return """# 影视解说脚本创作任务（专家级剪辑师 · 原声为主版）
+        return """# 影视解说脚本创作任务 · 方案「${editing_mode_name}」
 
 ## 你的身份
-你是**专家级影视剪辑师**，即将为《${film_name}》输出可直接交给剪辑引擎执行的 JSON 脚本。
+${editor_persona}
+即将为《${film_name}》输出可直接交给剪辑引擎执行的 JSON 脚本。
 请先回顾作品调研与剧情分析，再动手选段——像拉片一样精准，像预告片一样抓人。
+
+${style_directive}
 
 ## 作品背景调研
 <work_brief>
@@ -53,7 +56,7 @@ ${work_brief}
 </work_brief>
 
 ## 任务目标
-为《${film_name}》创作**原声占主导**的解说脚本：让观众多听原片台词与表演，解说只做必要铺垫、转折和点睛（类似「拉片」+「精剪原片」风格，而非长篇旁白复述）。
+为《${film_name}》创作解说脚本：**原声约 ${original_audio_percent}%、解说约 ${narration_percent}%**（按当前方案执行，不要偏离比例目标）。
 
 ## ⚠️ 成片时长目标（硬性要求）
 - 原片时长约 **${source_duration_minutes} 分钟**
@@ -69,8 +72,8 @@ ${work_brief}
 | **解说 OST=0** | **约 ${narration_percent}%** | 仅作短旁白串联 |
 
 **实现方式（在遵守剪辑引擎规则的前提下）：**
-- 多安排 **OST=1** 段（**${ost1_segment_min}–${ost1_segment_max} 段**），且每段 **${ost1_duration_min}–${ost1_duration_max} 秒**（低于 ${ost1_duration_min} 秒的会被丢弃或无效）
-- **OST=0** 段数 **${ost0_segment_min}–${ost0_segment_max} 段**、每段 **${narration_chars_min}–${narration_chars_max} 字**（开场可至 ${opening_chars_max} 字），点到为止
+- **OST=1** 段 **${ost1_segment_min}–${ost1_segment_max} 段**，每段 **${ost1_duration_min}–${ost1_duration_max} 秒**
+- **OST=0** 段 **${ost0_segment_min}–${ost0_segment_max} 段**、每段 **${narration_chars_min}–${narration_chars_max} 字**（开场可至 ${opening_chars_max} 字）
 
 ## 素材信息
 
@@ -136,11 +139,11 @@ OST=1 → OST=1 → OST=0 → OST=1 → OST=1 → OST=0   ✅ 连续原声播完
 
 ### 推荐节奏
 ```
-短解说(铺垫) → 原声 → 原声 → 短解说(转折) → 原声 → 原声 → 短解说 → …
+短解说(铺垫/立人) → 原声 → 原声 → 短解说(过渡) → 原声 → 短解说(转折) → …
 ```
-- 允许 **连续 2–3 段 OST=1**（一段对白接一段反应/对峙），**整组播完后**再用一句短 OST=0 解说带过
+- 允许 **连续 2–3 段 OST=1**，**整组播完后**再用 OST=0 解说串线
 - **禁止**在 OST=1 之间插入 OST=0（原声播放时解说必须等待）
-- 不要写成「长解说 → 短原声」；那是解说为主，**不符合本任务**
+- 当解说占比 ≥ 45% 时：**不要**写成「长原声、短解说」；解说要承担脉络，原声只留高光
 
 ### 原声段（OST=1）怎么选
 - 完整对白、争吵、威胁、反转、告白、名场面
@@ -150,10 +153,9 @@ OST=1 → OST=1 → OST=0 → OST=1 → OST=1 → OST=0   ✅ 连续原声播完
 - **`picture` 字段（重要）**：写画面/动作/角色神情与情绪的旁白描述（非对白复述），例如「胡队怒目圆睁，一字一句硬刚赵家势力」「反派冷笑威胁，气氛骤然紧张」；可结合前后情节做一句总结，供原声段左侧旁白字幕使用
 
 ### 解说段（OST=0）怎么写
-- 每段 **${narration_chars_min}–${narration_chars_max} 字**（上限 ${opening_chars_max} 字），**不要超过 ${narration_chars_max} 字为佳**
-- 只负责：开场钩子、段落过渡、一句点评、结尾点题
-- 禁止用大段旁白复述剧情（剧情交给原声展示）
-- 开场可略长至 **${opening_chars_max} 字**，其余段尽量 **${narration_chars_min}–${narration_chars_max} 字**
+- 每段 **${narration_chars_min}–${narration_chars_max} 字**（开场可至 ${opening_chars_max} 字）
+- 负责：开场钩子、人物关系、段落过渡、局势点评、结尾悬念
+- 禁止复述刚播完的原台词；禁止用超长旁白代替原声（该给原声的高光必须 OST=1）
 
 ---
 

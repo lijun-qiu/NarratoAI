@@ -14,23 +14,30 @@ from typing import Any, Dict, Optional
 import toml
 from loguru import logger
 
+from app.services.film_tv_rule_presets import (
+    DEFAULT_PRESET_ID,
+    apply_preset_to_settings,
+    format_style_directive,
+)
+
 FILM_TV_DEFAULTS: Dict[str, Any] = {
-    # 方案 B：高燃精剪（长剧单集约 45 分钟 → 约 10–12 分钟成片）
-    "target_duration_percent": 25,
-    "ost1_duration_min": 8,
-    "ost1_duration_max": 15,
-    "ost1_duration_long_max": 20,
-    "ost1_segment_min": 30,
-    "ost1_segment_max": 42,
-    "ost0_segment_min": 6,
-    "ost0_segment_max": 10,
-    "original_audio_percent": 80,
-    "narration_percent": 20,
+    # 默认方案：《罚罪2》悬疑脉络（原声 45% / 解说 55%）
+    "preset_id": DEFAULT_PRESET_ID,
+    "target_duration_percent": 30,
+    "ost1_duration_min": 5,
+    "ost1_duration_max": 11,
+    "ost1_duration_long_max": 14,
+    "ost1_segment_min": 12,
+    "ost1_segment_max": 18,
+    "ost0_segment_min": 14,
+    "ost0_segment_max": 22,
+    "original_audio_percent": 45,
+    "narration_percent": 55,
     "allow_consecutive_ost1": True,
     "enforce_narration_after_ost1": True,
-    "narration_chars_min": 35,
-    "narration_chars_max": 60,
-    "opening_chars_max": 80,
+    "narration_chars_min": 48,
+    "narration_chars_max": 78,
+    "opening_chars_max": 110,
 }
 
 
@@ -57,12 +64,16 @@ def _load_film_tv_from_config() -> Dict[str, Any]:
 
 
 def get_film_tv_settings(overrides: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
-    """合并 config.toml 默认值与运行时覆盖（如页面调节）。"""
+    """合并 config.toml、方案预设与页面微调。"""
     settings = _load_film_tv_from_config()
+    preset_id = (overrides or {}).get("preset_id") or settings.get("preset_id") or DEFAULT_PRESET_ID
+    settings = apply_preset_to_settings(settings, preset_id)
     if overrides:
         for key, value in overrides.items():
-            if key in FILM_TV_DEFAULTS and value is not None:
+            if value is not None and key in FILM_TV_DEFAULTS:
                 settings[key] = value
+            elif key == "preset_id" and value:
+                settings = apply_preset_to_settings(settings, value)
     return settings
 
 
@@ -96,6 +107,22 @@ def get_film_tv_script_prompt_params(
         "narration_chars_min": str(int(cfg["narration_chars_min"])),
         "narration_chars_max": str(int(cfg["narration_chars_max"])),
         "opening_chars_max": str(int(cfg["opening_chars_max"])),
+        "editing_mode_name": str(cfg.get("preset_name") or "均衡解说"),
+        "editor_persona": str(cfg.get("editor_persona") or ""),
+        "style_directive": format_style_directive(
+            str(cfg.get("style_directive") or ""),
+            {
+                "ost1_duration_min": str(int(cfg["ost1_duration_min"])),
+                "ost1_duration_max": str(int(cfg["ost1_duration_max"])),
+                "ost1_segment_min": str(int(cfg["ost1_segment_min"])),
+                "ost1_segment_max": str(int(cfg["ost1_segment_max"])),
+                "ost0_segment_min": str(int(cfg["ost0_segment_min"])),
+                "ost0_segment_max": str(int(cfg["ost0_segment_max"])),
+                "narration_chars_min": str(int(cfg["narration_chars_min"])),
+                "narration_chars_max": str(int(cfg["narration_chars_max"])),
+                "opening_chars_max": str(int(cfg["opening_chars_max"])),
+            },
+        ),
     }
 
 
@@ -111,6 +138,8 @@ def save_film_tv_settings_to_config(settings: Dict[str, Any]) -> bool:
         film_tv = {}
         for key in FILM_TV_DEFAULTS:
             film_tv[key] = settings.get(key, FILM_TV_DEFAULTS[key])
+        if settings.get("preset_id"):
+            film_tv["preset_id"] = settings["preset_id"]
         config_data["film_tv"] = film_tv
 
         with open(config_path, "w", encoding="utf-8") as f:

@@ -179,24 +179,37 @@
 ##########################################
 
 [film_tv]
-# 规则方案: fazu2 | balanced_narration | original_heavy
+# 规则来源: markdown | custom（互斥：markdown 用 rules_markdown_file；custom 用下方滑块）
+rules_source_mode = "markdown"
+rules_markdown_file = "fazu2_8min_master.md"
+# 规则方案: fazu2 | balanced_narration | original_heavy（custom 模式下生效）
 preset_id = "fazu2"
-# 影视解说 · 《罚罪2》悬疑脉络（原声约 45% / 解说约 55%）
-target_duration_percent = 30
-ost1_duration_min = 5
-ost1_duration_max = 11
-ost1_duration_long_max = 14
-ost1_segment_min = 12
-ost1_segment_max = 18
-ost0_segment_min = 14
-ost0_segment_max = 22
-original_audio_percent = 45
-narration_percent = 55
+# 影视解说 · 《罚罪2》8 分钟大师版（规则见 rules/fazu2_8min_master.md）
+target_duration_percent = 20
+ost1_duration_min = 8
+ost1_duration_max = 12
+ost1_duration_long_max = 12
+ost1_segment_min = 10
+ost1_segment_max = 14
+ost0_segment_min = 12
+ost0_segment_max = 16
+original_audio_percent = 48
+narration_percent = 52
 allow_consecutive_ost1 = true
 enforce_narration_after_ost1 = true
 narration_chars_min = 48
-narration_chars_max = 78
-opening_chars_max = 110
+narration_chars_max = 72
+opening_chars_max = 130
+max_consecutive_ost0 = 3
+max_consecutive_ost1 = 3
+# 作品类型: movie | tv_series（罚罪2 方案默认 tv_series，启用宝子们片头片尾）
+content_type = "tv_series"
+episode_number = 1
+tv_opening_line_template = "宝子们，我们开始《{film_name}》第{episode}集啦！"
+tv_closing_line_template = "好啦宝子们，我们下集再见！"
+tv_recap_prev_episode = true
+tv_recap_chars_min = 40
+tv_recap_chars_max = 80
 
 [frames]
     # 提取关键帧的间隔时间（秒）
@@ -237,12 +250,12 @@ opening_chars_max = 110
 [video_output]
     # 成片水印文字（留空则不添加水印；横屏 16:9 垂直居中靠右、上下 10% 浮动）
     watermark_text = "@小超剪辑"
-    # 原声段（OST=1）是否在画面左侧上方显示旁白字幕（画面/动作/情绪描述，取自脚本 picture 字段）
+    # 原声段（OST=1）是否在画面居中靠左显示旁白字幕（规则见 prompts/video_output/picture_narration_rules.md）
     enable_picture_narration = true
     picture_narration_font_size = 44
     picture_narration_color = "#FFE066"
     picture_narration_max_chars = 16
-    picture_narration_duration = 2.0
+    picture_narration_duration = 5.0
 
 [transcription]
     enable_fallback = true

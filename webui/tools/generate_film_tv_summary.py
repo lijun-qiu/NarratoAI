@@ -16,7 +16,11 @@ from loguru import logger
 
 from app.config import config
 from app.services.SDE.short_drama_explanation import analyze_subtitle, generate_narration_script, research_film_work
-from app.services.film_tv_settings import get_film_tv_settings, get_film_tv_script_prompt_params
+from app.services.film_tv_settings import (
+    TV_CONTENT_SERIES,
+    get_film_tv_settings,
+    get_film_tv_script_prompt_params,
+)
 from app.services.subtitle_text import read_subtitle_text
 from app.utils.video_processor import VideoProcessor
 import app.services.llm  # noqa: F401 — 触发 LLM 提供商注册
@@ -24,14 +28,163 @@ from app.services.llm.migration_adapter import SubtitleAnalyzerAdapter, _run_asy
 from app.services.llm.unified_service import UnifiedLLMService
 from app.services.film_tv_script_optimizer import (
     AUTO_NARRATION_MARKER,
+    apply_tv_series_bookends,
+    build_film_tv_script_summary,
     fill_auto_narration_placeholders,
     optimize_film_tv_script,
     supplement_film_tv_segment_counts,
+    validate_film_tv_script,
     validate_film_tv_script_counts,
 )
 from webui.tools.generate_short_summary import parse_and_fix_json
 
 PROMPT_CATEGORY = "film_tv_narration"
+
+
+def _format_llm_error_for_ui(message: str) -> str:
+    """将 LLM 接口原始错误转为可操作的界面提示。"""
+    msg = (message or "").strip()
+    lower = msg.lower()
+    if "insufficient_quota" in lower or "quota failed" in lower or "pre-consumed quota" in lower:
+        return (
+            "**LLM 账户余额不足**（403 insufficient_quota）。\n\n"
+            "字幕剧情分析需要一次性提交整集字幕，网关会**预扣约 $0.14** 额度，"
+            "而你当前余额不足（日志里 user quota 小于 need quota）。\n\n"
+            "**处理办法：**\n"
+            "1. 到 `api.4022543.xyz`（或你配置的 text_openai_base_url）充值；\n"
+            "2. 在「基础设置」换余额充足的 API Key；\n"
+            "3. 换更便宜的文本模型（当前为 config 里 text_openai_model_name）。\n\n"
+            f"原始信息：{msg[:500]}"
+        )
+    if "401" in msg or "authentication" in lower or "invalid api key" in lower:
+        return f"**LLM 认证失败**，请检查 config.toml 中 text_openai_api_key。\n\n原始信息：{msg[:500]}"
+    if "rate limit" in lower or "429" in msg:
+        return f"**LLM 请求过于频繁**（429），请稍后再试。\n\n原始信息：{msg[:500]}"
+    return f"剧情分析失败：{msg[:800]}"
+
+
+def _render_film_tv_script_summary_panel(summary: dict) -> None:
+    """在页面上展示成片脚本原声/解说段统计。"""
+    if not summary:
+        return
+    with st.container(border=True):
+        st.markdown("**成片脚本组成（原声 / 解说）**")
+        c1, c2, c3 = st.columns(3)
+        with c1:
+            st.metric(
+                "解说 OST=0",
+                f"{summary.get('ost0_count', 0)} 段",
+                f"{summary.get('narration_pct', 0):.1f}% · {summary.get('ost0_sec', 0):.0f}s",
+            )
+        with c2:
+            st.metric(
+                "原声 OST=1",
+                f"{summary.get('ost1_count', 0)} 段",
+                f"{summary.get('original_pct', 0):.1f}% · {summary.get('ost1_sec', 0):.0f}s",
+            )
+        with c3:
+            st.metric(
+                "成片总时长（估）",
+                f"{summary.get('total_sec', 0):.0f}s",
+                f"目标 {summary.get('narration_target', 60)}/{summary.get('original_target', 40)}",
+            )
+        d1, d2 = st.columns(2)
+        with d1:
+            ost0_ids = summary.get("ost0_ids") or []
+            st.caption(
+                f"解说段 _id：{', '.join(map(str, ost0_ids)) if ost0_ids else '无'}"
+            )
+            st.caption(
+                f"最长连续解说 {summary.get('max_consecutive_ost0', 0)} 段 "
+                f"(上限 {summary.get('max_consecutive_ost0_limit', 3)})"
+            )
+        with d2:
+            ost1_ids = summary.get("ost1_ids") or []
+            st.caption(
+                f"原声段 _id：{', '.join(map(str, ost1_ids)) if ost1_ids else '无'}"
+            )
+            st.caption(
+                f"最长连续原声 {summary.get('max_consecutive_ost1', 0)} 段 "
+                f"(上限 {summary.get('max_consecutive_ost1_limit', 3)})"
+            )
+        if summary.get("unanchored_ost0_count", 0) > 0:
+            st.warning(
+                f"仍有 {summary['unanchored_ost0_count']} 段解说时间戳未对齐字幕，建议重新生成。"
+            )
+        if summary.get("validation_ok"):
+            st.success("段数、时长占比与穿插结构均符合当前规则。")
+        else:
+            st.warning(summary.get("validation_message", "脚本未完全通过校验"))
+
+
+def _generate_prev_episode_recap(
+    *,
+    film_name: str,
+    episode_number: int,
+    work_brief: str,
+    plot_analysis: str,
+    film_tv_settings: dict,
+    text_api_key: str,
+    text_model: str,
+    text_base_url: str,
+    text_provider: str,
+    temperature: float,
+) -> str:
+    """非首集时生成上集剧情回顾（供开场解说拼接）。"""
+    if episode_number <= 1:
+        return ""
+    if not film_tv_settings.get("tv_recap_prev_episode", True):
+        return ""
+
+    chars_min = int(film_tv_settings.get("tv_recap_chars_min") or 40)
+    chars_max = int(film_tv_settings.get("tv_recap_chars_max") or 80)
+    prev_ep = episode_number - 1
+    prompt = (
+        f"你是影视解说编剧。请为《{film_name}》第 {episode_number} 集解说稿写一段「上集回顾」。\n"
+        f"要求：概括第 {prev_ep} 集主要剧情（人物关系、核心冲突、结尾悬念），"
+        f"约 {chars_min}-{chars_max} 个汉字，口语化，不要用列表，不要剧透本集。\n"
+        f"只输出回顾正文，不要标题、不要 markdown。\n\n"
+        f"作品调研：\n{(work_brief or '')[:2500]}\n\n"
+        f"本集字幕分析摘要：\n{(plot_analysis or '')[:2500]}"
+    )
+    try:
+        result = _run_async_safely(
+            UnifiedLLMService.generate_text,
+            prompt=prompt,
+            system_prompt="你只输出一段中文解说回顾正文。",
+            provider=text_provider,
+            temperature=min(1.0, temperature + 0.1),
+            api_key=text_api_key,
+            api_base=text_base_url,
+        )
+        recap = (result or "").strip()
+        if recap:
+            logger.info(f"已生成第 {prev_ep} 集回顾，约 {len(recap)} 字")
+        return recap
+    except Exception as exc:
+        logger.warning(f"上集回顾生成失败: {exc}")
+        return ""
+
+
+def _apply_tv_bookends_if_needed(
+    items: list,
+    *,
+    film_name: str,
+    film_tv_settings: dict,
+    subtitle_content: str,
+    source_duration_sec: float,
+    prev_episode_recap: str = "",
+) -> list:
+    if film_tv_settings.get("content_type") != TV_CONTENT_SERIES:
+        return items
+    return apply_tv_series_bookends(
+        items,
+        film_name=film_name,
+        settings=film_tv_settings,
+        subtitle_content=subtitle_content,
+        source_duration_sec=source_duration_sec or None,
+        prev_episode_recap=prev_episode_recap,
+    )
 
 
 def _fill_auto_narrations_with_llm(
@@ -154,11 +307,12 @@ def generate_script_film_tv_summary(params, subtitle_path, video_theme, temperat
             except Exception as e:
                 logger.warning(f"无法读取原片时长: {e}")
 
-            script_extra_params = get_film_tv_script_prompt_params(
-                source_duration_sec, settings=film_tv_settings
-            )
-
             film_name = (video_theme or "").strip()
+            script_extra_params = get_film_tv_script_prompt_params(
+                source_duration_sec,
+                settings=film_tv_settings,
+                film_name=film_name,
+            )
             if not film_name:
                 st.error("请先填写影视作品名称（剧名/片名），AI 需要先调研作品背景再生成脚本")
                 return
@@ -228,8 +382,9 @@ def generate_script_film_tv_summary(params, subtitle_path, video_theme, temperat
                 )
 
             if analysis_result["status"] != "success":
-                logger.error(f"分析失败: {analysis_result.get('message', 'unknown')}")
-                st.error("剧情分析失败，请检查日志")
+                err_msg = analysis_result.get("message", "unknown")
+                logger.error(f"分析失败: {err_msg}")
+                st.error(_format_llm_error_for_ui(str(err_msg)))
                 st.stop()
 
             logger.info("影视字幕分析成功")
@@ -266,6 +421,25 @@ def generate_script_film_tv_summary(params, subtitle_path, video_theme, temperat
                 )
 
             plot_analysis = analysis_result["analysis"]
+
+            prev_episode_recap = ""
+            if film_tv_settings.get("content_type") == TV_CONTENT_SERIES:
+                episode_no = max(1, int(film_tv_settings.get("episode_number") or 1))
+                if episode_no > 1 and film_tv_settings.get("tv_recap_prev_episode", True):
+                    update_progress(58, f"正在生成第 {episode_no - 1} 集回顾...")
+                    prev_episode_recap = _generate_prev_episode_recap(
+                        film_name=film_name,
+                        episode_number=episode_no,
+                        work_brief=work_brief,
+                        plot_analysis=plot_analysis,
+                        film_tv_settings=film_tv_settings,
+                        text_api_key=text_api_key,
+                        text_model=text_model,
+                        text_base_url=text_base_url,
+                        text_provider=text_provider,
+                        temperature=temperature,
+                    )
+
             narration_result = None
             narration_dict = None
             validation = None
@@ -293,7 +467,9 @@ def generate_script_film_tv_summary(params, subtitle_path, video_theme, temperat
                     source_duration_sec=source_duration_sec or None,
                     settings=film_tv_settings,
                 )
-                validation = validate_film_tv_script_counts(optimized_items, film_tv_settings)
+                validation = validate_film_tv_script(
+                    optimized_items, film_tv_settings, subtitle_content
+                )
                 if validation["ok"]:
                     narration_dict["items"] = optimized_items
                     break
@@ -301,12 +477,18 @@ def generate_script_film_tv_summary(params, subtitle_path, video_theme, temperat
                 if attempt < max_attempts:
                     plot_analysis = (
                         f"{analysis_result['analysis']}\n\n"
-                        f"【重要修正·第{attempt}次】脚本段数严重不足，当前输出无效。"
-                        f"原声 OST=1 仅 {validation['ost1_count']} 段（必须≥{validation['ost1_min']}），"
-                        f"解说 OST=0 仅 {validation['ost0_count']} 段（必须≥{validation['ost0_min']}），"
-                        f"总段数 {validation['total']}（必须≥{validation['total_min']}）。"
-                        f"请输出完整 JSON，OST=0 解说段必须穿插在原声段之间，"
-                        f"至少 {validation['ost0_min']} 段 OST=0、{validation['ost1_min']} 段 OST=1。"
+                        f"【重要修正·第{attempt}次】脚本未达标，当前输出无效。"
+                        f"原声 OST=1 {validation['ost1_count']} 段（至少 {validation['ost1_min']}），"
+                        f"解说 OST=0 {validation['ost0_count']} 段（至少 {validation['ost0_min']}）。"
+                        f"成片时长占比：解说约 {validation.get('narration_pct', 0):.0f}%"
+                        f"（目标 {validation.get('narration_target', 60)}%），"
+                        f"原声约 {validation.get('original_pct', 0):.0f}%"
+                        f"（目标 {validation.get('original_target', 40)}%）。"
+                        f"连续解说 {validation.get('max_consecutive_ost0', 0)} 段"
+                        f"（上限 {validation.get('max_consecutive_ost0_limit', 3)}），"
+                        f"未贴字幕解说 {validation.get('unanchored_ost0_count', 0)} 段。"
+                        f"请输出完整 JSON：解说/原声必须穿插，禁止连续超过 3 段同类型；"
+                        f"OST=0 的 timestamp 必须来自字幕真实时间点，禁止等差虚构时间轴。"
                     )
                 else:
                     narration_dict["items"] = optimized_items
@@ -339,13 +521,20 @@ def generate_script_film_tv_summary(params, subtitle_path, video_theme, temperat
                     source_duration_sec=source_duration_sec or None,
                     settings=film_tv_settings,
                 )
-                validation = validate_film_tv_script_counts(optimized_items, film_tv_settings)
+                validation = validate_film_tv_script(
+                    optimized_items, film_tv_settings, subtitle_content
+                )
                 narration_dict["items"] = optimized_items
                 supplemented = True
 
             if narration_result is None or narration_result["status"] != "success":
-                logger.error(f"解说文案生成失败: {narration_result.get('message', 'unknown') if narration_result else 'unknown'}")
-                st.error("生成脚本失败，请检查日志")
+                err_msg = (
+                    narration_result.get("message", "unknown")
+                    if narration_result
+                    else "unknown"
+                )
+                logger.error(f"解说文案生成失败: {err_msg}")
+                st.error(_format_llm_error_for_ui(str(err_msg)).replace("剧情分析", "脚本生成"))
                 st.stop()
 
             if narration_dict is None:
@@ -356,18 +545,44 @@ def generate_script_film_tv_summary(params, subtitle_path, video_theme, temperat
                 st.error("生成的解说文案缺少必要的 'items' 字段")
                 st.stop()
 
+            narration_dict["items"] = _apply_tv_bookends_if_needed(
+                narration_dict["items"],
+                film_name=film_name,
+                film_tv_settings=film_tv_settings,
+                subtitle_content=subtitle_content,
+                source_duration_sec=source_duration_sec,
+                prev_episode_recap=prev_episode_recap,
+            )
+
+            validation = validate_film_tv_script(
+                narration_dict["items"], film_tv_settings, subtitle_content
+            )
+            script_summary = build_film_tv_script_summary(
+                narration_dict["items"],
+                film_tv_settings,
+                subtitle_content,
+            )
+            st.session_state["film_tv_script_summary"] = script_summary
+
             if validation and not validation["ok"]:
                 st.warning(
-                    f"脚本段数仍未完全达标：原声 {validation['ost1_count']}/{validation['ost1_min']} 段，"
-                    f"解说 {validation['ost0_count']}/{validation['ost0_min']} 段，"
-                    f"共 {validation['total']}/{validation['total_min']} 段。"
-                    f"已自动重试并补段，建议检查补入片段文案或再次生成。"
+                    f"脚本仍未完全达标：原声 {validation['ost1_count']}/{validation['ost1_min']} 段，"
+                    f"解说 {validation['ost0_count']}/{validation['ost0_min']} 段；"
+                    f"时长占比 解说 {validation.get('narration_pct', 0):.0f}% / "
+                    f"原声 {validation.get('original_pct', 0):.0f}% "
+                    f"(目标 {validation.get('narration_target', 60)}/{validation.get('original_target', 40)})；"
+                    f"连续解说 {validation.get('max_consecutive_ost0', 0)} 段。"
+                    f"已自动校正，建议预览后再次生成。"
                 )
             elif supplemented and validation and validation["ok"]:
                 st.info(
-                    f"段数已按配置自动补全：原声 {validation['ost1_count']} 段，"
-                    f"解说 {validation['ost0_count']} 段（含程序补段，请预览解说文案）。"
+                    f"段数与时长占比已自动校正：原声 {validation['ost1_count']} 段 "
+                    f"({validation.get('original_pct', 0):.0f}%)，"
+                    f"解说 {validation['ost0_count']} 段 "
+                    f"({validation.get('narration_pct', 0):.0f}%)。"
                 )
+
+            _render_film_tv_script_summary_panel(script_summary)
 
             script = json.dumps(narration_dict["items"], ensure_ascii=False, indent=2)
             st.session_state["video_clip_json"] = json.loads(script)

@@ -67,7 +67,7 @@ def render_video_output_settings(tr):
     base = saved if isinstance(saved, dict) else defaults
 
     with st.expander("成片输出（水印 / 原声旁白）", expanded=False):
-        st.caption("16:9 与 9:16 下，旁白字幕固定居中靠左；水印居中靠右，上下浮动约 10% 画面高度，缓慢漂移。")
+        st.caption("16:9 与 9:16 下，旁白字幕固定居中靠左；水印居中靠右，上下浮动约 10% 画面高度，缓慢漂移。旁白文案须参照该段字幕上下文与画面生成（见 picture_narration_rules.md）。")
 
         watermark_text = st.text_input(
             "水印文字",
@@ -102,7 +102,7 @@ def render_video_output_settings(tr):
             "旁白字幕停留时长（秒）",
             min_value=1.0,
             max_value=15.0,
-            value=float(base.get("picture_narration_duration", 2.0)),
+            value=float(base.get("picture_narration_duration", 5.0)),
             step=0.5,
             help="每段 OST=1 原声开始时显示 picture 描述字幕的时长；原声段更长时字幕不会全程显示",
             key="vo_picture_narration_duration",

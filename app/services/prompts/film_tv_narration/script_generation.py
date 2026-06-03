@@ -29,7 +29,8 @@ class ScriptGenerationPrompt(ParameterizedPrompt):
                         "ost0_segment_min", "ost0_segment_max",
                         "original_audio_percent", "narration_percent",
                         "narration_chars_min", "narration_chars_max", "opening_chars_max",
-                        "total_segment_min", "editing_mode_name", "editor_persona", "style_directive"],
+                        "total_segment_min", "editing_mode_name", "editor_persona", "style_directive",
+                        "tv_series_rules", "picture_narration_rules"],
         )
         super().__init__(metadata, required_parameters=["film_name", "plot_analysis"])
 
@@ -50,6 +51,10 @@ ${editor_persona}
 
 ${style_directive}
 
+${tv_series_rules}
+
+${picture_narration_rules}
+
 ## 作品背景调研
 <work_brief>
 ${work_brief}
@@ -63,13 +68,15 @@ ${work_brief}
 - **成片总时长必须达到约 ${target_output_minutes} 分钟**（约为原片的 ${target_duration_percent}%）
 - 生成前请自行估算：所有 OST=1 时间戳跨度之和 + 所有 OST=0 解说 TTS 时长之和 ≈ ${target_output_minutes} 分钟
 - **严禁**生成总时长不足 1 分钟的脚本（原声段过短是主要原因）
+- **严禁**连续超过 3 段 OST=0 解说或 3 段 OST=1 原声（必须穿插）
+- **OST=0 的 timestamp 必须来自 `<subtitles>` 中真实对白/画面时间点**，禁止按等差秒数虚构时间轴
 
 ## 核心比例（成片时长，必须尽量达到）
 
 | 类型 | 目标占比 | 说明 |
 |------|----------|------|
-| **原声 OST=1** | **约 ${original_audio_percent}%** | 成片的大部分时间播放原片 |
-| **解说 OST=0** | **约 ${narration_percent}%** | 仅作短旁白串联 |
+| **原声 OST=1** | **约 ${original_audio_percent}%** | 保留高光对白/名场面，**段数宜少、每段宜精** |
+| **解说 OST=0** | **约 ${narration_percent}%** | 解说承担主线，**段数宜多、字数宜足** |
 
 **实现方式（在遵守剪辑引擎规则的前提下）：**
 - **OST=1** 段 **${ost1_segment_min}–${ost1_segment_max} 段**，每段 **${ost1_duration_min}–${ost1_duration_max} 秒**
@@ -150,7 +157,7 @@ OST=1 → OST=1 → OST=0 → OST=1 → OST=1 → OST=0   ✅ 连续原声播完
 - 每段包住**一句或多句连贯对话**，跨度 **${ost1_duration_min}–${ost1_duration_max} 秒**
 - 重要冲突可给到 **12–18 秒**（仍须来自字幕真实范围）
 - `narration` 固定：`播放原片+序号`
-- **`picture` 字段（重要）**：写画面/动作/角色神情与情绪的旁白描述（非对白复述），例如「胡队怒目圆睁，一字一句硬刚赵家势力」「反派冷笑威胁，气氛骤然紧张」；可结合前后情节做一句总结，供原声段左侧旁白字幕使用
+- **`picture` 字段（OST=1 原声旁白）**：严格按上方「原声段旁白字幕」规则，结合 `<subtitles>` 本段及前后上下文撰写；**禁止**复读对白、禁止「宝子们」话术
 
 ### 解说段（OST=0）怎么写
 - 每段 **${narration_chars_min}–${narration_chars_max} 字**（开场可至 ${opening_chars_max} 字）
@@ -232,6 +239,9 @@ OST=1 → OST=1 → OST=0 → OST=1 → OST=1 → OST=0   ✅ 连续原声播完
 - [ ] 原片时间戳无重叠
 - [ ] 无「OST=1 → OST=0 → OST=1」打断原声的排列
 - [ ] 未使用 OST=2
+- [ ] 连续 OST=0 / OST=1 均不超过 3 段
+- [ ] 所有 OST=0 时间戳均可在字幕中找到对应范围
+- [ ] （电视剧模式）第一段与最后一段均为 OST=0，且含规定开场/收尾话术
 
 ### 创作原则
 1. 只输出 JSON

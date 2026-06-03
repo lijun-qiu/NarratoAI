@@ -10,6 +10,7 @@
 
 from __future__ import annotations
 
+import os
 from copy import deepcopy
 from typing import Any, Dict, List, Optional
 
@@ -18,6 +19,15 @@ PRESET_ORIGINAL_HEAVY = "original_heavy"
 PRESET_FAZU2 = "fazu2"
 
 DEFAULT_PRESET_ID = PRESET_FAZU2
+
+FAZU2_RULES_MARKDOWN = "fazu2_8min_master.md"
+
+_RULES_DIR = os.path.join(
+    os.path.dirname(os.path.realpath(__file__)),
+    "prompts",
+    "film_tv_narration",
+    "rules",
+)
 
 # 仅数值类键（不含 preset_id / 提示词字段）
 NUMERIC_SETTING_KEYS = (
@@ -38,56 +48,33 @@ NUMERIC_SETTING_KEYS = (
     "opening_chars_max",
 )
 
-_FAZU2_STYLE_DIRECTIVE = """## 《罚罪2》专项剪辑法则 · 二十年剪辑大师版
+# 方案可一并写入 settings 的非数值键
+PRESET_EXTRA_SETTING_KEYS = (
+    "content_type",
+    "episode_number",
+    "tv_opening_line_template",
+    "tv_closing_line_template",
+    "tv_recap_prev_episode",
+)
 
-### 第一步：纵观全剧，吃透本集
-动笔前先建立**全剧视野**：人物弧光、赵家势力版图、警方布局、卧底暗线、未回收的伏笔。
-针对**当前这一集**做详细刨析：
-- 本集在整条故事线里处于什么位置？（起势 / 升级 / 反转 / 余震）
-- 本集核心矛盾是什么？谁赢谁亏？观众情绪应被带到哪里？
-- 哪些台词必须原声呈现？哪些信息必须靠解说补全？
 
-你的目标不是「剪短」，而是剪出**有观点、有情绪、有节奏**的一集优秀解说。
+def load_film_tv_rules_markdown(filename: str) -> str:
+    """读取 rules/*.md 作为 style_directive 正文。"""
+    path = os.path.join(_RULES_DIR, filename)
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            return handle.read().strip()
+    except OSError:
+        return ""
 
-### 解说 OST=0：带情绪的「第二导演」
-解说不是冷冰冰的说明书，而是**有态度、有温度**的旁白。根据剧情**主动切换情绪基调**：
 
-| 剧情情境 | 推荐情绪 | 解说写法示意 |
-|----------|----------|--------------|
-| 赵家嚣张、草菅人命、以势压人 | **愤怒 / 义愤** | 短句、反问、重音词；「这已经不是嚣张，是骑在法治头上撒野！」 |
-| 常征硬刚、孤胆破局、以命换证 | **燃 / 敬佩 / 严肃** | 克制有力，不煽情过头；「他明知是局，还是一步踏了进去。」 |
-| 卧底周旋、身份险些暴露、黑色幽默 | **紧张 + 一丝诙谐** | 先压后松；「表面赔笑敬酒，背地里冷汗已经湿透衬衫。」 |
-| 家族内斗、荒诞操作、弄巧成拙 | **搞笑 / 讽刺** | 适度调侃但不毁剧；「赵家这步棋，下完才发现坑的是自己。」 |
-| 证据链收网、真相大白、正义落地 | **严肃 / 释然 / 升华** | 沉下来，留余味；「这一天，他们等了太久。」 |
-| 无辜者受害、牺牲、告别 | **沉重 / 惋惜** | 放慢语速感，少用感叹号；「有些名字，从此只能活在档案里。」 |
-| 悬念未解、内鬼成谜、下一集钩子 | **悬疑 / 压低** | 留半句；「但他没注意到，电话那头的人，嘴角已经上扬。」 |
-
-**情绪控制原则：**
-- 一段 OST=0 **只主打一种主情绪**，不要又哭又笑又骂
-- 情绪服务于**剧情推进**，不为煽情而煽情
-- 用词口语化、有画面感，像**老剪辑师在跟观众聊这集**，不是念新闻稿
-- 每段 ${narration_chars_min}–${narration_chars_max} 字内完成「信息 + 情绪 + 钩子」
-
-### 原声 OST=1：只留「非剪不可」的三类 moment
-1. **爆点对峙**：警匪当面交锋、卧底险些暴露、赵家内部摊牌、枪口顶额
-2. **信息炸弹**：一句台词翻转前情（身份揭晓、内鬼暗示、证据甩脸）
-3. **情绪顶满**：沉默后爆发、摔杯离席、红眼咬牙等**表演不可替代**的秒
-
-解释性对白、重复信息、情绪已由解说说透的段落——**不要整段原声硬播**。
-
-### 全剧视角下的本集结构
-- **开场 OST=0**（可至 ${opening_chars_max} 字）：用**最强情绪**抓住人——愤怒控诉、冷峻悬念、或一句反讽，点明本集核心矛盾
-- **中段**：原声组（2–3 段 OST=1）+ 解说过渡（OST=0 换情绪、换视角、换线）
-- **赵家线 / 警方线 / 卧底线** 三线交替；每换一线，解说先「立旗」再进原声
-- **集末 OST=0**：悬念或升华，情绪收束或再推高，引向下一冲突
-
-### 节奏与禁忌
-- 避免连续 4 段以上纯原声——观众需要解说的**情绪引导**和**脉络梳理**
-- 禁止解说复述刚播完的原台词
-- 禁止 OST=1 只框 1–3 秒单句
-- 禁止全片一种语调念到底（全程严肃或全程吐槽都不合格）
-- `picture` 字段写画面/神情/动作，与解说情绪一致（如「胡队怒目圆睁，一字一句硬刚」）
-"""
+def _resolve_preset_style_directive(preset: Dict[str, Any]) -> str:
+    rules_file = preset.get("rules_markdown_file")
+    if rules_file:
+        content = load_film_tv_rules_markdown(str(rules_file))
+        if content:
+            return content
+    return str(preset.get("style_directive") or "")
 
 _PRESETS: Dict[str, Dict[str, Any]] = {
     PRESET_BALANCED: {
@@ -169,40 +156,82 @@ _PRESETS: Dict[str, Dict[str, Any]] = {
     PRESET_FAZU2: {
         "id": PRESET_FAZU2,
         "name": "《罚罪2》悬疑脉络",
-        "subtitle": "二十年剪辑大师 · 全剧视角 · 情绪化解说",
+        "subtitle": "8 分钟大师版 · 情绪曲线 · 宝子们片头片尾",
         "description": (
-            "以《罚罪2》为母题：纵观全剧、逐集深度刨析，解说带愤怒/严肃/搞笑/悬疑等情绪，"
-            "随剧情切换；原声只留爆点对峙与信息炸弹。"
+            "40 分钟正片 → 约 8 分钟成片：解说 12–16 段（52%），原声 10–14 段（48%）。"
+            "规则全文见 rules/fazu2_8min_master.md，含片头片尾「宝子们」固定话术。"
         ),
         "default_work_name": "罚罪2",
+        "rules_markdown_file": FAZU2_RULES_MARKDOWN,
         "editor_persona": (
-            "你是一位**有着二十年资深经验的剪辑大师**，纵览《罚罪2》全剧脉络，"
-            "对每一集做详细分析与深度刨析，再动手剪出优秀的解说成片。"
-            "你既是拉片者也是 storyteller：原声留给最炸的 moment，"
-            "解说则负责串线、立人、立局，并**随剧情注入情绪**——该愤怒时义愤填膺，"
-            "该严肃时沉得住气，该讽刺时一针见血，该悬疑时留半句让人睡不着觉。"
-            "你绝不用一种语调念完全片，也绝不拿长对白堆原声时长。"
+            "你是一位**《罚罪2》影视解说脚本生成大师**（二十年剪辑经验），"
+            "严格按「8 分钟版大师规则」输出 JSON：缓起→渐升→高潮→余韵；"
+            "解说带情绪钩子与信息密度，原声只留金句/反转/爆点；"
+            "第一段 OST=0 必须以「宝子们，我们开始…」开场，"
+            "最后一段必须以「好啦宝子们，我们下集再见！」收尾。"
         ),
-        "style_directive": _FAZU2_STYLE_DIRECTIVE,
+        "style_directive": "",
+        "inline_style_directive": (
+            "## 《罚罪2》自定义剪辑要点（非 MD 模式）\n"
+            "- 原声 OST=1：${ost1_segment_min}–${ost1_segment_max} 段，每段 ${ost1_duration_min}–${ost1_duration_max} 秒，只留爆点对峙与信息炸弹\n"
+            "- 解说 OST=0：${ost0_segment_min}–${ost0_segment_max} 段，每段 ${narration_chars_min}–${narration_chars_max} 字，带情绪钩子\n"
+            "- 原声/解说穿插，禁止连续超过 3 段同类型；picture 写画面/神情，禁止复读对白"
+        ),
         "settings": {
-            "target_duration_percent": 30,
-            "ost1_duration_min": 5,
-            "ost1_duration_max": 11,
-            "ost1_duration_long_max": 14,
-            "ost1_segment_min": 12,
-            "ost1_segment_max": 18,
-            "ost0_segment_min": 14,
-            "ost0_segment_max": 22,
-            "original_audio_percent": 45,
-            "narration_percent": 55,
+            "target_duration_percent": 20,
+            "ost1_duration_min": 8,
+            "ost1_duration_max": 12,
+            "ost1_duration_long_max": 12,
+            "ost1_segment_min": 10,
+            "ost1_segment_max": 14,
+            "ost0_segment_min": 12,
+            "ost0_segment_max": 16,
+            "original_audio_percent": 48,
+            "narration_percent": 52,
             "allow_consecutive_ost1": True,
             "enforce_narration_after_ost1": True,
             "narration_chars_min": 48,
-            "narration_chars_max": 78,
-            "opening_chars_max": 110,
+            "narration_chars_max": 72,
+            "opening_chars_max": 130,
+            "content_type": "tv_series",
+            "episode_number": 1,
+            "tv_opening_line_template": "宝子们，我们开始《{film_name}》第{episode}集啦！",
+            "tv_closing_line_template": "好啦宝子们，我们下集再见！",
+            "tv_recap_prev_episode": True,
         },
     },
 }
+
+
+def list_film_tv_rules_markdown_files() -> List[Dict[str, str]]:
+    """扫描 rules 目录下可用的 Markdown 规则文件。"""
+    items: List[Dict[str, str]] = []
+    try:
+        for name in sorted(os.listdir(_RULES_DIR)):
+            if not name.lower().endswith(".md"):
+                continue
+            linked = find_preset_id_for_rules_file(name)
+            preset = _PRESETS.get(linked) if linked else None
+            items.append(
+                {
+                    "filename": name,
+                    "label": name[:-3].replace("_", " "),
+                    "subtitle": str((preset or {}).get("subtitle") or ""),
+                }
+            )
+    except OSError:
+        pass
+    return items
+
+
+def find_preset_id_for_rules_file(filename: str) -> Optional[str]:
+    """查找与 Markdown 规则文件绑定的方案 id。"""
+    if not filename:
+        return None
+    for pid, preset in _PRESETS.items():
+        if preset.get("rules_markdown_file") == filename:
+            return pid
+    return None
 
 
 def list_film_tv_presets() -> List[Dict[str, Any]]:
@@ -219,10 +248,22 @@ def list_film_tv_presets() -> List[Dict[str, Any]]:
     ]
 
 
-def get_film_tv_preset(preset_id: Optional[str]) -> Optional[Dict[str, Any]]:
-    if not preset_id:
-        return deepcopy(_PRESETS.get(DEFAULT_PRESET_ID))
-    return deepcopy(_PRESETS.get(preset_id))
+def get_film_tv_preset(
+    preset_id: Optional[str],
+    *,
+    use_rules_markdown: bool = True,
+) -> Optional[Dict[str, Any]]:
+    pid = preset_id or DEFAULT_PRESET_ID
+    preset = deepcopy(_PRESETS.get(pid))
+    if not preset:
+        return None
+    if use_rules_markdown and preset.get("rules_markdown_file"):
+        preset["style_directive"] = _resolve_preset_style_directive(preset)
+    else:
+        preset["style_directive"] = str(
+            preset.get("inline_style_directive") or preset.get("style_directive") or ""
+        )
+    return preset
 
 
 def get_default_preset_id() -> str:
@@ -240,12 +281,17 @@ def get_preset_default_work_name(preset_id: Optional[str]) -> str:
 def apply_preset_to_settings(
     settings: Optional[Dict[str, Any]] = None,
     preset_id: Optional[str] = None,
+    *,
+    use_rules_markdown: bool = True,
 ) -> Dict[str, Any]:
     """将方案数值与元数据合并进 settings。"""
     merged = deepcopy(settings) if settings else {}
-    preset = get_film_tv_preset(preset_id or merged.get("preset_id") or DEFAULT_PRESET_ID)
+    preset = get_film_tv_preset(
+        preset_id or merged.get("preset_id") or DEFAULT_PRESET_ID,
+        use_rules_markdown=use_rules_markdown,
+    )
     if not preset:
-        preset = get_film_tv_preset(DEFAULT_PRESET_ID)
+        preset = get_film_tv_preset(DEFAULT_PRESET_ID, use_rules_markdown=use_rules_markdown)
     assert preset is not None
 
     merged["preset_id"] = preset["id"]
@@ -254,6 +300,9 @@ def apply_preset_to_settings(
     merged["style_directive"] = preset["style_directive"]
     for key in NUMERIC_SETTING_KEYS:
         if key in preset["settings"]:
+            merged[key] = preset["settings"][key]
+    for key in PRESET_EXTRA_SETTING_KEYS:
+        if key in preset.get("settings", {}):
             merged[key] = preset["settings"][key]
     return merged
 

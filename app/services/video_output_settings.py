@@ -18,7 +18,7 @@ VIDEO_OUTPUT_DEFAULTS: Dict[str, Any] = {
     "picture_narration_font_size": 44,
     "picture_narration_color": "#FFE066",
     "picture_narration_max_chars": 16,
-    "picture_narration_duration": 2.0,
+    "picture_narration_duration": 5.0,
 }
 
 

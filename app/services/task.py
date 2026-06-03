@@ -5,7 +5,7 @@ import os.path
 import re
 import traceback
 from os import path
-from typing import Optional
+from typing import Optional, Tuple
 from loguru import logger
 
 from app.config import config
@@ -311,8 +311,12 @@ def _produce_final_video(
     picture_narration_path: str,
     list_script: list,
     new_script_list: list,
-) -> str:
-    """合并 BGM/配音/旁白/水印，并在延迟模式下于最后 API 转写后烧录主字幕。"""
+) -> Tuple[str, Optional[str]]:
+    """合并 BGM/配音/旁白/水印，并在延迟模式下于最后 API 转写后烧录主字幕。
+
+    Returns:
+        (带主字幕成片路径, 无主字幕成片路径或 None)
+    """
     task_dir = utils.task_dir(task_id)
     output_video_path = path.join(task_dir, "combined.mp4")
     bgm_path = utils.get_bgm_file()
@@ -321,6 +325,7 @@ def _produce_final_video(
         list_script=list_script,
         picture_narration_path=picture_narration_path,
     )
+    subtitle_enabled = getattr(params, "subtitle_enabled", True)
 
     if _should_defer_subtitle_asr(params):
         base_output_path = path.join(task_dir, "combined_base.mp4")
@@ -339,10 +344,10 @@ def _produce_final_video(
             options=merge_options,
         )
 
-        if not getattr(params, "subtitle_enabled", True):
+        if not subtitle_enabled:
             logger.info("主字幕已禁用，跳过延迟 API 转写")
             os.replace(base_output_path, output_video_path)
-            return output_video_path
+            return output_video_path, None
 
         logger.info("\n\n## 7. 延迟字幕：API 转写")
         sm.state.update_task(task_id, state=const.TASK_STATE_PROCESSING, progress=90)
@@ -353,7 +358,7 @@ def _produce_final_video(
         if not deferred_subtitle_path:
             logger.warning("延迟字幕转写未生成有效字幕，保留无主字幕成片")
             os.replace(base_output_path, output_video_path)
-            return output_video_path
+            return output_video_path, None
 
         logger.info(f"\n\n## 8. 烧录主字幕 -> {output_video_path}")
         sm.state.update_task(task_id, state=const.TASK_STATE_PROCESSING, progress=95)
@@ -363,18 +368,35 @@ def _produce_final_video(
             output_path=output_video_path,
             options=options,
         )
-        return output_video_path
+        return output_video_path, base_output_path
+
+    no_subtitle_path: Optional[str] = None
+    if subtitle_enabled and merged_subtitle_path:
+        no_subtitle_path = path.join(task_dir, "combined_no_subtitle.mp4")
+        logger.info(
+            f"\n\n## 6a. 合成无主字幕成片 -> {no_subtitle_path}"
+        )
+        merge_options = dict(options)
+        merge_options["subtitle_enabled"] = False
+        generate_video.merge_materials(
+            video_path=combined_video_path,
+            audio_path=merged_audio_path,
+            subtitle_path=None,
+            bgm_path=bgm_path,
+            output_path=no_subtitle_path,
+            options=merge_options,
+        )
 
     logger.info(f"\n\n## 6. 最后一步: 合并字幕/BGM/配音/视频 -> {output_video_path}")
     generate_video.merge_materials(
         video_path=combined_video_path,
         audio_path=merged_audio_path,
-        subtitle_path=merged_subtitle_path,
+        subtitle_path=merged_subtitle_path if subtitle_enabled else None,
         bgm_path=bgm_path,
         output_path=output_video_path,
         options=options,
     )
-    return output_video_path
+    return output_video_path, no_subtitle_path
 
 
 def start_subclip(task_id: str, params: VideoClipParams, subclip_path_videos: dict = None):
@@ -501,6 +523,7 @@ def start_subclip(task_id: str, params: VideoClipParams, subclip_path_videos: di
     4. 合并视频（先合并，再按重编码后时长校正时间轴）
     """
     final_video_paths = []
+    no_subtitle_video_paths = []
     combined_video_paths = []
 
     video_clips = _collect_video_clips_from_script(new_script_list, subclip_path_videos)
@@ -520,7 +543,7 @@ def start_subclip(task_id: str, params: VideoClipParams, subclip_path_videos: di
     """
     6. 合并字幕/BGM/配音/视频（延迟模式下先合成再 API 转写烧字幕）
     """
-    output_video_path = _produce_final_video(
+    output_video_path, no_subtitle_path = _produce_final_video(
         task_id,
         params,
         combined_video_path=combined_video_path,
@@ -532,12 +555,18 @@ def start_subclip(task_id: str, params: VideoClipParams, subclip_path_videos: di
     )
 
     final_video_paths.append(output_video_path)
+    if no_subtitle_path:
+        no_subtitle_video_paths.append(no_subtitle_path)
     combined_video_paths.append(combined_video_path)
 
-    logger.success(f"任务 {task_id} 已完成, 生成 {len(final_video_paths)} 个视频.")
+    logger.success(
+        f"任务 {task_id} 已完成, 生成 {len(final_video_paths)} 个带字幕视频"
+        f"{f'、{len(no_subtitle_video_paths)} 个无字幕视频' if no_subtitle_video_paths else ''}."
+    )
 
     kwargs = {
         "videos": final_video_paths,
+        "videos_no_subtitle": no_subtitle_video_paths,
         "combined_videos": combined_video_paths
     }
     sm.state.update_task(task_id, state=const.TASK_STATE_COMPLETE, progress=100, **kwargs)
@@ -646,6 +675,7 @@ def start_subclip_unified(task_id: str, params: VideoClipParams):
     4. 合并视频（先合并，再按重编码后时长校正时间轴）
     """
     final_video_paths = []
+    no_subtitle_video_paths = []
     combined_video_paths = []
 
     video_clips = _collect_video_clips_from_script(new_script_list)
@@ -665,7 +695,7 @@ def start_subclip_unified(task_id: str, params: VideoClipParams):
     """
     6. 合并字幕/BGM/配音/视频（延迟模式下先合成再 API 转写烧字幕）
     """
-    output_video_path = _produce_final_video(
+    output_video_path, no_subtitle_path = _produce_final_video(
         task_id,
         params,
         combined_video_path=combined_video_path,
@@ -677,12 +707,18 @@ def start_subclip_unified(task_id: str, params: VideoClipParams):
     )
 
     final_video_paths.append(output_video_path)
+    if no_subtitle_path:
+        no_subtitle_video_paths.append(no_subtitle_path)
     combined_video_paths.append(combined_video_path)
 
-    logger.success(f"统一处理任务 {task_id} 已完成, 生成 {len(final_video_paths)} 个视频.")
+    logger.success(
+        f"统一处理任务 {task_id} 已完成, 生成 {len(final_video_paths)} 个带字幕视频"
+        f"{f'、{len(no_subtitle_video_paths)} 个无字幕视频' if no_subtitle_video_paths else ''}."
+    )
 
     kwargs = {
         "videos": final_video_paths,
+        "videos_no_subtitle": no_subtitle_video_paths,
         "combined_videos": combined_video_paths
     }
     sm.state.update_task(task_id, state=const.TASK_STATE_COMPLETE, progress=100, **kwargs)

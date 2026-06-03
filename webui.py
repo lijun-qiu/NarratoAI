@@ -204,13 +204,42 @@ def render_generate_button():
                     status_text.text(tr("视频生成完成"))
                     progress_bar.progress(1.0)
                     
-                    # 显示结果
+                    # 显示结果（列布局限制宽度，避免视频铺满整页）
                     video_files = task.get("videos", [])
-                    try:
-                        if video_files:
-                            player_cols = st.columns(len(video_files) * 2 + 1)
-                            for i, url in enumerate(video_files):
+                    no_subtitle_files = task.get("videos_no_subtitle", [])
+
+                    def _render_video_row(label: str, urls: list, *, use_full_width: bool = False) -> None:
+                        if not urls:
+                            return
+                        st.markdown(f"**{label}**")
+                        if len(urls) == 1:
+                            if use_full_width:
+                                st.video(urls[0])
+                            else:
+                                _, center, _ = st.columns([1, 2, 1])
+                                center.video(urls[0])
+                        else:
+                            player_cols = st.columns(len(urls) * 2 + 1)
+                            for i, url in enumerate(urls):
                                 player_cols[i * 2 + 1].video(url)
+
+                    try:
+                        if video_files or no_subtitle_files:
+                            dual_single = (
+                                video_files
+                                and no_subtitle_files
+                                and len(video_files) == 1
+                                and len(no_subtitle_files) == 1
+                            )
+                            if dual_single:
+                                c1, c2 = st.columns(2)
+                                with c1:
+                                    _render_video_row("带主字幕版本", video_files, use_full_width=True)
+                                with c2:
+                                    _render_video_row("无主字幕版本", no_subtitle_files, use_full_width=True)
+                            else:
+                                _render_video_row("带主字幕版本", video_files)
+                                _render_video_row("无主字幕版本", no_subtitle_files)
                     except Exception as e:
                         logger.error(f"播放视频失败: {e}")
                     

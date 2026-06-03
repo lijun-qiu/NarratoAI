@@ -264,7 +264,7 @@ def _build_ost1_picture_narration_entries(
     if duration_ms <= 0:
         return []
 
-    display_sec = float(video_output.get("picture_narration_duration", 2.0))
+    display_sec = float(video_output.get("picture_narration_duration", 5.0))
     display_ms = int(max(0.5, display_sec) * 1000)
     display_ms = min(display_ms, duration_ms)
 

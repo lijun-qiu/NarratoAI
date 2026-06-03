@@ -21,22 +21,22 @@ from app.services.film_tv_rule_presets import (
 )
 
 FILM_TV_DEFAULTS: Dict[str, Any] = {
-    # 默认方案：《罚罪2》悬疑脉络（原声 45% / 解说 55%）
+    # 默认方案：《罚罪2》悬疑脉络（原声 48% / 解说 52%）
     "preset_id": DEFAULT_PRESET_ID,
     "target_duration_percent": 30,
     "ost1_duration_min": 5,
-    "ost1_duration_max": 11,
-    "ost1_duration_long_max": 14,
-    "ost1_segment_min": 12,
-    "ost1_segment_max": 18,
-    "ost0_segment_min": 14,
-    "ost0_segment_max": 22,
-    "original_audio_percent": 45,
-    "narration_percent": 55,
+    "ost1_duration_max": 12,
+    "ost1_duration_long_max": 12,
+    "ost1_segment_min": 10,
+    "ost1_segment_max": 14,
+    "ost0_segment_min": 12,
+    "ost0_segment_max": 16,
+    "original_audio_percent": 48,
+    "narration_percent": 52,
     "allow_consecutive_ost1": True,
     "enforce_narration_after_ost1": True,
     "narration_chars_min": 48,
-    "narration_chars_max": 78,
+    "narration_chars_max": 72,
     "opening_chars_max": 110,
 }
 

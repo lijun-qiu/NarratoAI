@@ -311,6 +311,7 @@ class SubtitleAnalyzerAdapter:
         subtitle_content: str,
         film_name: str = "",
         work_brief: str = "",
+        vision_scene_notes: str = "",
     ) -> Dict[str, Any]:
         """
         分析字幕内容 - 兼容原有接口
@@ -329,6 +330,8 @@ class SubtitleAnalyzerAdapter:
                     "film_name": film_name or "未命名影视作品",
                     "work_brief": work_brief or "（未提供作品调研，请仅依据字幕分析）",
                     "subtitle_content": subtitle_content,
+                    "vision_scene_notes": vision_scene_notes
+                    or "（未启用视觉拉片，请主要依据字幕分析）",
                 }
             else:
                 parameters = {"subtitle_content": subtitle_content}

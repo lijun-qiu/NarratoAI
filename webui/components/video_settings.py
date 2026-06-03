@@ -113,7 +113,7 @@ def render_video_output_settings(tr):
             "enable_picture_narration": enable_picture_narration,
             "picture_narration_font_size": picture_narration_font_size,
             "picture_narration_color": picture_narration_color,
-            "picture_narration_max_chars": int(base.get("picture_narration_max_chars", 16)),
+            "picture_narration_max_chars": int(base.get("picture_narration_max_chars", 12)),
             "picture_narration_duration": picture_narration_duration,
         }
         st.session_state["video_output_settings"] = settings

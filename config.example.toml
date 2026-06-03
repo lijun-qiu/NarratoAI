@@ -186,10 +186,13 @@ target_duration_percent = 30
 ost1_duration_min = 5
 ost1_duration_max = 12
 ost1_duration_long_max = 12
-ost1_segment_min = 10
-ost1_segment_max = 14
-ost0_segment_min = 12
-ost0_segment_max = 16
+ost1_segment_min = 13
+ost1_segment_max = 18
+ost0_segment_min = 13
+ost0_segment_max = 18
+min_total_segments = 30
+max_total_segments = 36
+picture_chars_max = 12
 original_audio_percent = 48
 narration_percent = 52
 allow_consecutive_ost1 = true
@@ -197,6 +200,18 @@ enforce_narration_after_ost1 = true
 narration_chars_min = 48
 narration_chars_max = 72
 opening_chars_max = 110
+# 视觉模型增强：字幕分析 + 关键帧（使用设置页 vision 模型）
+enable_vision_enrichment = true
+vision_scene_interval_sec = 30
+vision_max_scene_samples = 80
+vision_enrich_picture = true
+vision_enrich_narration = true
+vision_picture_max_items = 30
+vision_segment_max_items = 30
+# 开场白 / 结尾（{work_name} 或 某某某 替换为作品名）
+enable_opening_closing_hook = true
+opening_hook_template = "宝子们，今天咱们一起追《{work_name}》。"
+closing_hook_template = "本集的核心冲突、留下的悬念和下一集的火药桶，就先帮大家梳理到这儿。宝子们，觉得讲清楚了点个赞，咱们下期再见。"
 
 [frames]
     # 提取关键帧的间隔时间（秒）
@@ -241,7 +256,7 @@ opening_chars_max = 110
     enable_picture_narration = true
     picture_narration_font_size = 44
     picture_narration_color = "#FFE066"
-    picture_narration_max_chars = 16
+    picture_narration_max_chars = 12
     picture_narration_duration = 2.0
 
 [transcription]

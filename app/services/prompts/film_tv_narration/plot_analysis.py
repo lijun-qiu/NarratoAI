@@ -17,33 +17,45 @@ class PlotAnalysisPrompt(TextPrompt):
         metadata = PromptMetadata(
             name="plot_analysis",
             category="film_tv_narration",
-            version="v1.3",
-            description="专家级剪辑师视角分析字幕，侧重原声保留时刻",
+            version="v1.4",
+            description="专家级剪辑师视角：字幕 + 视觉拉片交叉分析",
             model_type=ModelType.TEXT,
             output_format=OutputFormat.TEXT,
-            tags=["电影", "电视剧", "影视解说", "剧情分析", "字幕解析"],
-            parameters=["film_name", "work_brief", "subtitle_content"],
+            tags=["电影", "电视剧", "影视解说", "剧情分析", "字幕解析", "视觉拉片"],
+            parameters=["film_name", "work_brief", "subtitle_content", "vision_scene_notes"],
         )
         super().__init__(metadata)
 
         self._system_prompt = (
             "你是一位专家级影视剪辑师兼剧本分析师，拥有十年以上精剪经验。"
-            "你擅长从字幕中识别可长段保留的原声时刻，并为主剪提供结构化剪辑依据。"
+            "你擅长结合字幕对白与视觉拉片观察，识别可长段保留的原声时刻，并为主剪提供结构化剪辑依据。"
+            "字幕与画面冲突时：对白以字幕为准，表情/动作/场景以视觉观察为准。"
             "请严格按照要求的格式输出分析结果。"
         )
 
     def get_template(self) -> str:
         return """# 角色
 你是一位**专家级影视剪辑师**（10 年+ 精剪经验），正在为《${film_name}》制作「原声为主」的解说精剪。
-你已完成作品背景调研，现在需要结合**调研简报**与**实际字幕**，输出可执行的剪辑分析。
+你已完成作品背景调研，现在需要结合**调研简报**、**实际字幕**与**视觉拉片观察**，输出可执行的剪辑分析。
 
 # 作品背景调研（剪辑前必读）
 <work_brief>
 ${work_brief}
 </work_brief>
 
+# 视觉拉片观察（约每 30 秒抽帧，请与字幕交叉验证）
+<vision_scene_notes>
+${vision_scene_notes}
+</vision_scene_notes>
+
+**字幕 × 画面 分析原则：**
+- 台词内容、时间戳 → **以字幕为准**
+- 人物表情、肢体动作、场景氛围、镜头张力 → **以视觉观察补充或修正**
+- 标注「字幕与画面可形成反差/双关」的时刻（适合保留原声或重点解说）
+- 原声保留建议须**同时**考虑台词力度与画面张力，不要只看对白
+
 # 任务
-基于上述调研与下方字幕，完成：
+基于上述调研、字幕与视觉观察，完成：
 
 1. **整体剧情概括**：结合调研修正/补充认知，概括核心主题、人物、冲突（100–200 字）。
 2. **调研 vs 字幕校验**：标注调研中哪些判断被字幕证实、哪些需修正。

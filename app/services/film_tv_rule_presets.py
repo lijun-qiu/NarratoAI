@@ -36,6 +36,9 @@ NUMERIC_SETTING_KEYS = (
     "narration_chars_min",
     "narration_chars_max",
     "opening_chars_max",
+    "max_total_segments",
+    "min_total_segments",
+    "picture_chars_max",
 )
 
 _FAZU2_STYLE_DIRECTIVE = """## 《罚罪2》专项剪辑法则 · 二十年剪辑大师版
@@ -86,7 +89,9 @@ _FAZU2_STYLE_DIRECTIVE = """## 《罚罪2》专项剪辑法则 · 二十年剪�
 - 禁止解说复述刚播完的原台词
 - 禁止 OST=1 只框 1–3 秒单句
 - 禁止全片一种语调念到底（全程严肃或全程吐槽都不合格）
-- `picture` 字段写画面/神情/动作，与解说情绪一致（如「胡队怒目圆睁，一字一句硬刚」）
+- `picture` 字段写**精简**画面旁白（**${picture_chars_max} 字以内**）：承上启下、点明情绪/动作，禁止复述对白、禁止长句堆砌
+- **原声 OST=1 与解说 OST=0 各 ${ost1_segment_min}–${ost1_segment_max} 段**，严禁原声堆段超过 ${ost1_segment_max} 段
+- **总段数硬性上限 ${max_total_segments}**（OST=0+OST=1 合计），超出会导致成片过长，必须控制在范围内
 """
 
 _PRESETS: Dict[str, Dict[str, Any]] = {
@@ -189,10 +194,13 @@ _PRESETS: Dict[str, Dict[str, Any]] = {
             "ost1_duration_min": 5,
             "ost1_duration_max": 12,
             "ost1_duration_long_max": 12,
-            "ost1_segment_min": 10,
-            "ost1_segment_max": 14,
-            "ost0_segment_min": 12,
-            "ost0_segment_max": 16,
+            "ost1_segment_min": 13,
+            "ost1_segment_max": 18,
+            "ost0_segment_min": 13,
+            "ost0_segment_max": 18,
+            "min_total_segments": 30,
+            "max_total_segments": 36,
+            "picture_chars_max": 12,
             "original_audio_percent": 48,
             "narration_percent": 52,
             "allow_consecutive_ost1": True,

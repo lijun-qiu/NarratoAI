@@ -24,10 +24,17 @@ from app.services.llm.migration_adapter import SubtitleAnalyzerAdapter, _run_asy
 from app.services.llm.unified_service import UnifiedLLMService
 from app.services.film_tv_script_optimizer import (
     AUTO_NARRATION_MARKER,
+    apply_opening_closing_hooks,
+    enforce_picture_brevity,
     fill_auto_narration_placeholders,
     optimize_film_tv_script,
     supplement_film_tv_segment_counts,
+    trim_script_to_max_segments,
     validate_film_tv_script_counts,
+)
+from app.services.film_tv_vision_enrichment import (
+    collect_vision_scene_notes,
+    enrich_script_with_vision,
 )
 from webui.tools.generate_short_summary import parse_and_fix_json
 
@@ -195,7 +202,24 @@ def generate_script_film_tv_summary(params, subtitle_path, video_theme, temperat
                 logger.warning(f"作品调研未成功: {brief_result.get('message', 'unknown')}，将继续仅依据字幕分析")
                 work_brief = "（作品调研未完成，请主要依据字幕内容分析）"
 
-            update_progress(35, "正在分析字幕...")
+            vision_scene_notes = ""
+            if film_tv_settings.get("enable_vision_enrichment", True):
+                update_progress(32, "视觉拉片：30 秒一帧，对照字幕...")
+                try:
+                    vision_scene_notes = collect_vision_scene_notes(
+                        video_path=params.video_origin_path,
+                        film_name=film_name,
+                        subtitle_content=subtitle_content,
+                        source_duration_sec=source_duration_sec,
+                        settings=film_tv_settings,
+                        progress_callback=lambda msg: update_progress(34, msg),
+                    )
+                    if vision_scene_notes:
+                        logger.info("视觉拉片完成，将与字幕一并送入剧情分析")
+                except Exception as vision_err:
+                    logger.warning(f"视觉拉片失败，将仅使用字幕分析: {vision_err}")
+
+            update_progress(35, "正在分析字幕（结合视觉拉片）...")
             try:
                 if analyzer is None:
                     analyzer = SubtitleAnalyzerAdapter(
@@ -211,6 +235,7 @@ def generate_script_film_tv_summary(params, subtitle_path, video_theme, temperat
                     subtitle_content,
                     film_name=film_name,
                     work_brief=work_brief,
+                    vision_scene_notes=vision_scene_notes,
                 )
             except Exception as e:
                 logger.warning(f"使用新 LLM 服务失败，回退到旧实现: {str(e)}")
@@ -225,6 +250,7 @@ def generate_script_film_tv_summary(params, subtitle_path, video_theme, temperat
                     prompt_category=PROMPT_CATEGORY,
                     film_name=film_name,
                     work_brief=work_brief,
+                    vision_scene_notes=vision_scene_notes,
                 )
 
             if analysis_result["status"] != "success":
@@ -233,6 +259,8 @@ def generate_script_film_tv_summary(params, subtitle_path, video_theme, temperat
                 st.stop()
 
             logger.info("影视字幕分析成功")
+            plot_analysis = analysis_result["analysis"]
+
             update_progress(60, "专家剪辑师正在生成精剪脚本...")
 
             def _call_generate_narration(plot_analysis: str, gen_temperature=None):
@@ -265,7 +293,6 @@ def generate_script_film_tv_summary(params, subtitle_path, video_theme, temperat
                     work_brief=work_brief,
                 )
 
-            plot_analysis = analysis_result["analysis"]
             narration_result = None
             narration_dict = None
             validation = None
@@ -299,14 +326,39 @@ def generate_script_film_tv_summary(params, subtitle_path, video_theme, temperat
                     break
 
                 if attempt < max_attempts:
+                    fix_parts = []
+                    if validation["ost1_count"] < validation["ost1_min"]:
+                        fix_parts.append(
+                            f"原声 OST=1 仅 {validation['ost1_count']} 段（必须 {validation['ost1_min']}–{validation.get('ost1_max', 16)} 段）"
+                        )
+                    ost1_max = int(validation.get("ost1_max") or 0)
+                    if ost1_max > 0 and validation["ost1_count"] > ost1_max:
+                        fix_parts.append(
+                            f"原声 OST=1 共 {validation['ost1_count']} 段（不得超过 {ost1_max}，请删原声补解说）"
+                        )
+                    if validation["ost0_count"] < validation["ost0_min"]:
+                        fix_parts.append(
+                            f"解说 OST=0 仅 {validation['ost0_count']} 段（必须≥{validation['ost0_min']}）"
+                        )
+                    if validation["total"] < validation["total_min"]:
+                        fix_parts.append(
+                            f"总段数 {validation['total']}（必须≥{validation['total_min']}）"
+                        )
+                    total_max = int(validation.get("total_max") or 0)
+                    if total_max > 0 and validation["total"] > total_max:
+                        fix_parts.append(
+                            f"总段数 {validation['total']}（不得超过 {total_max}，超出会导致成片过长）"
+                        )
+                    fix_detail = "；".join(fix_parts) or validation["message"]
                     plot_analysis = (
                         f"{analysis_result['analysis']}\n\n"
-                        f"【重要修正·第{attempt}次】脚本段数严重不足，当前输出无效。"
-                        f"原声 OST=1 仅 {validation['ost1_count']} 段（必须≥{validation['ost1_min']}），"
-                        f"解说 OST=0 仅 {validation['ost0_count']} 段（必须≥{validation['ost0_min']}），"
-                        f"总段数 {validation['total']}（必须≥{validation['total_min']}）。"
+                        f"【重要修正·第{attempt}次】脚本段数不符合要求，当前输出无效。"
+                        f"{fix_detail}。"
                         f"请输出完整 JSON，OST=0 解说段必须穿插在原声段之间，"
-                        f"至少 {validation['ost0_min']} 段 OST=0、{validation['ost1_min']} 段 OST=1。"
+                        f"总 items {validation.get('total_min', 30)}–{total_max or 36} 段，"
+                        f"原声 OST=1 不超过 {validation.get('ost1_max') or 18} 段，"
+                        f"解说 OST=0 至少 {validation['ost0_min']} 段、原声至少 {validation['ost1_min']} 段。"
+                        f"OST=1 的 picture 旁白每段 {film_tv_settings.get('picture_chars_max', 12)} 字以内，精简承上启下。"
                     )
                 else:
                     narration_dict["items"] = optimized_items
@@ -357,16 +409,50 @@ def generate_script_film_tv_summary(params, subtitle_path, video_theme, temperat
                 st.stop()
 
             if validation and not validation["ok"]:
+                total_max = int(validation.get("total_max") or 0)
+                cap_hint = f"，总段上限 {total_max}" if total_max > 0 else ""
                 st.warning(
                     f"脚本段数仍未完全达标：原声 {validation['ost1_count']}/{validation['ost1_min']} 段，"
                     f"解说 {validation['ost0_count']}/{validation['ost0_min']} 段，"
-                    f"共 {validation['total']}/{validation['total_min']} 段。"
+                    f"共 {validation['total']}/{validation['total_min']} 段{cap_hint}。"
                     f"已自动重试并补段，建议检查补入片段文案或再次生成。"
                 )
             elif supplemented and validation and validation["ok"]:
                 st.info(
                     f"段数已按配置自动补全：原声 {validation['ost1_count']} 段，"
                     f"解说 {validation['ost0_count']} 段（含程序补段，请预览解说文案）。"
+                )
+
+            if film_tv_settings.get("enable_vision_enrichment", True) and (
+                film_tv_settings.get("vision_enrich_picture", True)
+                or film_tv_settings.get("vision_enrich_narration", True)
+            ):
+                update_progress(82, "视觉模型正在对照画面优化旁白...")
+                try:
+                    narration_dict["items"] = enrich_script_with_vision(
+                        video_path=params.video_origin_path,
+                        film_name=film_name,
+                        items=narration_dict["items"],
+                        settings=film_tv_settings,
+                        progress_callback=lambda msg: update_progress(86, msg),
+                    )
+                except Exception as pic_err:
+                    logger.warning(f"视觉旁白优化失败，保留文字模型结果: {pic_err}")
+                narration_dict["items"] = enforce_picture_brevity(
+                    narration_dict["items"], film_tv_settings
+                )
+
+            if film_tv_settings.get("enable_opening_closing_hook", True):
+                narration_dict["items"] = apply_opening_closing_hooks(
+                    narration_dict["items"],
+                    work_name=film_name,
+                    settings=film_tv_settings,
+                )
+                narration_dict["items"] = trim_script_to_max_segments(
+                    narration_dict["items"], film_tv_settings
+                )
+                narration_dict["items"] = enforce_picture_brevity(
+                    narration_dict["items"], film_tv_settings
                 )
 
             script = json.dumps(narration_dict["items"], ensure_ascii=False, indent=2)

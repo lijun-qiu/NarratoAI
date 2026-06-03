@@ -199,6 +199,7 @@ class SubtitleAnalyzer:
         subtitle_content: str,
         film_name: str = "",
         work_brief: str = "",
+        vision_scene_notes: str = "",
     ) -> Dict[str, Any]:
         """
         分析字幕内容
@@ -223,6 +224,8 @@ class SubtitleAnalyzer:
                             "film_name": film_name or "未命名影视作品",
                             "work_brief": work_brief or "（未提供作品调研，请仅依据字幕分析）",
                             "subtitle_content": subtitle_content,
+                            "vision_scene_notes": vision_scene_notes
+                            or "（未启用视觉拉片，请主要依据字幕分析）",
                         },
                     )
                 else:
@@ -802,6 +805,7 @@ def analyze_subtitle(
         prompt_category: str = "short_drama_narration",
         film_name: str = "",
         work_brief: str = "",
+        vision_scene_notes: str = "",
 ) -> Dict[str, Any]:
     """
     分析字幕内容的便捷函数
@@ -834,7 +838,12 @@ def analyze_subtitle(
     logger.debug(f"使用模型: {analyzer.model} 开始分析, 温度: {analyzer.temperature}")
     # 分析字幕
     if subtitle_content:
-        result = analyzer.analyze_subtitle(subtitle_content, film_name=film_name, work_brief=work_brief)
+        result = analyzer.analyze_subtitle(
+            subtitle_content,
+            film_name=film_name,
+            work_brief=work_brief,
+            vision_scene_notes=vision_scene_notes,
+        )
     elif subtitle_file_path:
         result = analyzer.analyze_subtitle_from_file(subtitle_file_path)
     else:

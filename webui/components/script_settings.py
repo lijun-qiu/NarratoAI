@@ -546,6 +546,21 @@ def render_film_tv_rules_settings(tr) -> str:
                 "解说段数最多", 3, 30, _clamp(base["ost0_segment_max"], 3, 30),
                 key="ftv_ost0_segment_max",
             )
+            max_total_segments = st.slider(
+                "总分段上限", 20, 50, _clamp(int(base.get("max_total_segments", 36)), 20, 50),
+                help="OST=0+OST=1 合计，超出会导致成片过长（罚罪2 建议 36）",
+                key="ftv_max_total_segments",
+            )
+            min_total_segments = st.slider(
+                "总分段下限", 20, 50, _clamp(int(base.get("min_total_segments", 30)), 20, 50),
+                help="OST=0+OST=1 合计，低于此值会触发补段（罚罪2 建议 30）",
+                key="ftv_min_total_segments",
+            )
+            picture_chars_max = st.slider(
+                "原声旁白字数上限", 6, 24, _clamp(int(base.get("picture_chars_max", 12)), 6, 24),
+                help="OST=1 原声段左侧 picture 字幕，精简承上启下",
+                key="ftv_picture_chars_max",
+            )
             narration_percent = st.slider(
                 "解说占比目标 (%)", 5, 70, _clamp(base["narration_percent"], 5, 70),
                 key="ftv_narration_percent",
@@ -579,6 +594,80 @@ def render_film_tv_rules_settings(tr) -> str:
             key="ftv_enforce_narration_after_ost1",
         )
 
+        st.markdown("**开场白 / 结尾**")
+        enable_opening_closing_hook = st.checkbox(
+            "启用固定开场白与结尾",
+            value=bool(base.get("enable_opening_closing_hook", True)),
+            key="ftv_enable_opening_closing_hook",
+            help="开启后，首段解说替换为开场白，末段解说替换为结尾（在视觉优化之后写入）",
+        )
+        opening_hook_template = st.text_area(
+            "开场白模板（首段仅短招呼，悬念解说由模型生成）",
+            value=str(base.get("opening_hook_template") or "宝子们，今天咱们一起追《{work_name}》。"),
+            key="ftv_opening_hook_template",
+            disabled=not enable_opening_closing_hook,
+            help="仅作简短招呼，会与首段悬念剧情解说合并；不要写「开看之前先捋主线」类引导",
+            height=68,
+        )
+        closing_hook_template = st.text_area(
+            "结尾模板（末段 OST=0，含本集总结+道别）",
+            value=str(
+                base.get("closing_hook_template")
+                or "本集的核心冲突、留下的悬念和下一集的火药桶，就先帮大家梳理到这儿。宝子们，觉得讲清楚了点个赞，咱们下期再见。"
+            ),
+            key="ftv_closing_hook_template",
+            disabled=not enable_opening_closing_hook,
+            help="会与模型生成的末段总结合并；若已有总结则只补道别",
+            height=80,
+        )
+
+        st.markdown("**视觉模型增强**（字幕 + 关键帧，使用「基础设置」中的 vision 模型）")
+        enable_vision_enrichment = st.checkbox(
+            "启用视觉模型辅助（推荐罚罪2等悬疑剧）",
+            value=bool(base.get("enable_vision_enrichment", True)),
+            key="ftv_enable_vision_enrichment",
+            help="文字模型分析字幕后，视觉模型抽帧补充场面信息，并优化 picture 旁白描述",
+        )
+        if enable_vision_enrichment:
+            vc1, vc2, vc3 = st.columns(3)
+            with vc1:
+                vision_scene_interval_sec = st.slider(
+                    "剧情拉片间隔 (秒)",
+                    15, 120, _clamp(base.get("vision_scene_interval_sec", 30), 15, 120),
+                    key="ftv_vision_scene_interval_sec",
+                    help="剧情分析阶段抽帧间隔，默认 30 秒一帧并对照字幕",
+                )
+            with vc2:
+                vision_max_scene_samples = st.slider(
+                    "剧情拉片最多帧数",
+                    20, 100, _clamp(base.get("vision_max_scene_samples", 80), 20, 100),
+                    key="ftv_vision_max_scene_samples",
+                )
+            with vc3:
+                vision_segment_max_items = st.slider(
+                    "旁白优化最多片段数",
+                    10, 50, _clamp(base.get("vision_segment_max_items", base.get("vision_picture_max_items", 30)), 10, 50),
+                    key="ftv_vision_segment_max_items",
+                )
+            vision_enrich_picture = st.checkbox(
+                "优化原声段 picture 旁白（对照画面）",
+                value=bool(base.get("vision_enrich_picture", True)),
+                key="ftv_vision_enrich_picture",
+            )
+            vision_enrich_narration = st.checkbox(
+                "优化解说段 narration 文案（对照画面，更贴视频）",
+                value=bool(base.get("vision_enrich_narration", True)),
+                key="ftv_vision_enrich_narration",
+            )
+        else:
+            vision_scene_interval_sec = int(base.get("vision_scene_interval_sec", 30))
+            vision_max_scene_samples = int(base.get("vision_max_scene_samples", 80))
+            vision_segment_max_items = int(
+                base.get("vision_segment_max_items", base.get("vision_picture_max_items", 30))
+            )
+            vision_enrich_picture = bool(base.get("vision_enrich_picture", True))
+            vision_enrich_narration = bool(base.get("vision_enrich_narration", True))
+
         if ost1_duration_min > ost1_duration_max:
             st.warning("原声最短时长不能大于最长时长，生成时将自动对调。")
         if ost1_segment_min > ost1_segment_max:
@@ -598,6 +687,9 @@ def render_film_tv_rules_settings(tr) -> str:
             "ost1_segment_max": max(ost1_segment_min, ost1_segment_max),
             "ost0_segment_min": min(ost0_segment_min, ost0_segment_max),
             "ost0_segment_max": max(ost0_segment_min, ost0_segment_max),
+            "max_total_segments": max_total_segments,
+            "min_total_segments": min(min_total_segments, max_total_segments),
+            "picture_chars_max": picture_chars_max,
             "original_audio_percent": original_audio_percent,
             "narration_percent": narration_percent,
             "narration_chars_min": min(narration_chars_min, narration_chars_max),
@@ -605,6 +697,16 @@ def render_film_tv_rules_settings(tr) -> str:
             "opening_chars_max": opening_chars_max,
             "allow_consecutive_ost1": allow_consecutive_ost1,
             "enforce_narration_after_ost1": enforce_narration_after_ost1,
+            "enable_opening_closing_hook": enable_opening_closing_hook,
+            "opening_hook_template": opening_hook_template.strip(),
+            "closing_hook_template": closing_hook_template.strip(),
+            "enable_vision_enrichment": enable_vision_enrichment,
+            "vision_scene_interval_sec": vision_scene_interval_sec,
+            "vision_max_scene_samples": vision_max_scene_samples,
+            "vision_enrich_picture": vision_enrich_picture,
+            "vision_enrich_narration": vision_enrich_narration,
+            "vision_picture_max_items": vision_segment_max_items,
+            "vision_segment_max_items": vision_segment_max_items,
         }
         st.session_state["film_tv_settings"] = settings
 

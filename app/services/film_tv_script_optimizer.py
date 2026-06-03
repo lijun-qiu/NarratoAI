@@ -276,6 +276,17 @@ def count_film_tv_segments(items: List[Dict[str, Any]]) -> Tuple[int, int, int]:
     return ost1, ost0, len(items)
 
 
+def _effective_total_bounds(settings: Dict[str, Any]) -> Tuple[int, int]:
+    """返回 (total_min, total_max)。"""
+    ost1_min = int(settings["ost1_segment_min"])
+    ost0_min = int(settings["ost0_segment_min"])
+    segment_floor = ost1_min + ost0_min
+    configured_floor = int(settings.get("min_total_segments") or 0)
+    total_min = max(segment_floor, configured_floor) if configured_floor > 0 else segment_floor
+    total_max = int(settings.get("max_total_segments") or 0)
+    return total_min, total_max
+
+
 def validate_film_tv_script_counts(
     items: List[Dict[str, Any]],
     settings: Optional[Dict[str, Any]] = None,
@@ -290,15 +301,23 @@ def validate_film_tv_script_counts(
     ost1_count, ost0_count, total = count_film_tv_segments(items)
     ost1_min = int(settings["ost1_segment_min"])
     ost0_min = int(settings["ost0_segment_min"])
-    total_min = ost1_min + ost0_min
+    ost1_max = int(settings.get("ost1_segment_max") or 0)
+    ost0_max = int(settings.get("ost0_segment_max") or 0)
+    total_min, total_max = _effective_total_bounds(settings)
 
     issues: List[str] = []
     if ost1_count < ost1_min:
         issues.append(f"原声 OST=1 仅 {ost1_count} 段，要求至少 {ost1_min} 段")
+    if ost1_max > 0 and ost1_count > ost1_max:
+        issues.append(f"原声 OST=1 共 {ost1_count} 段，不得超过 {ost1_max} 段")
     if ost0_count < ost0_min:
         issues.append(f"解说 OST=0 仅 {ost0_count} 段，要求至少 {ost0_min} 段")
+    if ost0_max > 0 and ost0_count > ost0_max:
+        issues.append(f"解说 OST=0 共 {ost0_count} 段，不得超过 {ost0_max} 段")
     if total < total_min:
-        issues.append(f"总段数 {total}，要求至少 {total_min} 段（{ost1_min}+{ost0_min}）")
+        issues.append(f"总段数 {total}，要求至少 {total_min} 段")
+    if total_max > 0 and total > total_max:
+        issues.append(f"总段数 {total}，超过上限 {total_max} 段（成片会过长，须删段）")
 
     ok = not issues
     message = "段数符合配置要求" if ok else "；".join(issues)
@@ -309,7 +328,10 @@ def validate_film_tv_script_counts(
         "total": total,
         "ost1_min": ost1_min,
         "ost0_min": ost0_min,
+        "ost1_max": ost1_max,
+        "ost0_max": ost0_max,
         "total_min": total_min,
+        "total_max": total_max,
         "message": message,
     }
 
@@ -354,10 +376,281 @@ def _find_timeline_gaps(
     return gaps
 
 
+def _segment_duration_sec(item: Dict[str, Any]) -> float:
+    try:
+        start, end = parse_timestamp_range(item["timestamp"])
+        return max(0.0, end - start)
+    except (ValueError, AttributeError, KeyError):
+        return 0.0
+
+
+def enforce_picture_brevity(
+    items: List[Dict[str, Any]],
+    settings: Optional[Dict[str, Any]] = None,
+) -> List[Dict[str, Any]]:
+    """精简 OST=1 的 picture 旁白字数。"""
+    settings = get_film_tv_settings(settings)
+    max_chars = max(int(settings.get("picture_chars_max") or 12), 4)
+    result: List[Dict[str, Any]] = []
+    for item in items:
+        row = dict(item)
+        picture = str(row.get("picture") or "").strip()
+        if picture and len(picture) > max_chars:
+            row["picture"] = picture[:max_chars]
+        result.append(row)
+    return result
+
+
+def trim_excess_ost1_segments(
+    items: List[Dict[str, Any]],
+    settings: Optional[Dict[str, Any]] = None,
+) -> List[Dict[str, Any]]:
+    """原声段超过上限时，移除最短的原声段，把段数让给解说。"""
+    settings = get_film_tv_settings(settings)
+    ost1_max = int(settings.get("ost1_segment_max") or 0)
+    if ost1_max <= 0:
+        return items
+
+    ordered = sorted([dict(item) for item in items], key=_timestamp_sort_key)
+    removed = 0
+    while sum(1 for item in ordered if int(item.get("OST") or 0) == 1) > ost1_max:
+        candidates = [
+            (idx, item)
+            for idx, item in enumerate(ordered)
+            if int(item.get("OST") or 0) == 1
+        ]
+        if not candidates:
+            break
+        drop_idx = min(candidates, key=lambda pair: _segment_duration_sec(pair[1]))[0]
+        dropped = ordered.pop(drop_idx)
+        removed += 1
+        logger.info(
+            f"原声段超限，移除 OST=1 #{dropped.get('_id')} "
+            f"时长 {_segment_duration_sec(dropped):.1f}s"
+        )
+
+    if removed:
+        logger.info(f"原声段已裁剪 {removed} 段，剩余不超过 {ost1_max} 段上限")
+    return _renumber_items_by_time(ordered)
+
+
+def trim_excess_ost0_segments(
+    items: List[Dict[str, Any]],
+    settings: Optional[Dict[str, Any]] = None,
+) -> List[Dict[str, Any]]:
+    """解说段超过上限时，移除最短解说段（保留首尾开场/结尾）。"""
+    settings = get_film_tv_settings(settings)
+    ost0_max = int(settings.get("ost0_segment_max") or 0)
+    if ost0_max <= 0:
+        return items
+
+    ordered = sorted([dict(item) for item in items], key=_timestamp_sort_key)
+    removed = 0
+    while sum(1 for item in ordered if int(item.get("OST") or 0) == 0) > ost0_max:
+        ost0_positions = [
+            idx for idx, item in enumerate(ordered) if int(item.get("OST") or 0) == 0
+        ]
+        protected = set()
+        if ost0_positions:
+            protected.add(ost0_positions[0])
+            if len(ost0_positions) > 1:
+                protected.add(ost0_positions[-1])
+
+        candidates = [
+            (idx, item)
+            for idx, item in enumerate(ordered)
+            if int(item.get("OST") or 0) == 0 and idx not in protected
+        ]
+        if not candidates:
+            break
+        drop_idx = min(candidates, key=lambda pair: _segment_duration_sec(pair[1]))[0]
+        dropped = ordered.pop(drop_idx)
+        removed += 1
+        logger.info(
+            f"解说段超限，移除 OST=0 #{dropped.get('_id')} "
+            f"时长 {_segment_duration_sec(dropped):.1f}s"
+        )
+
+    if removed:
+        logger.info(f"解说段已裁剪 {removed} 段，剩余不超过 {ost0_max} 段上限")
+    return _renumber_items_by_time(ordered)
+
+
+def trim_script_to_max_segments(
+    items: List[Dict[str, Any]],
+    settings: Optional[Dict[str, Any]] = None,
+) -> List[Dict[str, Any]]:
+    """总段数超过上限时，优先移除最短且非首尾解说的片段。"""
+    settings = get_film_tv_settings(settings)
+    max_total = int(settings.get("max_total_segments") or 0)
+    if max_total <= 0 or len(items) <= max_total:
+        return items
+
+    ordered = sorted([dict(item) for item in items], key=_timestamp_sort_key)
+    removed = 0
+    ost0_min = int(settings.get("ost0_segment_min") or 0)
+    while len(ordered) > max_total:
+        ost0_count = sum(1 for item in ordered if int(item.get("OST") or 0) == 0)
+        ost0_under_min = ost0_min > 0 and ost0_count <= ost0_min
+
+        ost0_positions = [
+            idx for idx, item in enumerate(ordered) if int(item.get("OST") or 0) == 0
+        ]
+        protected = set()
+        if ost0_positions:
+            protected.add(ost0_positions[0])
+            if len(ost0_positions) > 1:
+                protected.add(ost0_positions[-1])
+
+        candidates = [
+            (idx, item)
+            for idx, item in enumerate(ordered)
+            if idx not in protected
+            and not (ost0_under_min and int(item.get("OST") or 0) == 0)
+        ]
+        if not candidates:
+            candidates = [
+                (idx, item) for idx, item in enumerate(ordered) if idx not in protected
+            ]
+        if not candidates:
+            candidates = list(enumerate(ordered))
+
+        drop_idx = min(
+            candidates,
+            key=lambda pair: (
+                _segment_duration_sec(pair[1]),
+                0 if int(pair[1].get("OST") or 0) == 0 else 1,
+            ),
+        )[0]
+        dropped = ordered.pop(drop_idx)
+        removed += 1
+        logger.info(
+            f"段数超限，移除片段 #{dropped.get('_id')} OST={dropped.get('OST')} "
+            f"时长 {_segment_duration_sec(dropped):.1f}s"
+        )
+
+    if removed:
+        logger.info(f"已裁剪 {removed} 段，剩余 {len(ordered)}/{max_total} 段上限内")
+    return _renumber_items_by_time(ordered)
+
+
+def _free_slots_for_ost0(
+    items: List[Dict[str, Any]],
+    slots_needed: int,
+    settings: Optional[Dict[str, Any]] = None,
+) -> List[Dict[str, Any]]:
+    """段数触顶时移除最短原声段，为补入解说段腾出空位。"""
+    settings = get_film_tv_settings(settings)
+    max_total = int(settings.get("max_total_segments") or 0)
+    if max_total <= 0 or slots_needed <= 0:
+        return items
+
+    result = [dict(item) for item in items]
+    removed = 0
+    while len(result) + slots_needed > max_total:
+        candidates = [
+            (idx, item)
+            for idx, item in enumerate(result)
+            if int(item.get("OST") or 0) == 1
+        ]
+        if not candidates:
+            break
+
+        drop_idx = min(candidates, key=lambda pair: _segment_duration_sec(pair[1]))[0]
+        dropped = result.pop(drop_idx)
+        removed += 1
+        logger.info(
+            f"为补解说段腾位，移除 OST=1 #{dropped.get('_id')} "
+            f"时长 {_segment_duration_sec(dropped):.1f}s"
+        )
+
+    if removed:
+        logger.info(f"已移除 {removed} 段原声，腾出 {removed} 个解说段空位")
+    return _renumber_items_by_time(result)
+
+
+def _boost_segments_to_total_min(
+    items: List[Dict[str, Any]],
+    *,
+    subtitle_content: str,
+    source_duration_sec: float,
+    settings: Dict[str, Any],
+) -> List[Dict[str, Any]]:
+    """总段数低于下限时，优先补解说段至达标。"""
+    result = [dict(item) for item in items]
+    start_total = len(result)
+    srt_entries = parse_srt(subtitle_content) if subtitle_content else []
+    picture_chars = int(settings.get("picture_chars_max") or 12)
+    max_total = int(settings.get("max_total_segments") or 0)
+    next_id = max((int(i.get("_id", 0) or 0) for i in result), default=0) + 1
+
+    for _ in range(24):
+        validation = validate_film_tv_script_counts(result, settings)
+        total_need = max(0, validation["total_min"] - validation["total"])
+        if total_need <= 0:
+            break
+        if max_total > 0 and len(result) >= max_total:
+            result = _free_slots_for_ost0(result, min(total_need, 2), settings)
+            if len(result) >= max_total:
+                break
+
+        ost0_need = max(0, validation["ost0_min"] - validation["ost0_count"])
+        ost1_need = max(0, validation["ost1_min"] - validation["ost1_count"])
+        prefer_ost0 = ost0_need > 0 or validation["ost0_count"] <= validation["ost1_count"]
+        ost = 0 if prefer_ost0 else 1
+
+        occupied = _merge_time_ranges(_collect_item_ranges(result))
+        gaps = _find_timeline_gaps(occupied, source_duration_sec, min_gap=6.0)
+        if not gaps:
+            bin_size = source_duration_sec / max(int(settings.get("min_total_segments") or 30), 1)
+            seg_start = (len(result) % 10) * bin_size * 0.1 + bin_size * 0.05
+            seg_end = seg_start + 12.0
+        else:
+            gap_start, gap_end = gaps[0]
+            seg_len = min(14.0, max(10.0, gap_end - gap_start))
+            seg_start = gap_start + max(0.0, (gap_end - gap_start - seg_len) / 2.0)
+            seg_end = seg_start + seg_len
+
+        if ost == 0:
+            result.append(
+                {
+                    "_id": next_id,
+                    "timestamp": format_timestamp_range(seg_start, seg_end),
+                    "picture": _picture_hint_from_subtitle(
+                        srt_entries, seg_start, seg_end, max_chars=picture_chars
+                    ),
+                    "narration": AUTO_NARRATION_MARKER,
+                    "OST": 0,
+                }
+            )
+        else:
+            result.append(
+                {
+                    "_id": next_id,
+                    "timestamp": format_timestamp_range(seg_start, seg_end),
+                    "picture": _picture_hint_from_subtitle(
+                        srt_entries, seg_start, seg_end, max_chars=picture_chars
+                    ),
+                    "narration": f"播放原片{next_id}",
+                    "OST": 1,
+                }
+            )
+        next_id += 1
+
+    boosted = validate_film_tv_script_counts(result, settings)
+    if boosted["total"] > start_total:
+        logger.info(
+            f"总段数补至 {boosted['total']} 段（目标下限 {boosted['total_min']}）"
+        )
+    return _renumber_items_by_time(result)
+
+
 def _picture_hint_from_subtitle(
     srt_entries: list,
     start_sec: float,
     end_sec: float,
+    *,
+    max_chars: int = 12,
 ) -> str:
     if not srt_entries:
         return "剧情过渡"
@@ -369,8 +662,9 @@ def _picture_hint_from_subtitle(
     if not clipped:
         return "剧情过渡"
     text = clipped[0].text.strip().replace("\n", " ")
-    if len(text) > 24:
-        return text[:24]
+    cap = max(int(max_chars or 12), 4)
+    if len(text) > cap:
+        return text[:cap]
     return text or "剧情过渡"
 
 
@@ -453,6 +747,8 @@ def supplement_film_tv_segment_counts(
 
     ost1_min = int(settings["ost1_duration_min"])
     ost1_max = int(settings["ost1_duration_max"])
+    picture_chars = int(settings.get("picture_chars_max") or 12)
+    max_total = int(settings.get("max_total_segments") or 0)
     next_id = max((int(i.get("_id", 0) or 0) for i in result), default=0) + 1
 
     ost1_need = max(0, validation["ost1_min"] - validation["ost1_count"])
@@ -462,6 +758,8 @@ def supplement_film_tv_segment_counts(
         added = 0
         for gap_start, gap_end in gaps:
             if added >= ost1_need:
+                break
+            if max_total > 0 and len(result) >= max_total:
                 break
             gap_cues = [(s, e) for s, e in cues if e > gap_start and s < gap_end]
             if not gap_cues:
@@ -477,7 +775,9 @@ def supplement_film_tv_segment_counts(
                 {
                     "_id": next_id,
                     "timestamp": format_timestamp_range(clip_start, clip_end),
-                    "picture": _picture_hint_from_subtitle(srt_entries, clip_start, clip_end),
+                    "picture": _picture_hint_from_subtitle(
+                        srt_entries, clip_start, clip_end, max_chars=picture_chars
+                    ),
                     "narration": f"播放原片{next_id}",
                     "OST": 1,
                 }
@@ -490,23 +790,32 @@ def supplement_film_tv_segment_counts(
     validation = validate_film_tv_script_counts(result, settings)
     ost0_need = max(0, validation["ost0_min"] - validation["ost0_count"])
     if ost0_need > 0:
+        result = _free_slots_for_ost0(result, ost0_need, settings)
+        validation = validate_film_tv_script_counts(result, settings)
+        ost0_need = max(0, validation["ost0_min"] - validation["ost0_count"])
+
+    if ost0_need > 0:
         occupied = _merge_time_ranges(_collect_item_ranges(result))
-        gaps = _find_timeline_gaps(occupied, source_duration_sec, min_gap=10.0)
+        gaps = _find_timeline_gaps(occupied, source_duration_sec, min_gap=8.0)
         added = 0
         for gap_start, gap_end in gaps:
             if added >= ost0_need:
                 break
+            if max_total > 0 and len(result) >= max_total:
+                break
             available = gap_end - gap_start
-            if available < 10.0:
+            if available < 8.0:
                 continue
-            seg_len = min(15.0, max(12.0, available * 0.8))
+            seg_len = min(15.0, max(10.0, available * 0.8))
             seg_start = gap_start + (available - seg_len) / 2.0
             seg_end = seg_start + seg_len
             result.append(
                 {
                     "_id": next_id,
                     "timestamp": format_timestamp_range(seg_start, seg_end),
-                    "picture": _picture_hint_from_subtitle(srt_entries, seg_start, seg_end),
+                    "picture": _picture_hint_from_subtitle(
+                        srt_entries, seg_start, seg_end, max_chars=picture_chars
+                    ),
                     "narration": AUTO_NARRATION_MARKER,
                     "OST": 0,
                 }
@@ -519,6 +828,11 @@ def supplement_film_tv_segment_counts(
     validation = validate_film_tv_script_counts(result, settings)
     ost0_need = max(0, validation["ost0_min"] - validation["ost0_count"])
     if ost0_need > 0:
+        result = _free_slots_for_ost0(result, ost0_need, settings)
+        validation = validate_film_tv_script_counts(result, settings)
+        ost0_need = max(0, validation["ost0_min"] - validation["ost0_count"])
+
+    if ost0_need > 0:
         occupied = _merge_time_ranges(_collect_item_ranges(result))
         ost0_min_target = int(settings["ost0_segment_min"])
         bin_size = source_duration_sec / max(ost0_min_target, 1)
@@ -530,6 +844,8 @@ def supplement_film_tv_segment_counts(
         added = 0
         for bin_idx in range(ost0_min_target):
             if ost0_need <= 0:
+                break
+            if max_total > 0 and len(result) >= max_total:
                 break
             bin_start = bin_idx * bin_size
             bin_end = min(source_duration_sec, (bin_idx + 1) * bin_size)
@@ -544,7 +860,9 @@ def supplement_film_tv_segment_counts(
                 {
                     "_id": next_id,
                     "timestamp": format_timestamp_range(seg_start, seg_end),
-                    "picture": _picture_hint_from_subtitle(srt_entries, seg_start, seg_end),
+                    "picture": _picture_hint_from_subtitle(
+                        srt_entries, seg_start, seg_end, max_chars=picture_chars
+                    ),
                     "narration": AUTO_NARRATION_MARKER,
                     "OST": 0,
                 }
@@ -557,7 +875,17 @@ def supplement_film_tv_segment_counts(
         if added:
             logger.info(f"自动补入 {added} 段 OST=0 解说（均匀分桶，待填充文案）")
 
+    result = _boost_segments_to_total_min(
+        result,
+        subtitle_content=subtitle_content,
+        source_duration_sec=float(source_duration_sec or 600.0),
+        settings=settings,
+    )
     result = _renumber_items_by_time(result)
+    result = trim_excess_ost1_segments(result, settings)
+    result = trim_excess_ost0_segments(result, settings)
+    result = enforce_picture_brevity(result, settings)
+    result = trim_script_to_max_segments(result, settings)
     validation = validate_film_tv_script_counts(result, settings)
     if not validation["ok"]:
         logger.warning(f"自动补段后仍未达标: {validation['message']}")
@@ -673,8 +1001,144 @@ def optimize_film_tv_script(
     optimized = normalize_ost_types(optimized)
     optimized = finalize_film_tv_playback_order(optimized, settings)
 
+    optimized = trim_excess_ost1_segments(optimized, settings)
+    optimized = trim_excess_ost0_segments(optimized, settings)
+    optimized = enforce_picture_brevity(optimized, settings)
+    optimized = trim_script_to_max_segments(optimized, settings)
+
     validation = validate_film_tv_script_counts(optimized, settings)
     if not validation["ok"]:
         logger.warning(f"影视脚本段数未达标: {validation['message']}")
 
     return optimized
+
+
+DEFAULT_OPENING_HOOK_TEMPLATE = "宝子们，今天咱们一起追《{work_name}》。"
+DEFAULT_CLOSING_HOOK_TEMPLATE = (
+    "本集的核心冲突、留下的悬念和下一集的火药桶，就先帮大家梳理到这儿。"
+    "宝子们，觉得讲清楚了点个赞，咱们下期再见。"
+)
+DEFAULT_CLOSING_FAREWELL = "宝子们，觉得讲清楚了点个赞，咱们下期再见。"
+
+
+def _clamp_narration_text(text: str, max_chars: int) -> str:
+    text = (text or "").strip()
+    if max_chars > 0 and len(text) > max_chars:
+        return text[:max_chars]
+    return text
+
+
+def _merge_opening_narration(hook: str, existing: str, opening_chars_max: int) -> str:
+    """开场：仅补短招呼，主体保留模型写的悬念剧情解说。"""
+    existing = (existing or "").strip()
+    hook = (hook or "").strip()
+    if not hook:
+        return _clamp_narration_text(existing, opening_chars_max)
+    if not existing or existing == AUTO_NARRATION_MARKER:
+        return _clamp_narration_text(hook, opening_chars_max)
+    if hook.rstrip("。") in existing or (
+        existing.startswith("宝子们") and len(existing) >= 24
+    ):
+        return _clamp_narration_text(existing, opening_chars_max)
+    merged = f"{hook.rstrip('。')}。{existing.lstrip('。')}"
+    return _clamp_narration_text(merged, opening_chars_max)
+
+
+def _merge_closing_narration(
+    hook: str,
+    existing: str,
+    *,
+    opening_chars_max: int,
+    narration_chars_max: int,
+) -> str:
+    """结尾：先保留本集总结，再收束到道别，不能只有一句再见。"""
+    existing = (existing or "").strip()
+    hook = (hook or "").strip()
+    limit = max(opening_chars_max, narration_chars_max)
+    if not hook:
+        return _clamp_narration_text(existing, limit)
+    if not existing or existing == AUTO_NARRATION_MARKER:
+        return _clamp_narration_text(hook, limit)
+    if hook in existing:
+        return _clamp_narration_text(existing, limit)
+    has_farewell = any(k in existing for k in ("下期再见", "下期见", "下回见"))
+    has_summary = len(existing) >= 20 and not (has_farewell and len(existing) < 32)
+    if has_summary and not has_farewell:
+        merged = f"{existing.rstrip('。')}。{DEFAULT_CLOSING_FAREWELL}"
+    elif has_summary:
+        merged = existing
+    else:
+        merged = hook
+    return _clamp_narration_text(merged, limit)
+
+
+def format_hook_template(template: str, work_name: str) -> str:
+    """将 {work_name} / 某某某 替换为作品名。"""
+    name = (work_name or "").strip() or "本期内容"
+    text = (template or "").strip()
+    return text.replace("{work_name}", name).replace("某某某", name)
+
+
+def apply_opening_closing_hooks(
+    items: List[Dict[str, Any]],
+    work_name: str,
+    settings: Optional[Dict[str, Any]] = None,
+) -> List[Dict[str, Any]]:
+    """为首尾 OST=0 解说段写入固定开场白与结尾。"""
+    cfg = get_film_tv_settings(settings)
+    if not cfg.get("enable_opening_closing_hook", True):
+        return items
+
+    opening = format_hook_template(
+        str(cfg.get("opening_hook_template") or DEFAULT_OPENING_HOOK_TEMPLATE),
+        work_name,
+    )
+    closing = format_hook_template(
+        str(cfg.get("closing_hook_template") or DEFAULT_CLOSING_HOOK_TEMPLATE),
+        work_name,
+    )
+    opening_chars_max = int(cfg.get("opening_chars_max") or 110)
+    narration_chars_max = int(cfg.get("narration_chars_max") or 72)
+    if not opening and not closing:
+        return items
+
+    updated = [dict(item) for item in items]
+    ost0_indices = sorted(
+        (i for i, item in enumerate(updated) if int(item.get("OST") or 0) == 0),
+        key=lambda i: _timestamp_sort_key(updated[i]),
+    )
+    if not ost0_indices:
+        return items
+
+    first_idx = ost0_indices[0]
+    last_idx = ost0_indices[-1]
+    merged_opening = ""
+
+    if opening:
+        merged_opening = _merge_opening_narration(
+            opening,
+            str(updated[first_idx].get("narration") or ""),
+            opening_chars_max,
+        )
+        updated[first_idx]["narration"] = merged_opening
+        logger.info(f"已应用开场白（悬念解说）: {merged_opening[:60]}...")
+
+    if closing:
+        if first_idx == last_idx and opening:
+            merged_closing = _merge_closing_narration(
+                closing,
+                merged_opening,
+                opening_chars_max=opening_chars_max,
+                narration_chars_max=narration_chars_max,
+            )
+        else:
+            merged_closing = _merge_closing_narration(
+                closing,
+                str(updated[last_idx].get("narration") or ""),
+                opening_chars_max=opening_chars_max,
+                narration_chars_max=narration_chars_max,
+            )
+        updated[last_idx]["narration"] = merged_closing
+        logger.info(f"已应用结尾（含本集总结）: {merged_closing[:60]}...")
+
+    return updated

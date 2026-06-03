@@ -27,10 +27,13 @@ FILM_TV_DEFAULTS: Dict[str, Any] = {
     "ost1_duration_min": 5,
     "ost1_duration_max": 12,
     "ost1_duration_long_max": 12,
-    "ost1_segment_min": 10,
-    "ost1_segment_max": 14,
-    "ost0_segment_min": 12,
-    "ost0_segment_max": 16,
+    "ost1_segment_min": 13,
+    "ost1_segment_max": 18,
+    "ost0_segment_min": 13,
+    "ost0_segment_max": 18,
+    "min_total_segments": 30,
+    "max_total_segments": 36,
+    "picture_chars_max": 12,
     "original_audio_percent": 48,
     "narration_percent": 52,
     "allow_consecutive_ost1": True,
@@ -38,6 +41,21 @@ FILM_TV_DEFAULTS: Dict[str, Any] = {
     "narration_chars_min": 48,
     "narration_chars_max": 72,
     "opening_chars_max": 110,
+    # 视觉模型增强（字幕 + 关键帧）
+    "enable_vision_enrichment": True,
+    "vision_scene_interval_sec": 30,
+    "vision_max_scene_samples": 80,
+    "vision_enrich_picture": True,
+    "vision_enrich_narration": True,
+    "vision_picture_max_items": 30,
+    "vision_segment_max_items": 30,
+    # 开场白 / 结尾固定话术
+    "enable_opening_closing_hook": True,
+    "opening_hook_template": "宝子们，今天咱们一起追《{work_name}》。",
+    "closing_hook_template": (
+        "本集的核心冲突、留下的悬念和下一集的火药桶，就先帮大家梳理到这儿。"
+        "宝子们，觉得讲清楚了点个赞，咱们下期再见。"
+    ),
 }
 
 
@@ -46,8 +64,8 @@ def _config_file_path() -> str:
     return os.path.join(root, "config.toml")
 
 
-def _load_film_tv_from_config() -> Dict[str, Any]:
-    settings = deepcopy(FILM_TV_DEFAULTS)
+def _read_film_tv_config_section() -> Dict[str, Any]:
+    """仅读取 config.toml 中 [film_tv] 已显式配置的项。"""
     try:
         from app.config.config import _cfg
         film_tv = _cfg.get("film_tv", {})
@@ -56,24 +74,40 @@ def _load_film_tv_from_config() -> Dict[str, Any]:
             film_tv = toml.load(_config_file_path()).get("film_tv", {})
         except Exception:
             film_tv = {}
+    return dict(film_tv) if isinstance(film_tv, dict) else {}
 
-    for key in FILM_TV_DEFAULTS:
-        if key in film_tv:
-            settings[key] = film_tv[key]
+
+def _load_film_tv_from_config() -> Dict[str, Any]:
+    """兼容旧调用：默认 + config 覆盖（不含方案预设）。"""
+    settings = deepcopy(FILM_TV_DEFAULTS)
+    for key, value in _read_film_tv_config_section().items():
+        if key in FILM_TV_DEFAULTS:
+            settings[key] = value
     return settings
 
 
 def get_film_tv_settings(overrides: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
-    """合并 config.toml、方案预设与页面微调。"""
-    settings = _load_film_tv_from_config()
-    preset_id = (overrides or {}).get("preset_id") or settings.get("preset_id") or DEFAULT_PRESET_ID
-    settings = apply_preset_to_settings(settings, preset_id)
+    """合并方案预设、config.toml 与页面微调（config 优先于预设）。"""
+    config_layer = _read_film_tv_config_section()
+    preset_id = (
+        (overrides or {}).get("preset_id")
+        or config_layer.get("preset_id")
+        or FILM_TV_DEFAULTS.get("preset_id")
+        or DEFAULT_PRESET_ID
+    )
+    settings = apply_preset_to_settings(deepcopy(FILM_TV_DEFAULTS), preset_id)
+    for key, value in config_layer.items():
+        if key in FILM_TV_DEFAULTS:
+            settings[key] = value
     if overrides:
         for key, value in overrides.items():
             if value is not None and key in FILM_TV_DEFAULTS:
                 settings[key] = value
             elif key == "preset_id" and value:
                 settings = apply_preset_to_settings(settings, value)
+                for ck, cv in config_layer.items():
+                    if ck in FILM_TV_DEFAULTS and ck != "preset_id":
+                        settings[ck] = cv
     return settings
 
 
@@ -101,7 +135,16 @@ def get_film_tv_script_prompt_params(
         "ost1_segment_max": str(cfg["ost1_segment_max"]),
         "ost0_segment_min": str(cfg["ost0_segment_min"]),
         "ost0_segment_max": str(cfg["ost0_segment_max"]),
-        "total_segment_min": str(int(cfg["ost1_segment_min"]) + int(cfg["ost0_segment_min"])),
+        "total_segment_min": str(
+            max(
+                int(cfg["ost1_segment_min"]) + int(cfg["ost0_segment_min"]),
+                int(cfg.get("min_total_segments") or 0),
+            )
+        ),
+        "min_total_segments": str(int(cfg.get("min_total_segments") or 30)),
+        "total_segment_max": str(int(cfg.get("max_total_segments") or 36)),
+        "max_total_segments": str(int(cfg.get("max_total_segments") or 36)),
+        "picture_chars_max": str(int(cfg.get("picture_chars_max") or 12)),
         "original_audio_percent": str(int(cfg["original_audio_percent"])),
         "narration_percent": str(int(cfg["narration_percent"])),
         "narration_chars_min": str(int(cfg["narration_chars_min"])),
@@ -118,6 +161,9 @@ def get_film_tv_script_prompt_params(
                 "ost1_segment_max": str(int(cfg["ost1_segment_max"])),
                 "ost0_segment_min": str(int(cfg["ost0_segment_min"])),
                 "ost0_segment_max": str(int(cfg["ost0_segment_max"])),
+                "max_total_segments": str(int(cfg.get("max_total_segments") or 36)),
+                "min_total_segments": str(int(cfg.get("min_total_segments") or 30)),
+                "picture_chars_max": str(int(cfg.get("picture_chars_max") or 12)),
                 "narration_chars_min": str(int(cfg["narration_chars_min"])),
                 "narration_chars_max": str(int(cfg["narration_chars_max"])),
                 "opening_chars_max": str(int(cfg["opening_chars_max"])),

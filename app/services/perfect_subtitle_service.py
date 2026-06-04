@@ -170,7 +170,7 @@ def _build_ost1_entries(
     if settings.get("ost1_from_source_srt", True) and source_entries:
         local_entries = extract_entries_in_range(source_entries, clip_start_ms, clip_end_ms)
         for entry in local_entries:
-            entry.label = label
+            entry.label = "original"
 
     if not local_entries and settings.get("ost1_asr_fallback", True):
         media_path = segment.get("video") or segment.get("audio")
@@ -185,7 +185,7 @@ def _build_ost1_entries(
                     max_duration=float(settings.get("max_duration", 4.0)),
                 )
                 for entry in local_entries:
-                    entry.label = label
+                    entry.label = "original"
             except Exception as exc:
                 logger.warning(f"OST=1 片段 #{segment_id} ASR 回退失败: {exc}")
 
@@ -193,6 +193,11 @@ def _build_ost1_entries(
     if video_ms > 0 and local_entries:
         local_entries = _align_segment_subtitle_entries(local_entries, segment)
 
+    display_prefix = label.strip()
+    if display_prefix:
+        for entry in local_entries:
+            if display_prefix not in entry.text:
+                entry.text = f"{display_prefix}{entry.text}"
     return offset_entries(local_entries, _edited_offset_ms(segment))
 
 
@@ -203,7 +208,7 @@ def _build_narration_entries(
     settings: dict[str, Any],
 ) -> list[SrtEntry]:
     segment_id = segment.get("_id", "unknown")
-    label = str(settings.get("narration_label") or "")
+    display_label = str(settings.get("narration_label") or "").strip()
     duration_ms = _segment_duration_ms(segment)
     local_entries: list[SrtEntry] = []
 
@@ -236,7 +241,7 @@ def _build_narration_entries(
                 narration,
                 duration_ms,
                 max_chars=int(settings.get("max_chars", 18)),
-                label=label,
+                label="narration",
             )
 
     video_ms = _segment_video_duration_ms(segment)
@@ -245,8 +250,9 @@ def _build_narration_entries(
         local_entries = _align_segment_subtitle_entries(local_entries, segment)
 
     for entry in local_entries:
-        if label and not entry.label:
-            entry.label = label
+        entry.label = entry.label or "narration"
+        if display_label and display_label not in entry.text:
+            entry.text = f"{display_label}{entry.text}"
     return offset_entries(local_entries, _edited_offset_ms(segment))
 
 

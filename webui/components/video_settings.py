@@ -98,6 +98,13 @@ def render_video_output_settings(tr):
                 key="vo_picture_narration_color",
             )
 
+        original_subtitle_color = st.color_picker(
+            "原声主字幕颜色",
+            value=str(base.get("original_subtitle_color", "#FFE066")),
+            help="OST=1 原片播放时的对白/转写字幕颜色（与白色解说字幕区分）",
+            key="vo_original_subtitle_color",
+        )
+
         picture_narration_duration = st.slider(
             "旁白字幕停留时长（秒）",
             min_value=1.0,
@@ -113,6 +120,7 @@ def render_video_output_settings(tr):
             "enable_picture_narration": enable_picture_narration,
             "picture_narration_font_size": picture_narration_font_size,
             "picture_narration_color": picture_narration_color,
+            "original_subtitle_color": original_subtitle_color,
             "picture_narration_max_chars": int(base.get("picture_narration_max_chars", 12)),
             "picture_narration_duration": picture_narration_duration,
         }

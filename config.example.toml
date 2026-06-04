@@ -215,13 +215,32 @@ closing_hook_template = "本集的核心冲突、留下的悬念和下一集的�
 
 [frames]
     # 提取关键帧的间隔时间（秒）
-    frame_interval_input = 3
+    frame_interval_input = 2
 
     # 大模型单次处理的关键帧数量
     vision_batch_size = 10
 
     # 视觉批处理最大并发批次数（OpenAI 兼容 provider）
     vision_max_concurrency = 2
+
+[documentary]
+    # 逐帧解说：在爆燃/恐怖/尖叫等关键场面自动插入 OST=1 纯原声段
+    enable_original_audio_highlights = true
+    ost1_duration_min = 4
+    ost1_duration_max = 12
+    max_ost1_segments = 6
+    default_narration_ost = 2
+    # 解说风格：幽默风趣、动作表情修饰、上下文物料预判、反常理吐槽
+    enable_humor_narration = true
+    context_window_sec = 30
+    enable_action_expression_modifiers = true
+    enable_logic_roast = true
+    # 全片覆盖：尽量不漏段；每 coverage_interval_sec 秒至少一段解说
+    enable_full_timeline_coverage = true
+    coverage_interval_sec = 30
+    narration_chars_min = 20
+    narration_chars_max = 40
+    default_custom_prompt = "尽量覆盖全片时间线，每 30 秒至少一段解说，不要大段跳过。"
 
 ##########################################
 # 完美字幕（影视解说：解说 + 原声双轨）
@@ -258,6 +277,8 @@ closing_hook_template = "本集的核心冲突、留下的悬念和下一集的�
     picture_narration_color = "#FFE066"
     picture_narration_max_chars = 12
     picture_narration_duration = 2.0
+    # OST=1 原片播放时的主字幕颜色（对白/ASR 转写，与白色解说字幕区分）
+    original_subtitle_color = "#FFE066"
 
 [transcription]
     enable_fallback = true

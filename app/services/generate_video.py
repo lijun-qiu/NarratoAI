@@ -30,7 +30,7 @@ from app.utils import utils
 from app.models.schema import AudioVolumeDefaults, VideoAspect
 from app.services.audio_normalizer import AudioNormalizer, normalize_audio_for_mixing
 from app.services.update_script import probe_media_duration
-from app.services.srt_utils import strip_subtitle_punctuation
+from app.services.srt_utils import decode_subtitle_track_label, parse_srt_file, strip_subtitle_punctuation
 
 
 def _is_landscape_video(video_width: float, video_height: float, video_aspect: Any = None) -> bool:
@@ -147,8 +147,22 @@ def _parse_subtitle_style_options(options: Optional[Dict[str, Any]] = None) -> D
         "stroke_width": _to_int(options.get("stroke_width", 1), 1),
         "picture_narration_font_size": _to_int(options.get("picture_narration_font_size", 44), 44),
         "picture_narration_color": options.get("picture_narration_color", "#FFE066"),
+        "original_subtitle_color": options.get("original_subtitle_color", "#FFE066"),
         "video_aspect": options.get("video_aspect"),
     }
+
+
+def _resolve_subtitle_clip_color(
+    *,
+    track_label: str,
+    position_mode: str,
+    style: Dict[str, Any],
+) -> str:
+    if position_mode == "picture_narration":
+        return style["picture_narration_color"]
+    if track_label in ("original", "原声"):
+        return style.get("original_subtitle_color", "#FFE066")
+    return style["subtitle_color"]
 
 
 def _position_subtitle_clip(
@@ -189,12 +203,20 @@ def _create_timed_subtitle_clip(
     style: Dict[str, Any],
     position_mode: str = "default",
     is_landscape: bool = False,
+    track_label: str = "",
 ):
-    phrase = strip_subtitle_punctuation(subtitle_item[1])
+    raw_phrase = subtitle_item[1]
+    decoded_label, phrase_body = decode_subtitle_track_label(raw_phrase)
+    effective_track = track_label or decoded_label
+    phrase = strip_subtitle_punctuation(phrase_body)
     if not phrase:
         return None
     font_size = style["subtitle_font_size"]
-    color = style["subtitle_color"]
+    color = _resolve_subtitle_clip_color(
+        track_label=effective_track,
+        position_mode=position_mode,
+        style=style,
+    )
     max_width_ratio = 0.9
     clip_stroke_color = style["stroke_color"]
     clip_stroke_width = style["stroke_width"]
@@ -202,7 +224,11 @@ def _create_timed_subtitle_clip(
 
     if position_mode == "picture_narration":
         font_size = style["picture_narration_font_size"]
-        color = style["picture_narration_color"]
+        color = _resolve_subtitle_clip_color(
+            track_label=effective_track or "picture_narration",
+            position_mode=position_mode,
+            style=style,
+        )
         max_width_ratio = 0.42 if is_landscape else 0.45
         clip_stroke_color = "#000000"
         clip_stroke_width = max(2, style["stroke_width"])
@@ -266,37 +292,30 @@ def load_subtitle_overlay_clips(
     font_path = _resolve_subtitle_font_path(style["subtitle_font"])
     is_landscape = _is_landscape_video(video_width, video_height, style.get("video_aspect"))
 
-    def make_textclip(text):
-        return TextClip(
-            text=text,
-            font=font_path,
-            font_size=style["subtitle_font_size"],
-            color=style["subtitle_color"],
-        )
-
+    entries = parse_srt_file(subtitle_path)
+    clips = []
     try:
-        sub = SubtitlesClip(
-            subtitles=subtitle_path,
-            encoding="utf-8",
-            make_textclip=make_textclip,
-        )
-        clips = []
-        for item in sub.subtitles:
+        for entry in entries:
+            start = entry.start_ms / 1000.0
+            end = entry.end_ms / 1000.0
+            if end <= start:
+                continue
             clip = _create_timed_subtitle_clip(
-                item,
+                ((start, end), entry.text),
                 video_width=video_width,
                 video_height=video_height,
                 font_path=font_path,
                 style=style,
                 position_mode=position_mode,
                 is_landscape=is_landscape,
+                track_label=entry.label,
             )
             if clip is not None:
                 clips.append(clip)
-        return clips
     except Exception as e:
         logger.error(f"处理字幕失败 ({subtitle_path}): \n{traceback.format_exc()}")
         return []
+    return clips
 
 
 def merge_materials(
@@ -362,6 +381,7 @@ def merge_materials(
     picture_narration_enabled = options.get('enable_picture_narration', False)
     picture_narration_font_size = options.get('picture_narration_font_size', 44)
     picture_narration_color = options.get('picture_narration_color', '#FFE066')
+    original_subtitle_color = options.get('original_subtitle_color', '#FFE066')
     video_aspect = options.get('video_aspect')
 
     # 配置日志 - 便于调试问题
@@ -548,6 +568,7 @@ def merge_materials(
         "stroke_width": stroke_width,
         "picture_narration_font_size": picture_narration_font_size,
         "picture_narration_color": picture_narration_color,
+        "original_subtitle_color": original_subtitle_color,
         "video_aspect": video_aspect,
     }
 

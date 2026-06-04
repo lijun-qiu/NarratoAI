@@ -17,6 +17,36 @@ _TIME_LINE_RE = re.compile(
     r"(\d{2}:\d{2}:\d{2}[,.]\d{3})\s*-->\s*(\d{2}:\d{2}:\d{2}[,.]\d{3})"
 )
 
+# 字幕轨道标记（写入 SRT 时使用私有区字符，烧录前解码）
+SUBTITLE_TRACK_ORIGINAL = "original"
+SUBTITLE_TRACK_NARRATION = "narration"
+SUBTITLE_TRACK_PICTURE = "picture_narration"
+_SUBTITLE_TRACK_MARKER = "\uE000"
+
+
+def encode_subtitle_track_label(label: str, text: str) -> str:
+    """Encode subtitle track type into SRT text for later color routing."""
+    track = (label or "").strip()
+    cleaned = clean_subtitle_dialogue_text(text)
+    if track in (SUBTITLE_TRACK_ORIGINAL, "原声", SUBTITLE_TRACK_PICTURE):
+        if track == "原声":
+            track = SUBTITLE_TRACK_ORIGINAL
+        return f"{_SUBTITLE_TRACK_MARKER}{track}{_SUBTITLE_TRACK_MARKER}{cleaned}"
+    return cleaned
+
+
+def decode_subtitle_track_label(text: str) -> tuple[str, str]:
+    """Return (track_label, visible_text)."""
+    raw = (text or "").strip()
+    if raw.startswith(_SUBTITLE_TRACK_MARKER):
+        end = raw.find(_SUBTITLE_TRACK_MARKER, len(_SUBTITLE_TRACK_MARKER))
+        if end > 0:
+            track = raw[len(_SUBTITLE_TRACK_MARKER) : end]
+            visible = raw[end + len(_SUBTITLE_TRACK_MARKER) :]
+            return track, clean_subtitle_dialogue_text(visible)
+    return "", clean_subtitle_dialogue_text(raw)
+
+
 # 去掉说话人/角色前缀，只保留对白正文
 _SPEAKER_PREFIX_PATTERNS = (
     re.compile(r"^说话人\s*\d+\s*[:：]\s*"),
@@ -86,10 +116,11 @@ def parse_srt(content: str) -> list[SrtEntry]:
         start_ms = _time_str_to_ms(match.group(1))
         end_ms = _time_str_to_ms(match.group(2))
         text_lines = lines[time_line_idx + 1 :]
-        text = clean_subtitle_dialogue_text("\n".join(text_lines).strip())
+        raw_text = "\n".join(text_lines).strip()
+        track_label, text = decode_subtitle_track_label(raw_text)
         if not text:
             continue
-        entries.append(SrtEntry(start_ms=start_ms, end_ms=end_ms, text=text))
+        entries.append(SrtEntry(start_ms=start_ms, end_ms=end_ms, text=text, label=track_label))
     return entries
 
 
@@ -104,7 +135,7 @@ def entries_to_srt(entries: Iterable[SrtEntry]) -> str:
     lines: list[str] = []
     output_index = 0
     for entry in entries:
-        text = clean_subtitle_dialogue_text(entry.text)
+        text = encode_subtitle_track_label(entry.label, entry.text)
         if not text:
             continue
         output_index += 1

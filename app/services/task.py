@@ -141,6 +141,7 @@ def _build_merge_video_options(
         'picture_narration_path': picture_narration_path,
         'picture_narration_font_size': int(video_output.get('picture_narration_font_size', 44)),
         'picture_narration_color': video_output.get('picture_narration_color', '#FFE066'),
+        'original_subtitle_color': video_output.get('original_subtitle_color', '#FFE066'),
         'video_aspect': getattr(params, 'video_aspect', None),
     }
 

@@ -19,6 +19,8 @@ VIDEO_OUTPUT_DEFAULTS: Dict[str, Any] = {
     "picture_narration_color": "#FFE066",
     "picture_narration_max_chars": 12,
     "picture_narration_duration": 2.0,
+    # 原声段（OST=1）主字幕颜色，与白色解说字幕区分
+    "original_subtitle_color": "#FFE066",
 }
 
 

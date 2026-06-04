@@ -383,7 +383,7 @@ def render_video_details(tr):
         st.number_input(
             tr("Frame Interval (seconds)"),
             min_value=0,
-            value=st.session_state.get('frame_interval_input', config.frames.get('frame_interval_input', 3)),
+            value=st.session_state.get('frame_interval_input', config.frames.get('frame_interval_input', 2)),
             help=tr("Frame Interval (seconds) (More keyframes consume more tokens)"),
             key="frame_interval_input"
         )

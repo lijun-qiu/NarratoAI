@@ -8,6 +8,15 @@ from typing import Any, Callable
 from loguru import logger
 
 from app.config import config
+from app.services.documentary.documentary_script_optimizer import finalize_documentary_script_items
+from app.services.documentary.documentary_settings import (
+    build_coverage_instructions,
+    build_frame_highlight_hint,
+    build_narration_style_instructions,
+    build_ost_instructions,
+    get_documentary_settings,
+    resolve_documentary_custom_prompt,
+)
 from app.services.documentary.frame_analysis_models import FrameBatchResult
 from app.services.generate_narration_script import generate_narration, parse_frame_analysis_to_markdown
 from app.services.llm.migration_adapter import create_vision_analyzer
@@ -17,7 +26,7 @@ from app.utils import utils, video_processor
 class DocumentaryFrameAnalysisService:
     PROMPT_TEMPLATE = """
 我提供了 {frame_count} 张视频帧，它们按时间顺序排列，代表一个连续的视频片段。
-首先，请详细描述每一帧的关键视觉信息（包含：主要内容、人物、动作和场景）。
+首先，请详细描述每一帧的关键视觉信息（包含：主要内容、人物、动作、表情、肢体细节和场景氛围）。
 然后，基于所有帧的分析，请用简洁的语言总结整个视频片段中发生的主要活动或事件流程。
 请务必使用 JSON 格式输出。
 JSON 必须包含以下键：
@@ -26,7 +35,7 @@ JSON 必须包含以下键：
 示例结构：
 {{
   "frame_observations": [
-    {{"timestamp": "00:00:00,000", "observation": "画面描述"}}
+    {{"timestamp": "00:00:00,000", "observation": "画面描述（含动作/表情修饰）"}}
   ],
   "overall_activity_summary": "本批次主要活动总结"
 }}
@@ -77,10 +86,12 @@ JSON 必须包含以下键：
             )
 
         markdown_output = parse_frame_analysis_to_markdown(analysis_json_path)
+        doc_settings = get_documentary_settings()
         narration_input = self._build_narration_input(
             markdown_output=markdown_output,
             video_theme=video_theme,
             custom_prompt=custom_prompt,
+            documentary_settings=doc_settings,
         )
         narration_raw = generate_narration(
             narration_input,
@@ -89,8 +100,8 @@ JSON 必须包含以下键：
             model=text_model,
         )
         narration_items = self._parse_narration_items(narration_raw)
-
-        final_script = [{**item, "OST": 2} for item in narration_items]
+        doc_settings = get_documentary_settings()
+        final_script = finalize_documentary_script_items(narration_items, doc_settings)
         progress(100, "脚本生成完成")
         return final_script
 
@@ -192,18 +203,40 @@ JSON 必须包含以下键：
 
         return items
 
-    def _build_narration_input(self, *, markdown_output: str, video_theme: str, custom_prompt: str) -> str:
+    def _build_narration_input(
+        self,
+        *,
+        markdown_output: str,
+        video_theme: str,
+        custom_prompt: str,
+        documentary_settings: dict | None = None,
+    ) -> str:
+        cfg = documentary_settings or get_documentary_settings()
+        sections = [markdown_output.rstrip()]
+
         context_lines: list[str] = []
         if (video_theme or "").strip():
             context_lines.append(f"视频主题：{video_theme.strip()}")
-        if (custom_prompt or "").strip():
-            context_lines.append(f"补充创作要求：{custom_prompt.strip()}")
+        merged_prompt = resolve_documentary_custom_prompt(custom_prompt, cfg)
+        if merged_prompt:
+            context_lines.append(f"补充创作要求：{merged_prompt}")
+        if context_lines:
+            context_block = "\n".join(f"- {line}" for line in context_lines)
+            sections.append(f"## 创作上下文\n{context_block}")
 
-        if not context_lines:
-            return markdown_output
+        coverage_block = build_coverage_instructions(cfg).strip()
+        if coverage_block:
+            sections.append(coverage_block)
 
-        context_block = "\n".join(f"- {line}" for line in context_lines)
-        return f"{markdown_output.rstrip()}\n\n## 创作上下文\n{context_block}\n"
+        ost_block = build_ost_instructions(cfg).strip()
+        if ost_block:
+            sections.append(ost_block)
+
+        style_block = build_narration_style_instructions(cfg).strip()
+        if style_block:
+            sections.append(style_block)
+
+        return "\n\n".join(sections) + "\n"
 
     def _repair_narration_payload(self, narration_raw: str) -> dict[str, Any] | None:
         def load_json_candidate(payload: str) -> dict[str, Any] | None:
@@ -253,7 +286,7 @@ JSON 必须包含以下键：
     def _resolve_frame_interval(self, frame_interval_input: int | float | None) -> float:
         interval = frame_interval_input
         if interval in (None, ""):
-            interval = config.frames.get("frame_interval_input", 3)
+            interval = config.frames.get("frame_interval_input", 2)
         try:
             value = float(interval)
         except (TypeError, ValueError):
@@ -412,6 +445,9 @@ JSON 必须包含以下键：
     def _build_batch_prompt(self, *, frame_count: int, video_theme: str, custom_prompt: str) -> str:
         prompt = self._build_analysis_prompt(frame_count=frame_count)
         extra_lines: list[str] = []
+        highlight_hint = build_frame_highlight_hint()
+        if highlight_hint:
+            extra_lines.append(highlight_hint)
         if (video_theme or "").strip():
             extra_lines.append(f"视频主题：{video_theme.strip()}")
         if (custom_prompt or "").strip():

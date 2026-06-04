@@ -131,15 +131,19 @@ class DocumentaryFrameAnalysisServiceScriptGenerationTests(unittest.IsolatedAsyn
                 },
             ), patch(
                 "app.services.documentary.frame_analysis_service.generate_narration",
-                return_value='{"items":[{"timestamp":"00:00:00,000-00:00:03,000","picture":"镜头里有一只猫","narration":"一只猫警觉地望向镜头。"}]}',
+                return_value=(
+                    '{"items":[{"_id":1,"timestamp":"00:00:00,000-00:00:08,000",'
+                    '"picture":"镜头里有一只猫","narration":"一只猫警觉地望向镜头。","OST":2},'
+                    '{"_id":2,"timestamp":"00:00:18,000-00:00:26,000",'
+                    '"picture":"爆炸火光","narration":"播放原片1","OST":1}]}'
+                ),
             ):
                 result = await service.generate_documentary_script(video_path="demo.mp4")
 
-        self.assertEqual(1, len(result))
-        self.assertEqual("00:00:00,000-00:00:03,000", result[0]["timestamp"])
-        self.assertEqual("镜头里有一只猫", result[0]["picture"])
-        self.assertEqual("一只猫警觉地望向镜头。", result[0]["narration"])
+        self.assertEqual(2, len(result))
         self.assertEqual(2, result[0]["OST"])
+        self.assertEqual(1, result[1]["OST"])
+        self.assertEqual("播放原片1", result[1]["narration"])
 
     async def test_generate_documentary_script_raises_when_narration_json_is_malformed(self):
         service = DocumentaryFrameAnalysisService()
@@ -262,7 +266,12 @@ class DocumentaryFrameAnalysisServiceScriptGenerationTests(unittest.IsolatedAsyn
         narration_input = mocked_generate.call_args.args[0]
         self.assertIn("## 创作上下文", narration_input)
         self.assertIn("视频主题：野生动物纪录片", narration_input)
-        self.assertIn("补充创作要求：重点描述危险信号", narration_input)
+        self.assertIn("重点描述危险信号", narration_input)
+        self.assertIn("尽量覆盖全片时间线", narration_input)
+        self.assertIn("## 音频模式", narration_input)
+        self.assertIn("## 解说风格", narration_input)
+        self.assertIn("## 全片覆盖", narration_input)
+        self.assertIn("20", narration_input)
 
     async def test_analyze_video_forwards_explicit_empty_base_url_without_config_fallback(self):
         service = DocumentaryFrameAnalysisService()

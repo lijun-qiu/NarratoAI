@@ -5,12 +5,21 @@
 
 from __future__ import annotations
 
+import re
 from typing import Any, Dict, List, Optional
 
 from loguru import logger
 
-from app.services.documentary.documentary_settings import get_documentary_settings
+from app.services.documentary.documentary_settings import (
+    FAZU2_FORBIDDEN_NARRATION_PHRASES,
+    compute_max_ost1_segments,
+    get_documentary_compact_settings,
+    get_documentary_settings,
+    is_compact_documentary_settings,
+    is_fazu2_compact_settings,
+)
 from app.services.srt_utils import parse_timestamp_range
+from app.utils import utils
 
 
 def _segment_duration_sec(timestamp: str) -> float:
@@ -18,6 +27,245 @@ def _segment_duration_sec(timestamp: str) -> float:
     if end_ms <= start_ms:
         return 0.0
     return (end_ms - start_ms) / 1000.0
+
+
+def _item_sort_key(item: Dict[str, Any]) -> tuple[int, int]:
+    timestamp = str(item.get("timestamp") or "")
+    start = timestamp.split("-", 1)[0].strip()
+    try:
+        start_ms, _ = parse_timestamp_range(start)
+    except Exception:
+        start_ms = 0
+    return start_ms, int(item.get("_id") or 0)
+
+
+def _is_preservable_ost1_dialogue(narration: str) -> bool:
+    text = (narration or "").strip()
+    return bool(text) and not text.startswith("播放原片")
+
+
+def _ms_to_timestamp(ms: int) -> str:
+    return utils.seconds_to_time(max(0, ms) / 1000.0).replace(".", ",")
+
+
+def _narration_char_count(text: str) -> int:
+    return len(re.sub(r"\s+", "", (text or "").strip()))
+
+
+def _min_narration_duration_sec(text: str) -> float:
+    chars = _narration_char_count(text)
+    if chars <= 0:
+        return 0.0
+    return (chars / 10.0) * 1.5
+
+
+def _is_quote_only_narration(text: str) -> bool:
+    """narration 是否仅为一句原声台词（应标 OST=1）。"""
+    narration = (text or "").strip()
+    if not narration or narration.startswith("播放原片"):
+        return False
+    if len(narration) > 28:
+        return False
+    if "：" in narration or ":" in narration:
+        if len(narration) > 18:
+            return False
+    if narration.startswith("「") and narration.endswith("」"):
+        return True
+    if narration.startswith("『") and narration.endswith("』"):
+        return True
+    if narration.startswith("『") and narration.endswith("』"):
+        return True
+    if narration.startswith('"') and narration.count('"') >= 2 and len(narration) < 40:
+        return True
+    compact = re.sub(r"[\s「」『』""\"'（）()。！？!?]", "", narration)
+    return len(compact) <= 24 and ("「" in text or "」" in text)
+
+
+def _is_mechanical_grid_timestamp(timestamp: str) -> bool:
+    """检测 00:06:00,000-00:06:12,000 等整分等间隔编造时间戳。"""
+    ts = (timestamp or "").strip()
+    if not ts:
+        return False
+    if re.search(r":00:00,000|:06:00,000|:12:00,000|:18:00,000|:24:00,000|:30:00,000|:36:00,000", ts):
+        return True
+    try:
+        start_ms, end_ms = parse_timestamp_range(ts)
+    except Exception:
+        return False
+    duration_ms = end_ms - start_ms
+    if duration_ms in (12000, 15000) and start_ms % 360000 == 0:
+        return True
+    return False
+
+
+def _normalize_fazu2_script_items(
+    items: List[Dict[str, Any]],
+    cfg: Dict[str, Any],
+) -> List[Dict[str, Any]]:
+    max_ost1 = compute_max_ost1_segments(len(items), cfg)
+    ost1_count = sum(1 for item in items if int(item.get("OST", 0)) == 1)
+    mechanical_hits = 0
+
+    for item in items:
+        ts = str(item.get("timestamp") or "")
+        if _is_mechanical_grid_timestamp(ts):
+            mechanical_hits += 1
+
+        ost = int(item.get("OST", 0))
+        narration = str(item.get("narration") or "").strip()
+        if ost != 0 or not _is_quote_only_narration(narration):
+            continue
+        if ost1_count >= max_ost1:
+            logger.warning(
+                f"片段 #{item.get('_id')} 为裸台词但 OST=1 已满 {max_ost1}，"
+                "请合并进前后解说段或删减原声"
+            )
+            continue
+        item["OST"] = 1
+        ost1_count += 1
+        logger.info(
+            f"片段 #{item.get('_id')} narration 仅为台词，已改为 OST=1"
+        )
+
+    if mechanical_hits:
+        logger.warning(
+            f"检测到 {mechanical_hits} 段疑似编造等间隔时间戳"
+            "（如 00:06:00-00:06:12），请重新生成并改用字幕/抽帧真实时间"
+        )
+    return items
+
+
+_GENERIC_CHARACTER_RE = re.compile(
+    r"警员\s*\d+|警察\s*\d+|说话人\s*\d+|男子\s*\d+|女子\s*[A-Z\d]|黑衣人\s*\d+"
+)
+
+
+def _warn_fazu2_forbidden_phrases(item: Dict[str, Any]) -> None:
+    narration = str(item.get("narration") or "")
+    picture = str(item.get("picture") or "")
+    if int(item.get("OST", 0)) != 0:
+        text = narration
+    else:
+        text = f"{narration}\n{picture}"
+    hits = [phrase for phrase in FAZU2_FORBIDDEN_NARRATION_PHRASES if phrase in text]
+    if hits:
+        logger.warning(
+            f"片段 #{item.get('_id')} 含禁用表述 {hits}，建议改用具体人名后重新生成"
+        )
+    generic = _GENERIC_CHARACTER_RE.findall(text)
+    if generic:
+        logger.warning(
+            f"片段 #{item.get('_id')} 使用编号式人物称呼 {generic}，"
+            "应改为字幕/剧情中的具体人名"
+        )
+
+
+def _adjust_fazu2_ost0_timestamps(items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    if not items:
+        return items
+    ordered = sorted(items, key=_item_sort_key)
+    next_starts: List[int] = []
+    for item in ordered:
+        start_ms, _ = parse_timestamp_range(str(item.get("timestamp") or ""))
+        next_starts.append(start_ms)
+    for index, item in enumerate(ordered):
+        if int(item.get("OST", 0)) != 0:
+            continue
+        narration = str(item.get("narration") or "").strip()
+        min_sec = _min_narration_duration_sec(narration)
+        if min_sec <= 0:
+            continue
+        start_ms, end_ms = parse_timestamp_range(str(item.get("timestamp") or ""))
+        duration_sec = max(0.0, (end_ms - start_ms) / 1000.0)
+        if duration_sec >= min_sec:
+            continue
+        needed_end_ms = start_ms + int(min_sec * 1000)
+        if index + 1 < len(next_starts):
+            needed_end_ms = min(needed_end_ms, next_starts[index + 1] - 50)
+        if needed_end_ms <= start_ms:
+            continue
+        item["timestamp"] = (
+            f"{_ms_to_timestamp(start_ms)}-{_ms_to_timestamp(needed_end_ms)}"
+        )
+        logger.info(
+            f"片段 #{item.get('_id')} 解说时长 {duration_sec:.1f}s 短于要求 {min_sec:.1f}s，"
+            f"已延长至 {(needed_end_ms - start_ms) / 1000.0:.1f}s"
+        )
+    return ordered
+
+
+def _break_consecutive_ost1(
+    items: List[Dict[str, Any]],
+    default_ost: int,
+) -> List[Dict[str, Any]]:
+    if len(items) < 2:
+        return items
+    fixed: List[Dict[str, Any]] = []
+    for item in items:
+        if (
+            fixed
+            and int(fixed[-1].get("OST", 0)) == 1
+            and int(item.get("OST", 0)) == 1
+        ):
+            prev = dict(fixed[-1])
+            prev["OST"] = default_ost
+            logger.warning(
+                f"片段 #{prev.get('_id')} 与 #{item.get('_id')} 连续 OST=1，"
+                f"已将前段改为 OST={default_ost}"
+            )
+            fixed[-1] = prev
+        fixed.append(item)
+    return fixed
+
+
+def _evenly_sample_items(items: List[Dict[str, Any]], count: int) -> List[Dict[str, Any]]:
+    if count >= len(items):
+        return list(items)
+    if count <= 0:
+        return []
+    if count == 1:
+        return [items[len(items) // 2]]
+    step = (len(items) - 1) / (count - 1)
+    indices = sorted({min(len(items) - 1, max(0, round(index * step))) for index in range(count)})
+    while len(indices) < count:
+        for candidate in range(len(items)):
+            if candidate not in indices:
+                indices.append(candidate)
+                break
+        else:
+            break
+    indices = sorted(indices)[:count]
+    return [items[index] for index in indices]
+
+
+def trim_compact_script_items(
+    items: List[Dict[str, Any]],
+    settings: Optional[Dict[str, Any]] = None,
+) -> List[Dict[str, Any]]:
+    """精剪模式：超出上限时按时间线均匀裁剪，优先保留 OST=1。"""
+    if not items:
+        return []
+    cfg = get_documentary_compact_settings(settings)
+    max_total = int(cfg.get("max_total_segments", 0) or 0)
+    if max_total <= 0 or len(items) <= max_total:
+        return items
+
+    ordered = sorted(items, key=_item_sort_key)
+    ost1_items = [item for item in ordered if int(item.get("OST", 0)) == 1]
+    other_items = [item for item in ordered if int(item.get("OST", 0)) != 1]
+
+    if len(ost1_items) >= max_total:
+        picked = _evenly_sample_items(ost1_items, max_total)
+    else:
+        picked = list(ost1_items)
+        picked.extend(_evenly_sample_items(other_items, max_total - len(picked)))
+        picked.sort(key=_item_sort_key)
+
+    for index, item in enumerate(picked, 1):
+        item["_id"] = index
+
+    logger.info(f"精剪脚本从 {len(items)} 段裁剪至 {len(picked)} 段（上限 {max_total}）")
+    return picked
 
 
 def finalize_documentary_script_items(
@@ -34,9 +282,11 @@ def finalize_documentary_script_items(
         default_ost = 2
 
     highlights_enabled = bool(cfg.get("enable_original_audio_highlights", True))
-    ost1_min = float(cfg.get("ost1_duration_min", 4))
+    ost1_min = float(cfg.get("ost1_duration_min", 3))
     ost1_max = float(cfg.get("ost1_duration_max", 12))
-    max_ost1 = int(cfg.get("max_ost1_segments", 6))
+    ost1_hard_max = float(cfg.get("ost1_duration_hard_max", ost1_max) or ost1_max)
+    fazu2_mode = is_fazu2_compact_settings(cfg)
+    max_ost1 = compute_max_ost1_segments(len(items), cfg)
 
     result: List[Dict[str, Any]] = []
     ost1_counter = 0
@@ -49,7 +299,7 @@ def finalize_documentary_script_items(
         item["_id"] = int(item.get("_id") or index + 1)
 
         if not highlights_enabled:
-            item["OST"] = 2
+            item["OST"] = default_ost
             result.append(item)
             continue
 
@@ -60,6 +310,12 @@ def finalize_documentary_script_items(
 
         if ost not in (0, 1, 2):
             ost = default_ost
+
+        if default_ost == 0 and ost == 2:
+            logger.warning(
+                f"片段 #{item['_id']} OST=2 在精剪模式下不可用，转为 OST=0"
+            )
+            ost = 0
 
         if ost == 1:
             duration = _segment_duration_sec(str(item.get("timestamp") or ""))
@@ -73,14 +329,34 @@ def finalize_documentary_script_items(
                     f"片段 #{item['_id']} OST=1 时长 {duration:.1f}s 短于 {ost1_min}s，回退为 OST={default_ost}"
                 )
                 ost = default_ost
+            elif duration > ost1_hard_max:
+                logger.warning(
+                    f"片段 #{item['_id']} OST=1 时长 {duration:.1f}s 超过 {ost1_hard_max}s，"
+                    f"回退为 OST={default_ost}"
+                )
+                ost = default_ost
             elif duration > ost1_max:
                 logger.info(
-                    f"片段 #{item['_id']} OST=1 时长 {duration:.1f}s 超过建议上限 {ost1_max}s，保留"
+                    f"片段 #{item['_id']} OST=1 时长 {duration:.1f}s 超过建议 {ost1_max}s，保留"
                 )
 
         if ost == 1:
             ost1_counter += 1
-            item["narration"] = f"播放原片{ost1_counter}"
+            existing_narration = str(item.get("narration") or "").strip()
+            if fazu2_mode:
+                if _is_preservable_ost1_dialogue(existing_narration):
+                    item["narration"] = existing_narration
+                elif existing_narration:
+                    item["narration"] = existing_narration
+                else:
+                    logger.warning(
+                        f"片段 #{item['_id']} OST=1 缺少台词原文，请按模板填写 narration"
+                    )
+                    item["narration"] = f"播放原片{ost1_counter}"
+            elif _is_preservable_ost1_dialogue(existing_narration):
+                item["narration"] = existing_narration
+            else:
+                item["narration"] = f"播放原片{ost1_counter}"
             item["OST"] = 1
         else:
             item["OST"] = ost
@@ -88,6 +364,25 @@ def finalize_documentary_script_items(
         result.append(item)
 
     if highlights_enabled and ost1_counter:
-        logger.info(f"逐帧解说脚本含 {ost1_counter} 段 OST=1 原声高光")
+        logger.info(
+            f"逐帧解说脚本含 {ost1_counter} 段 OST=1 原声高光"
+            f"（上限 {max_ost1}，约每 {cfg.get('ost1_every_n_segments', 10)} 段 1 原声）"
+        )
+
+    if fazu2_mode:
+        result = _normalize_fazu2_script_items(result, cfg)
+        result = _break_consecutive_ost1(result, default_ost)
+        for item in result:
+            _warn_fazu2_forbidden_phrases(item)
+        result = _adjust_fazu2_ost0_timestamps(result)
+        ost0_count = sum(1 for item in result if int(item.get("OST", 0)) == 0)
+        ost0_min = int(cfg.get("ost0_segment_min", 30) or 30)
+        if ost0_count < ost0_min:
+            logger.warning(
+                f"罚罪2模式解说段 {ost0_count} 段，低于建议最少 {ost0_min} 段"
+            )
+
+    if is_compact_documentary_settings(cfg):
+        result = trim_compact_script_items(result, cfg)
 
     return result

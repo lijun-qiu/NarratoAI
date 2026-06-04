@@ -135,10 +135,19 @@ def render_video_output_settings(tr):
 def get_video_params():
     """获取视频参数"""
     vo = st.session_state.get("video_output_settings") or get_video_output_settings()
+    enable_picture_narration = vo.get("enable_picture_narration", True)
+    script_path = st.session_state.get("video_clip_json_path", "")
+    doc_mode = st.session_state.get("documentary_script_mode", "")
+    if doc_mode == "auto_compact" or script_path == "auto_compact":
+        from app.services.documentary.documentary_settings import get_documentary_compact_settings
+
+        enable_picture_narration = bool(
+            get_documentary_compact_settings().get("enable_picture_narration", False)
+        )
     return {
         'video_aspect': st.session_state.get('video_aspect', VideoAspect.portrait.value),
         'video_quality': st.session_state.get('video_quality', '1080p'),
         'original_volume': st.session_state.get('original_volume', AudioVolumeDefaults.ORIGINAL_VOLUME),
         'watermark_text': vo.get('watermark_text', VIDEO_OUTPUT_DEFAULTS['watermark_text']),
-        'enable_picture_narration': vo.get('enable_picture_narration', True),
+        'enable_picture_narration': enable_picture_narration,
     }

@@ -215,7 +215,7 @@ closing_hook_template = "本集的核心冲突、留下的悬念和下一集的�
 
 [frames]
     # 提取关键帧的间隔时间（秒）
-    frame_interval_input = 2
+    frame_interval_input = 3
 
     # 大模型单次处理的关键帧数量
     vision_batch_size = 10
@@ -226,11 +226,12 @@ closing_hook_template = "本集的核心冲突、留下的悬念和下一集的�
 [documentary]
     # 逐帧解说：在爆燃/恐怖/尖叫等关键场面自动插入 OST=1 纯原声段
     enable_original_audio_highlights = true
-    ost1_duration_min = 4
+    ost1_duration_min = 3
     ost1_duration_max = 12
-    max_ost1_segments = 6
+    ost1_every_n_segments = 10
+    max_ost1_segments = 0
     default_narration_ost = 2
-    # 解说风格：幽默风趣、动作表情修饰、上下文物料预判、反常理吐槽
+    # 解说风格：资深解说员、灵活应变、亲民易懂；enable_humor_narration 控制适度网络梗与轻松点评
     enable_humor_narration = true
     context_window_sec = 30
     enable_action_expression_modifiers = true
@@ -241,6 +242,52 @@ closing_hook_template = "本集的核心冲突、留下的悬念和下一集的�
     narration_chars_min = 20
     narration_chars_max = 40
     default_custom_prompt = "尽量覆盖全片时间线，每 30 秒至少一段解说，不要大段跳过。"
+    # 有 SRT 时与抽帧分析交叉验证（对白以字幕为准，表情动作以画面为准）
+    enable_subtitle_enrichment = true
+    subtitle_max_chars = 15000
+    subtitle_analysis_max_frame_chars = 8000
+    subtitle_batch_pad_sec = 5
+    frame_interval_input = 3
+    # 解说生成上下文控制（长视频自动分块）
+    narration_input_max_chars = 65000
+    narration_input_max_tokens = 85000
+    narration_compact_markdown_chars = 120000
+    narration_chunk_max_chars = 50000
+    narration_chunk_max_sections = 12
+    narration_chunk_max_items_per_call = 20
+    # 脚本生成（分块/补段每次调用）：max_tokens 建议 12000–16000；temperature 建议 0.3–0.5
+    narration_script_max_tokens = 16000
+    narration_script_temperature = 0.4
+
+[documentary_compact]
+    # 逐帧精剪：故事讲述型（35–45 段，原声 ≤6，解说 30–100 字/段）
+    documentary_compact_mode = true
+    documentary_compact_style = "fazu2"
+    default_narration_ost = 0
+    enable_full_timeline_coverage = false
+    target_output_minutes = 12
+    target_output_ratio = 0.3
+    frame_interval_input = 3
+    min_total_segments = 35
+    max_total_segments = 45
+    ost0_segment_min = 30
+    enable_picture_narration = false
+    enable_humor_narration = false
+    enable_logic_roast = false
+    context_window_sec = 45
+    narration_chars_min = 30
+    narration_chars_max = 100
+    ost1_duration_min = 3
+    ost1_duration_max = 8
+    ost1_duration_hard_max = 10
+    max_ost1_segments = 6
+    ost1_every_n_segments = 999
+    # 全片核心主题（可选，留空则用 WebUI「视频主题」或由模型自拟，如「为谁而战」）
+    fazu2_core_theme = ""
+    narration_chunk_max_items_per_call = 20
+    narration_script_max_tokens = 16000
+    narration_script_temperature = 0.4
+    default_custom_prompt = "故事讲述型精剪：像说书人讲清剧情，对白融入解说；35–45段，原声≤6；必须写具体人名，禁止警员1/警员2/说话人1；禁止拉片、禁止然后/接着。"
 
 ##########################################
 # 完美字幕（影视解说：解说 + 原声双轨）

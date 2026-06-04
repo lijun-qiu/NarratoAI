@@ -52,7 +52,10 @@ def render_script_panel(tr):
         # 根据脚本类型显示不同的布局
         if script_path == "auto":
             # 画面解说
-            render_video_details(tr)
+            render_video_details(tr, compact=False)
+        elif script_path == "auto_compact":
+            # 逐帧精剪（纯解说快剪）
+            render_video_details(tr, compact=True)
         elif script_path == "short":
             # 短剧混剪
             render_short_generate_options(tr)
@@ -75,6 +78,7 @@ def render_script_file(tr, params):
     # 定义功能模式
     MODE_FILE = "file_selection"
     MODE_AUTO = "auto"
+    MODE_AUTO_COMPACT = "auto_compact"
     MODE_SHORT = "short"
     MODE_SUMMARY = "summary"
     MODE_FILM_TV = "film_tv"
@@ -88,6 +92,7 @@ def render_script_file(tr, params):
     mode_options = {
         tr("Select/Upload Script"): MODE_FILE,
         tr("Auto Generate"): MODE_AUTO,
+        tr("Compact Frame Narration"): MODE_AUTO_COMPACT,
         tr("Short Generate"): MODE_SHORT,
         tr("Short Drama Summary"): MODE_SUMMARY,
         tr("Film TV Narration"): MODE_FILM_TV,
@@ -102,6 +107,8 @@ def render_script_file(tr, params):
     
     if current_path == "auto":
         default_index = mode_keys.index(tr("Auto Generate"))
+    elif current_path == "auto_compact":
+        default_index = mode_keys.index(tr("Compact Frame Narration"))
     elif current_path == "short":
         default_index = mode_keys.index(tr("Short Generate"))
     elif current_path == "summary":
@@ -126,6 +133,12 @@ def render_script_file(tr, params):
             new_mode = mode_options[selected_label]
             st.session_state.video_clip_json_path = new_mode
             params.video_clip_json_path = new_mode
+            if new_mode == MODE_AUTO_COMPACT:
+                st.session_state["documentary_script_mode"] = MODE_AUTO_COMPACT
+            elif new_mode == MODE_AUTO:
+                st.session_state["documentary_script_mode"] = MODE_AUTO
+            else:
+                st.session_state.pop("documentary_script_mode", None)
         else:
             # 如果用户取消选择（segmented_control 允许取消），恢复到默认或上一个状态
             # 这里我们强制保持当前状态，或者重置为默认
@@ -174,7 +187,9 @@ def render_script_file(tr, params):
 
         # 找到保存的脚本文件在列表中的索引
         # 如果当前path是特殊值(auto/short/summary)，则重置为空
-        saved_script_path = current_path if current_path not in [MODE_AUTO, MODE_SHORT, MODE_SUMMARY, MODE_FILM_TV] else ""
+        saved_script_path = current_path if current_path not in [
+            MODE_AUTO, MODE_AUTO_COMPACT, MODE_SHORT, MODE_SUMMARY, MODE_FILM_TV
+        ] else ""
         
         selected_index = 0
         for i, (_, path) in enumerate(script_list):
@@ -367,25 +382,47 @@ def render_short_generate_options(tr):
     st.session_state['custom_clips'] = custom_clips
 
 
-def render_video_details(tr):
-    """画面解说 渲染视频主题和提示词"""
+def render_video_details(tr, *, compact: bool = False):
+    """画面解说 / 逐帧精剪：渲染视频主题和提示词"""
+    from app.services.documentary.documentary_settings import (
+        get_documentary_compact_settings,
+        get_documentary_settings,
+    )
+
+    doc_settings = get_documentary_compact_settings() if compact else get_documentary_settings()
+    default_interval = float(
+        doc_settings.get("frame_interval_input")
+        or config.frames.get("frame_interval_input", 3)
+    )
+    default_prompt = str(doc_settings.get("default_custom_prompt") or "")
+
+    if compact:
+        st.caption(
+            "故事讲述型精剪：像说书人讲剧情（30–100 字/段），须写具体人名（禁警员1/说话人1）；"
+            "原声 ≤6 段；35–45 段。视频主题填剧名集数（如《罚罪2》第1集）。"
+        )
+
+    render_documentary_subtitle_options(tr, doc_settings)
+
     video_theme = st.text_input(tr("Video Theme"))
     custom_prompt = st.text_area(
         tr("Generation Prompt"),
-        value=st.session_state.get('video_plot', ''),
+        value=st.session_state.get("video_plot", default_prompt),
         help=tr("Custom prompt for LLM, leave empty to use default prompt"),
-        height=180
+        height=180,
+        key="custom_prompt_input_compact" if compact else "custom_prompt_input_full",
     )
+    interval_key = "frame_interval_input_compact" if compact else "frame_interval_input_full"
     # 非短视频模式下显示原有的三个输入框
     input_cols = st.columns(2)
 
     with input_cols[0]:
         st.number_input(
             tr("Frame Interval (seconds)"),
-            min_value=0,
-            value=st.session_state.get('frame_interval_input', config.frames.get('frame_interval_input', 2)),
+            min_value=0.0,
+            value=float(st.session_state.get(interval_key, default_interval)),
             help=tr("Frame Interval (seconds) (More keyframes consume more tokens)"),
-            key="frame_interval_input"
+            key=interval_key,
         )
 
     with input_cols[1]:
@@ -396,9 +433,74 @@ def render_video_details(tr):
             help=tr("Batch Size (More keyframes consume more tokens)"),
             key="vision_batch_size"
         )
-    st.session_state['video_theme'] = video_theme
-    st.session_state['custom_prompt'] = custom_prompt
+    st.session_state["video_theme"] = video_theme
+    st.session_state["custom_prompt"] = custom_prompt
+    st.session_state["frame_interval_input"] = st.session_state.get(
+        interval_key,
+        default_interval,
+    )
     return video_theme, custom_prompt
+
+
+def render_documentary_subtitle_options(tr, doc_settings: dict):
+    """逐帧解说 / 精剪：可选字幕与抽帧结合。"""
+    default_enabled = bool(doc_settings.get("enable_subtitle_enrichment", True))
+    st.checkbox(
+        "结合字幕分析（有 SRT 时与抽帧交叉验证）",
+        value=st.session_state.get("doc_enable_subtitle_enrichment", default_enabled),
+        key="doc_enable_subtitle_enrichment",
+        help="上传/转录字幕后，抽帧分析会对照对白；并生成字幕×画面对照分析再写脚本",
+    )
+    if not st.session_state.get("doc_enable_subtitle_enrichment", default_enabled):
+        return
+
+    render_fun_asr_transcription(tr)
+
+    if "doc_subtitle_file_processed" not in st.session_state:
+        st.session_state["doc_subtitle_file_processed"] = False
+
+    subtitle_file = st.file_uploader(
+        tr("上传字幕文件"),
+        type=["srt"],
+        accept_multiple_files=False,
+        key="docu_subtitle_uploader",
+    )
+
+    if st.session_state.get("subtitle_path"):
+        st.info(f"已关联字幕: {os.path.basename(st.session_state['subtitle_path'])}")
+        if st.button(tr("清除已上传字幕"), key="doc_clear_subtitle"):
+            st.session_state["subtitle_path"] = None
+            st.session_state["subtitle_content"] = None
+            st.session_state["doc_subtitle_file_processed"] = False
+            st.rerun()
+
+    if subtitle_file is not None and not st.session_state.get("doc_subtitle_file_processed"):
+        try:
+            safe_filename = os.path.basename(subtitle_file.name)
+            decoded = decode_subtitle_bytes(subtitle_file.getvalue())
+            script_content = decoded.text
+            if not script_content:
+                st.error(tr("无法读取字幕文件，请检查文件编码（支持 UTF-8、UTF-16、GBK、GB2312）"))
+                st.stop()
+
+            script_dir = utils.script_dir()
+            os.makedirs(script_dir, exist_ok=True)
+            script_file_path = os.path.join(script_dir, safe_filename)
+            if os.path.exists(script_file_path):
+                timestamp = time.strftime("%Y%m%d%H%M%S")
+                name, ext = os.path.splitext(safe_filename)
+                script_file_path = os.path.join(script_dir, f"{name}_{timestamp}{ext}")
+
+            with open(script_file_path, "w", encoding="utf-8") as f:
+                f.write(script_content)
+
+            st.session_state["subtitle_path"] = script_file_path
+            st.session_state["subtitle_content"] = script_content
+            st.session_state["doc_subtitle_file_processed"] = True
+            st.success(f"字幕已保存: {safe_filename}")
+            st.rerun()
+        except Exception as e:
+            st.error(f"{tr('Upload failed')}: {str(e)}")
 
 
 def short_drama_summary(tr):
@@ -1007,6 +1109,8 @@ def render_script_buttons(tr, params):
     # 生成/加载按钮
     if script_path == "auto":
         button_name = tr("Generate Video Script")
+    elif script_path == "auto_compact":
+        button_name = tr("Generate Compact Frame Script")
     elif script_path == "short":
         button_name = tr("Generate Short Video Script")
     elif script_path == "summary":
@@ -1022,6 +1126,8 @@ def render_script_buttons(tr, params):
         if script_path == "auto":
             # 执行纪录片视频脚本生成（视频无字幕无配音）
             generate_script_docu(params)
+        elif script_path == "auto_compact":
+            generate_script_docu(params, compact=True)
         elif script_path == "short":
             # 执行 短剧混剪 脚本生成
             custom_clips = st.session_state.get('custom_clips')

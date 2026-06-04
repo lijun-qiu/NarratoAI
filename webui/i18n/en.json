@@ -9,6 +9,8 @@
     "Generate Video Script and Keywords": "Click to use AI to generate **Video Script** and **Video Keywords** based on the **subject**",
     "Auto Detect": "Auto Detect",
     "Auto Generate": "Auto Generate",
+    "Compact Frame Narration": "Compact Frame Narration",
+    "Generate Compact Frame Script": "Generate Compact Frame Script",
     "Video Script": "Video Script (:blue[①Optional, use AI to generate ②Proper punctuation helps in generating subtitles])",
     "Save Script": "Save Script",
     "Crop Video": "Crop Video",

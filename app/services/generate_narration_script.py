@@ -17,16 +17,18 @@ from loguru import logger
 
 # 导入新的LLM服务模块 - 确保提供商被注册
 import app.services.llm  # 这会触发提供商注册
+from app.services.documentary.documentary_settings import get_narration_script_llm_params
 from app.services.llm.migration_adapter import generate_narration as generate_narration_new
 # 导入新的提示词管理系统
 from app.services.prompts import PromptManager
 
 
-def parse_frame_analysis_to_markdown(json_file_path):
+def parse_frame_analysis_to_markdown(json_file_path, *, detail_level: str = "full"):
     """
     解析视频帧分析JSON文件并转换为Markdown格式
     
     :param json_file_path: JSON文件路径
+    :param detail_level: full=含每帧描述；compact=仅批次摘要+首尾帧（长视频省 token）
     :return: Markdown格式的字符串
     """
     # 检查文件是否存在
@@ -63,6 +65,22 @@ def parse_frame_analysis_to_markdown(json_file_path):
             start = time_range.split("-", 1)[0].strip()
             return time_to_milliseconds(start), batch.get("batch_index", 0)
 
+        compact = (detail_level or "full").lower() == "compact"
+
+        def format_sample_frames(observations: list) -> str:
+            if not observations:
+                return ""
+            if len(observations) == 1:
+                selected = observations
+            else:
+                selected = [observations[0], observations[-1]]
+            lines = ""
+            for frame in selected:
+                timestamp = frame.get("timestamp", "")
+                observation = frame.get("observation", "")
+                lines += f"  - {timestamp}: {observation}\n" if observation else f"  - {timestamp}: \n"
+            return lines
+
         markdown = ""
 
         # 新结构：按批次保存完整分析产物
@@ -82,12 +100,15 @@ def parse_frame_analysis_to_markdown(json_file_path):
                 markdown += f"## 片段 {i}\n"
                 markdown += f"- 时间范围：{time_range}\n"
                 markdown += f"- 片段描述：{summary}\n" if summary else "- 片段描述：\n"
-                markdown += "- 详细描述：\n"
-
-                for frame in observations:
-                    timestamp = frame.get("timestamp", "")
-                    observation = frame.get("observation", "")
-                    markdown += f"  - {timestamp}: {observation}\n" if observation else f"  - {timestamp}: \n"
+                if compact:
+                    markdown += "- 详细描述：（已压缩；请以片段描述为主，首尾帧采样如下）\n"
+                    markdown += format_sample_frames(observations)
+                else:
+                    markdown += "- 详细描述：\n"
+                    for frame in observations:
+                        timestamp = frame.get("timestamp", "")
+                        observation = frame.get("observation", "")
+                        markdown += f"  - {timestamp}: {observation}\n" if observation else f"  - {timestamp}: \n"
 
                 markdown += "\n"
 
@@ -112,13 +133,16 @@ def parse_frame_analysis_to_markdown(json_file_path):
             markdown += f"## 片段 {i}\n"
             markdown += f"- 时间范围：{time_range}\n"
             markdown += f"- 片段描述：{batch_summary}\n" if batch_summary else f"- 片段描述：\n"
-            markdown += "- 详细描述：\n"
-
             frames = batch_frames.get(batch_index, [])
-            for frame in frames:
-                timestamp = frame.get('timestamp', '')
-                observation = frame.get('observation', '')
-                markdown += f"  - {timestamp}: {observation}\n" if observation else f"  - {timestamp}: \n"
+            if compact:
+                markdown += "- 详细描述：（已压缩；请以片段描述为主，首尾帧采样如下）\n"
+                markdown += format_sample_frames(frames)
+            else:
+                markdown += "- 详细描述：\n"
+                for frame in frames:
+                    timestamp = frame.get('timestamp', '')
+                    observation = frame.get('observation', '')
+                    markdown += f"  - {timestamp}: {observation}\n" if observation else f"  - {timestamp}: \n"
 
             markdown += "\n"
 
@@ -177,22 +201,33 @@ def _generate_narration_legacy(markdown_content, api_key, base_url, model):
 
 
 
+        prompt_obj = PromptManager.get_prompt_object(
+            category="documentary",
+            name="narration_generation",
+        )
+        system_prompt = (prompt_obj.get_system_prompt() if prompt_obj else None) or (
+            "你是一位资深视频解说员，只输出合法 JSON，包含 items 数组。"
+        )
+
         # 使用OpenAI SDK初始化客户端
         client = OpenAI(
             api_key=api_key,
             base_url=base_url
         )
         
+        llm_params = get_narration_script_llm_params()
+
         # 使用SDK发送请求
         if model not in ["deepseek-reasoner"]:
             # deepseek-reasoner 不支持 json 输出
             response = client.chat.completions.create(
                 model=model,
                 messages=[
-                    {"role": "system", "content": "你是一名专业的短视频解说文案撰写专家。"},
+                    {"role": "system", "content": system_prompt},
                     {"role": "user", "content": prompt}
                 ],
-                temperature=1.5,
+                temperature=llm_params["temperature"],
+                max_tokens=llm_params["max_tokens"],
                 response_format={"type": "json_object"},
             )
             # 提取生成的文案
@@ -201,17 +236,17 @@ def _generate_narration_legacy(markdown_content, api_key, base_url, model):
                 # 打印消耗的tokens
                 logger.debug(f"消耗的tokens: {response.usage.total_tokens}")
                 return narration_script
-            else:
-                return "生成解说文案失败: 未获取到有效响应"
+            raise RuntimeError("生成解说文案失败: 未获取到有效响应")
         else:
             # 不支持 json 输出，需要多一步处理 ```json ``` 的步骤
             response = client.chat.completions.create(
                 model=model,
                 messages=[
-                    {"role": "system", "content": "你是一名专业的短视频解说文案撰写专家。"},
+                    {"role": "system", "content": system_prompt},
                     {"role": "user", "content": prompt}
                 ],
-                temperature=1.5,
+                temperature=llm_params["temperature"],
+                max_tokens=llm_params["max_tokens"],
             )
             # 提取生成的文案
             if response.choices and len(response.choices) > 0:
@@ -221,11 +256,11 @@ def _generate_narration_legacy(markdown_content, api_key, base_url, model):
                 # 清理 narration_script 字符串前后的 ```json ``` 字符串
                 narration_script = narration_script.replace("```json", "").replace("```", "")
                 return narration_script
-            else:
-                return "生成解说文案失败: 未获取到有效响应"
+            raise RuntimeError("生成解说文案失败: 未获取到有效响应")
     
     except Exception as e:
-        return f"调用API生成解说文案时出错: {traceback.format_exc()}"
+        logger.error(f"调用API生成解说文案时出错: {traceback.format_exc()}")
+        raise RuntimeError(f"调用API生成解说文案时出错: {e}") from e
 
 
 if __name__ == '__main__':

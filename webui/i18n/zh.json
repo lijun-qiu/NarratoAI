@@ -157,6 +157,8 @@
     "Adjust the volume of the original audio": "调整原始音频的音量",
     "Original Volume": "视频音量",
     "Auto Generate": "逐帧解说",
+    "Compact Frame Narration": "逐帧精剪",
+    "Generate Compact Frame Script": "生成逐帧精剪脚本",
     "Frame Interval (seconds)": "帧间隔 (秒)",
     "Frame Interval (seconds) (More keyframes consume more tokens)": "帧间隔 (秒) (更多关键帧消耗更多令牌)",
     "Batch Size": "批处理大小",

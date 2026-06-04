@@ -10,6 +10,7 @@ from pathlib import Path
 import PIL.Image
 from loguru import logger
 
+from app.config import config
 from .unified_service import UnifiedLLMService
 from .exceptions import LLMServiceError
 from .manager import LLMServiceManager
@@ -83,6 +84,18 @@ class LegacyLLMAdapter:
         return VisionAnalyzerAdapter(provider, api_key, model, base_url)
     
     @staticmethod
+    def _clean_json_output(output: str) -> str:
+        """清理JSON输出，移除markdown标记等"""
+        import re
+
+        output = re.sub(r'^```json\s*', '', output, flags=re.MULTILINE)
+        output = re.sub(r'^```\s*$', '', output, flags=re.MULTILINE)
+        output = re.sub(r'^```.*$', '', output, flags=re.MULTILINE)
+        output = re.sub(r'^```', '', output)
+        output = re.sub(r'```$', '', output)
+        return output.strip()
+
+    @staticmethod
     def generate_narration(markdown_content: str, api_key: str, base_url: str, model: str) -> str:
         """
         生成解说文案 - 兼容原有接口
@@ -97,7 +110,6 @@ class LegacyLLMAdapter:
             生成的解说文案JSON字符串
         """
         try:
-            # 使用新的提示词管理系统
             prompt = PromptManager.get_prompt(
                 category="documentary",
                 name="narration_generation",
@@ -105,16 +117,38 @@ class LegacyLLMAdapter:
                     "video_frame_description": markdown_content
                 }
             )
+            prompt_obj = PromptManager.get_prompt_object(
+                category="documentary",
+                name="narration_generation",
+            )
+            system_prompt = prompt_obj.get_system_prompt() or (
+                "你是一位资深视频解说员，只输出合法 JSON，包含 items 数组。"
+            )
+            provider = config.app.get("text_llm_provider", "openai")
+            from app.services.documentary.documentary_settings import (
+                get_narration_script_llm_params,
+            )
 
-            # 使用统一服务生成文案
+            llm_params = get_narration_script_llm_params()
+
             result = _run_async_safely(
                 UnifiedLLMService.generate_text,
                 prompt=prompt,
-                system_prompt="你是一名专业的短视频解说文案撰写专家。",
-                temperature=1.5,
-                response_format="json"
+                system_prompt=system_prompt,
+                provider=provider,
+                temperature=llm_params["temperature"],
+                max_tokens=llm_params["max_tokens"],
+                response_format="json",
+                api_key=api_key,
+                api_base=base_url,
+                for_script=True,
             )
-            return result if isinstance(result, str) else str(result)
+            cleaned = LegacyLLMAdapter._clean_json_output(
+                result if isinstance(result, str) else str(result)
+            )
+            if not cleaned:
+                raise LLMServiceError("文本模型返回空响应")
+            return cleaned
 
         except Exception as e:
             logger.error(f"生成解说文案失败: {str(e)}")

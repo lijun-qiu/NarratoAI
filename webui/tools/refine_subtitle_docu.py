@@ -1,0 +1,106 @@
+# 对照抽帧校正字幕
+import os
+import time
+import traceback
+
+import streamlit as st
+from loguru import logger
+
+from app.services.documentary.documentary_settings import get_documentary_compact_settings, get_documentary_settings
+from app.services.documentary.frame_analysis_pairing import find_paired_frame_analysis_path
+from app.services.documentary.frame_analysis_service import DocumentaryFrameAnalysisService
+from app.services.documentary.subtitle_refinement_service import (
+    get_refined_subtitle_path,
+    refine_subtitle_with_frame_analysis,
+)
+from app.services.subtitle_video_pairing import find_paired_subtitle_path, load_subtitle_content
+
+
+def _normalize_progress_value(progress: float | int) -> int:
+    try:
+        value = float(progress)
+    except (TypeError, ValueError):
+        return 0
+    if 0.0 <= value <= 1.0:
+        value *= 100
+    return max(0, min(100, int(round(value))))
+
+
+def refine_subtitle_docu(params, *, compact: bool = False):
+    """对照已有抽帧分析 JSON 校正字幕，产出 *_refined.srt。"""
+    progress_bar = st.progress(0)
+    status_text = st.empty()
+
+    def update_progress(progress: float, message: str = ""):
+        normalized_progress = _normalize_progress_value(progress)
+        progress_bar.progress(normalized_progress)
+        if message:
+            status_text.text(f"📝 {message}")
+        else:
+            status_text.text(f"📊 进度: {normalized_progress}%")
+
+    try:
+        with st.spinner("正在校正字幕..."):
+            if not params.video_origin_path:
+                st.error("请先选择视频文件")
+                return
+
+            doc_settings = get_documentary_compact_settings() if compact else get_documentary_settings()
+            if "doc_enable_subtitle_enrichment" in st.session_state:
+                doc_settings = dict(doc_settings)
+                doc_settings["enable_subtitle_enrichment"] = bool(
+                    st.session_state.get("doc_enable_subtitle_enrichment")
+                )
+
+            subtitle_path = (st.session_state.get("subtitle_path") or "").strip()
+            if not subtitle_path or not os.path.isfile(subtitle_path):
+                subtitle_path = find_paired_subtitle_path(params.video_origin_path) or ""
+            if not subtitle_path or not os.path.isfile(subtitle_path):
+                st.error("请先转写或上传字幕，再执行校正")
+                return
+
+            reuse_frame_analysis = bool(st.session_state.get("doc_reuse_frame_analysis", True))
+            analysis_path = DocumentaryFrameAnalysisService().resolve_reusable_analysis_path(
+                params.video_origin_path,
+                explicit_path=(st.session_state.get("frame_analysis_json_path") or "").strip() or None,
+                reuse=reuse_frame_analysis,
+            )
+            if not analysis_path:
+                analysis_path = find_paired_frame_analysis_path(params.video_origin_path) or ""
+            if not analysis_path or not os.path.isfile(analysis_path):
+                st.error("未找到抽帧分析 JSON，请先执行「抽帧并分析」")
+                return
+
+            update_progress(10, "正在对照抽帧分析校正字幕...")
+
+            def on_progress(message: str):
+                update_progress(50, message)
+
+            output_path = refine_subtitle_with_frame_analysis(
+                subtitle_path=subtitle_path,
+                analysis_json_path=analysis_path,
+                video_theme=st.session_state.get("video_theme", ""),
+                documentary_settings=doc_settings,
+                progress_callback=on_progress,
+            )
+
+            refined_content = load_subtitle_content(output_path)
+            st.session_state["subtitle_path"] = output_path
+            st.session_state["subtitle_content"] = refined_content
+            st.session_state["doc_subtitle_file_processed"] = True
+            logger.info(f"字幕校正已保存: {output_path}")
+
+        time.sleep(0.1)
+        progress_bar.progress(100)
+        status_text.text("🎉 字幕校正完成！")
+        st.success(f"✅ 已保存校正字幕: `{os.path.basename(output_path)}`")
+        st.caption(f"完整路径: `{output_path}`")
+        st.info("生成脚本时将优先使用此校正字幕。")
+
+    except Exception as err:
+        st.error(f"❌ 字幕校正失败: {str(err)}")
+        logger.exception(f"字幕校正失败\n{traceback.format_exc()}")
+    finally:
+        time.sleep(2)
+        progress_bar.empty()
+        status_text.empty()

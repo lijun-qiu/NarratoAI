@@ -137,6 +137,10 @@ cp config.example.toml config.toml
 # 5. 启动应用
 streamlit run webui.py --server.maxUploadSize=2048
 
+# 或多开（推荐）：
+python run_webui.py -i 1    # http://localhost:8501
+python run_webui.py -i 2    # http://localhost:8502
+
 # 6. 访问应用
 # 浏览器打开 http://localhost:8501
 ```

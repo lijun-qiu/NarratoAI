@@ -238,7 +238,7 @@ class OpenAICompatibleTextProvider(_OpenAICompatibleBase, TextModelProvider):
         **kwargs,
     ) -> str:
         messages = self._build_messages(prompt, system_prompt)
-        model_name = _normalize_model_name(self.model_name)
+        model_name = _normalize_model_name(kwargs.get("model") or self.model_name)
 
         completion_kwargs: Dict[str, Any] = {
             "model": model_name,

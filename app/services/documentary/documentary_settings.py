@@ -40,6 +40,22 @@ DOCUMENTARY_DEFAULTS: Dict[str, Any] = {
     "subtitle_max_chars": 15000,
     "subtitle_analysis_max_frame_chars": 8000,
     "subtitle_batch_pad_sec": 5,
+    # 对照抽帧校正 ASR 字幕（输出 *_refined.srt）
+    "enable_subtitle_refinement": True,
+    "subtitle_refinement_max_entries_per_call": 25,
+    "subtitle_refinement_temperature": 0.3,
+    "subtitle_refinement_min_similarity": 0.5,
+    "subtitle_refinement_max_length_ratio_delta": 0.4,
+    # 硬字幕 OCR 校准（裁剪关键帧底部，输出 *_ocr_refined.srt）
+    "enable_hard_subtitle_ocr": True,
+    "auto_subtitle_calibration_on_frame_analysis": True,
+    "subtitle_ocr_min_similarity": 0.5,
+    "subtitle_ocr_max_length_ratio_delta": 0.35,
+    "subtitle_ocr_crop_ratio": 0.22,
+    "subtitle_ocr_batch_size": 10,
+    "subtitle_ocr_max_concurrency": 2,
+    "subtitle_ocr_match_pad_ms": 1500,
+    "subtitle_ocr_min_confidence_frames": 1,
     # 逐帧解说/精剪默认抽帧间隔（秒）
     "frame_interval_input": 3,
     # 解说生成：超长输入自动分块（避免超出文本模型上下文）
@@ -47,15 +63,21 @@ DOCUMENTARY_DEFAULTS: Dict[str, Any] = {
     "narration_input_max_tokens": 85000,
     "narration_compact_markdown_chars": 120000,
     "narration_chunk_max_chars": 50000,
-    "narration_chunk_max_sections": 12,
-    # 单次 LLM 调用可靠输出的 items 上限，超过则强制分块生成
-    "narration_chunk_max_items_per_call": 20,
-    # 逐帧解说/精剪脚本生成：输出 token 上限与温度（分块时每块一次调用）
+    "narration_chunk_max_sections": 30,
+    # 单次 LLM 调用可靠输出的 items 上限；分块数以段数容量为下限，仅单块超限时才增块
+    "narration_chunk_max_items_per_call": 15,
+    # 精剪段数校验：首次生成失败后最多重试次数
+    "narration_segment_max_retries": 3,
+    # 逐帧解说/精剪脚本生成：输出 token 上限与温度
     "narration_script_max_tokens": 16000,
     "narration_script_temperature": 0.4,
+    # WebUI「视频主题」默认值
+    "default_video_theme": "罚罪2",
+    # 叠加在自定义提示词之后的本集/本片专属要求
+    "append_custom_prompt": "",
 }
 
-# 逐帧精剪：故事讲述型（35–45 段，原声 ≤6，解说 30–100 字/段，台词融入叙述）
+# 逐帧精剪：故事讲述型（35–50 段，原声 5–10 段，解说 30–100 字/段，台词融入叙述）
 DOCUMENTARY_COMPACT_OVERRIDES: Dict[str, Any] = {
     "documentary_compact_mode": True,
     "documentary_compact_style": "fazu2",
@@ -66,7 +88,7 @@ DOCUMENTARY_COMPACT_OVERRIDES: Dict[str, Any] = {
     "target_output_minutes": 12,
     "frame_interval_input": 3,
     "min_total_segments": 35,
-    "max_total_segments": 45,
+    "max_total_segments": 50,
     "ost0_segment_min": 30,
     "enable_picture_narration": False,
     "enable_humor_narration": False,
@@ -74,17 +96,19 @@ DOCUMENTARY_COMPACT_OVERRIDES: Dict[str, Any] = {
     "context_window_sec": 45,
     "narration_chars_min": 30,
     "narration_chars_max": 100,
-    "ost1_duration_min": 3,
+    "ost1_duration_min": 1,
     "ost1_duration_max": 8,
     "ost1_duration_hard_max": 10,
-    "max_ost1_segments": 6,
-    "ost1_every_n_segments": 999,
+    "min_ost1_segments": 5,
+    "max_ost1_segments": 10,
+    "ost1_every_n_segments": 10,
     "fazu2_core_theme": "",
-    "default_custom_prompt": (
-        "故事讲述型精剪：像说书人一样讲清剧情，把对白自然写进解说；"
-        "35–45 段，原声≤6 段；必须使用具体人名，禁止警员1/警员2/说话人1；"
-        "禁止分析镜头/导演手法；禁止然后/接着/我们可以看到。"
-    ),
+    "enable_opening_closing_hook": True,
+    "opening_hook_template": "宝子们，我们开始《{work_name}》啦！",
+    "closing_hook_template": "宝子们，我们下期再见！",
+    "default_custom_prompt": "",
+    "default_video_theme": "罚罪2",
+    "append_custom_prompt": "",
 }
 
 DOCUMENTARY_SETTING_KEYS = frozenset(
@@ -95,6 +119,20 @@ DOCUMENTARY_SETTING_KEYS = frozenset(
         "subtitle_max_chars",
         "subtitle_analysis_max_frame_chars",
         "subtitle_batch_pad_sec",
+        "enable_subtitle_refinement",
+        "subtitle_refinement_max_entries_per_call",
+        "subtitle_refinement_temperature",
+        "subtitle_refinement_min_similarity",
+        "subtitle_refinement_max_length_ratio_delta",
+        "enable_hard_subtitle_ocr",
+        "auto_subtitle_calibration_on_frame_analysis",
+        "subtitle_ocr_crop_ratio",
+        "subtitle_ocr_batch_size",
+        "subtitle_ocr_max_concurrency",
+        "subtitle_ocr_match_pad_ms",
+        "subtitle_ocr_min_confidence_frames",
+        "subtitle_ocr_min_similarity",
+        "subtitle_ocr_max_length_ratio_delta",
         "frame_interval_input",
         "min_total_segments",
         "max_total_segments",
@@ -105,17 +143,23 @@ DOCUMENTARY_SETTING_KEYS = frozenset(
         "narration_chunk_max_chars",
         "narration_chunk_max_sections",
         "narration_chunk_max_items_per_call",
+        "narration_segment_max_retries",
         "narration_script_max_tokens",
         "narration_script_temperature",
         "ost1_every_n_segments",
         "documentary_compact_mode",
         "documentary_compact_style",
         "fazu2_core_theme",
+        "enable_opening_closing_hook",
+        "opening_hook_template",
+        "closing_hook_template",
         "coverage_interval_sec",
         "target_output_ratio",
         "target_output_minutes",
         "ost0_segment_min",
         "ost1_duration_hard_max",
+        "min_ost1_segments",
+        "max_ost1_segments",
     }
 )
 
@@ -173,14 +217,42 @@ def resolve_fazu2_core_theme(
 
 def build_fazu2_narration_copy_hard_requirements(
     core_theme: str = "",
+    settings: Optional[Dict[str, Any]] = None,
 ) -> str:
     """逐帧精剪：故事讲述型脚本规则（写入脚本生成提示）。"""
-    return build_compact_story_script_rules(core_theme)
+    return build_compact_story_script_rules(core_theme, settings=settings)
 
 
-def build_compact_story_script_rules(core_theme: str = "") -> str:
+def _build_compact_hooks_rules_section(settings: Optional[Dict[str, Any]] = None) -> str:
+    """首尾招呼规则：从 [documentary_compact] 开场/结尾模板生成。"""
+    cfg = settings or get_documentary_compact_settings()
+    if not cfg.get("enable_opening_closing_hook", True):
+        return """### 7. 首尾招呼
+- **已关闭**固定开场/结尾模板；首末段 OST=0 按剧情自然起收即可
+"""
+    opening_tpl = str(cfg.get("opening_hook_template") or "宝子们，我们开始《{work_name}》啦！")
+    closing_tpl = str(cfg.get("closing_hook_template") or "宝子们，我们下期再见！")
+    return f"""### 7. 首尾招呼（必须）
+- **首段** OST=0 的 `narration` 开头须有开场招呼（可与剧情衔接），模板示例：**{opening_tpl}**（`{{work_name}}` 替换为作品名/集数）
+- **末段** OST=0 的 `narration` 结尾须有道别，模板示例：**{closing_tpl}**（可先写本集收束，再道别）
+- 成片后处理也会按上述模板补全，模型生成时尽量自带，避免与正文重复两遍
+"""
+
+
+def build_compact_story_script_rules(
+    core_theme: str = "",
+    settings: Optional[Dict[str, Any]] = None,
+) -> str:
     """逐帧精剪 · 故事讲述型：角色设定与创作规则。"""
-    work_hint = (core_theme or "").strip() or "（根据字幕与视频主题填写剧名/集数）"
+    cfg = settings or get_documentary_compact_settings()
+    work_hint = (core_theme or "").strip() or "（填写「视频主题」如《罚罪2》第1集）"
+    hooks_section = _build_compact_hooks_rules_section(cfg)
+    min_seg = int(cfg.get("min_total_segments", 35))
+    max_seg = int(cfg.get("max_total_segments", 50))
+    ost0_min = int(cfg.get("ost0_segment_min", 30) or 30)
+    min_ost1, max_ost1 = compute_ost1_segment_bounds(settings=cfg)
+    ost_dur_min = int(cfg.get("ost1_duration_min", 3))
+    ost_dur_max = int(cfg.get("ost1_duration_hard_max", 10) or 10)
     return f"""## 逐帧精剪 · 故事讲述型脚本规则（优先级最高）
 
 ### 角色设定
@@ -188,61 +260,113 @@ def build_compact_story_script_rules(core_theme: str = "") -> str:
 受众是普通观众：他们要快速看懂**剧情脉络、人物冲突、情感高潮**，**不要**分析镜头语言、导演手法或社会隐喻。
 
 ### 任务目标
-根据 `<subtitles>` / 抽帧画面与**精确字幕时间戳**，生成解说脚本。作品：**{work_hint}**
+根据 `<subtitles>` 与**精确字幕时间戳**（结合抽帧画面），生成解说脚本。作品：**{work_hint}**
 
 ### 输出格式（必须严格遵守）
-只输出 JSON：`{{"items":[{{"_id", "timestamp", "picture", "narration", "OST"}}]}}`
+- 只输出纯 JSON：`{{"items":[{{"_id", "timestamp", "picture", "narration", "OST"}}]}}`
+- **不要**使用 Markdown 代码块（不要 ```json ... ```），直接输出 JSON 文本
+- **不要**添加任何注释、前后缀或解释文字
 
 ### 1. 整体风格
 - **故事讲述型**：像说书人从头到尾讲清剧情，有细节、情绪、转折
-- **贴合时间轴**：`timestamp` **必须从原字幕逐字复制**（`HH:MM:SS,mmm-HH:MM:SS,mmm`），禁止编造整分等间隔
+- **贴合时间轴**：`timestamp` **必须从原字幕逐字复制**（`HH:MM:SS,mmm-HH:MM:SS,mmm`）；允许解说段跨越多个原字幕行（画面连续即可），但起止时间必须真实存在
 - **语言通俗**：短句、口语（如「结果到了地方，根本不是狗贩子」）
 - **情绪递进**：紧张/愤怒/悲伤/希望；可用小钩子（如「可谁也没想到……」）
+- **跳过无关内容**：可完全跳过与主线无关的过渡对话、重复场景、琐碎日常，只保留推动剧情或塑造人物的关键情节
 
 ### 2. 人物称呼（硬性）
 - `narration` 与 `picture` 必须使用**具体人名**（如胡小月、秦枫、伟业、罗博、马金），与字幕/剧情一致
+- 优先使用已知姓名；字幕从未给出姓名时，可用**稳定且唯一**的描述性称呼（如「狗场匪徒」「罗博的手下」「龙湾村的一位老人」），首次可简短说明
 - **禁止**编号式称呼：❌ 警员1/警员2、说话人1、男子1、女子A、黑衣人1 等
-- 字幕只有职务时：用剧情已出现的**姓名**；首次可写「胡小月的师弟秦枫」等，**禁止**用匿名编号代替具名角色
 - 全片人名前后统一，不要同一人又叫「年轻警员」又叫「警员2」
 
 ### 3. 解说段 OST=0（默认，全片 ≥30 段）
 - 每段 **30–100 字**，朗读约 4–15 秒；**一段一个情节点**，不要塞太多信息
 - **把人物对白融入解说**：用「秦枫开口就说」「胡小月突然吼了出来」等转述，对白用引号嵌入正文
 - **禁止流水账词**：❌ 然后、接着、接下来、我们可以看到、这里讲的是
-- **禁止拉片腔**：❌ 导演、镜头语言、社会隐喻、权力博弈、试探底线（改写成讲故事）
+- **禁止分析性词汇**：❌ 权力博弈、试探底线、导演手法、社会隐喻（改用动作和对话展现，如「罗博步步紧逼」）
 - 段与段**自然过渡**（例：「可谁也没想到，真正的麻烦还在后面。」）
 
-### 4. 原声段 OST=1（全片 ≤6 段，通常 3–5 段）
+### 4. 原声段 OST=1（全片 **{min_ost1}–{max_ost1} 段**）
 - **仅**标志性金句/情绪爆点/绝望叹息（如「天就快亮了」「有意思」）
-- 每段 **3–8 秒**（最长 ≤10 秒），`timestamp` **精确取自字幕**
-- `narration` **只写这一句台词**（引号包裹）；前面须有 OST=0 铺垫
+- 每段 **{ost_dur_min}–{ost_dur_max} 秒**；若原声台词过长，必须截取最核心的 {ost_dur_min}–{ost_dur_max} 秒
+- `timestamp` 精确取自字幕（截取部分的起止时间）
+- `narration` **只写这一句台词原文**（引号包裹），**不得**添加叙述动作（如「罗博咬着牙挤出两个字」应放在前一段 OST=0）
+- 必须前面有一段 OST=0 铺垫；后面可跟 OST=0 点评或过渡
 - **严禁**相邻两段 OST=1；**禁止**「播放原片N」
 
-### 5. picture（10–20 字）
-- **写出人物姓名** + 动作 + 场景（例：「秦枫冷冷看着罗博，灵堂内气氛压抑」）
+### 5. picture（15–30 字）
+- 写出**人物姓名** + 动作 + 场景 + 情绪（可省略部分）
+- 例：「秦枫冷冷看着罗博，灵堂内气氛压抑」
 - ❌ 「警员1站在门口」→ ✅ 「秦枫站在灵堂门口」
 
 ### 6. 时间戳与 `_id`
-- `_id` = **成片播放顺序**（1→2→3…），按**剧情推进**编排，不必按原片时间先后
+- `_id` = **成片播放顺序**（1→2→3…），按**剧情推进**编排，不必按原片时间先后（倒叙可提前讲）
+- 每段 `timestamp` 仍须是原字幕中**真实存在**的区间
 - 解说段时长 ≈ 字数÷10×1.5 秒；段与段可略有重叠，**禁止大段空白跳跃**
+- 多线叙事时，建议每条线索完整讲述再切换；切换前可用过渡句（如「与此同时，龙湾村也在开会」）
 
-### 7. 全片指标（约 40 分钟原片 → 12–15 分钟成片）
+{hooks_section}
+### 8. 全片指标（约 40 分钟原片 → 12–15 分钟成片）
 | 指标 | 要求 |
 |------|------|
-| 总段数 | **35–45 段** |
-| 解说 OST=0 | **≥30 段** |
-| 原声 OST=1 | **≤6 段**，原声总时长 **≤50 秒** |
+| 总段数 | **{min_seg}–{max_seg} 段** |
+| 解说 OST=0 | **≥{ost0_min} 段** |
+| 原声 OST=1 | **{min_ost1}–{max_ost1} 段**，原声总时长 **≤80 秒** |
 | 解说总时长 | 约 11–14 分钟 |
 """
 
 
-# 故事讲述型：标准输出参考（《罚罪2》第一集节选）
+def get_compact_custom_prompt_display(
+    settings: Optional[Dict[str, Any]] = None,
+) -> str:
+    """逐帧精剪：供 WebUI「自定义提示词」反显的完整规则文案（可编辑）。"""
+    cfg = get_documentary_compact_settings(settings)
+    chars_min = int(cfg.get("narration_chars_min", 30))
+    chars_max = int(cfg.get("narration_chars_max", 100))
+    min_seg = int(cfg.get("min_total_segments", 35))
+    max_seg = int(cfg.get("max_total_segments", 50))
+    min_ost1, max_ost1 = compute_ost1_segment_bounds(settings=cfg)
+    ost_min = int(cfg.get("ost1_duration_min", 3))
+    ost_max = int(cfg.get("ost1_duration_max", 8))
+    target_min = float(cfg.get("target_output_minutes", 12))
+    opening_tpl = str(cfg.get("opening_hook_template") or "宝子们，我们开始《{work_name}》啦！")
+    closing_tpl = str(cfg.get("closing_hook_template") or "宝子们，我们下期再见！")
+    auto_hook = "开启" if cfg.get("enable_opening_closing_hook", True) else "关闭"
+
+    rules = build_compact_story_script_rules(
+        str(cfg.get("fazu2_core_theme") or "").strip()
+        or "（填写「视频主题」如《罚罪2》第1集）",
+        settings=cfg,
+    )
+    return f"""# 逐帧精剪 · 故事讲述型规则
+（本框内容会作为「补充创作要求」参与生成；与系统内置规则一致，可直接修改）
+
+{rules}
+
+## 当前配置摘要（[documentary_compact]）
+| 项 | 值 |
+|----|-----|
+| 总段数 | {min_seg}–{max_seg} |
+| 解说字数/段 | {chars_min}–{chars_max} |
+| 原声 OST=1 | **{min_ost1}–{max_ost1} 段**，每段 {ost_min}–{ost_max} 秒 |
+| 目标成片 | 约 {target_min:.0f} 分钟 |
+| 首尾招呼 | {auto_hook}；开场模板「{opening_tpl}」；结尾「{closing_tpl}」 |
+
+## JSON 输出示例（结构参考）
+```json
+{{"items": {FAZU2_SCRIPT_REFERENCE_ITEMS_JSON}}}
+```
+
+---
+（本集/本片专属要求请写在 WebUI「追加提示词」框，会叠加在本规则之后参与生成）
+"""
 FAZU2_SCRIPT_REFERENCE_ITEMS_JSON = """[
   {
     "_id": 1,
     "timestamp": "00:00:01,940-00:00:12,740",
     "picture": "办公室内，领导与伟业对坐，气氛凝重",
-    "narration": "《罚罪2》开场，省厅领导把伟业叫到办公室。领导开口就说：你都到厅级了，干嘛非要回去当局长？想清楚了？伟业没有接话，他只说了一句：胡晓月是我的徒弟。",
+    "narration": "宝子们，我们开始《罚罪2》啦！开场省厅领导就把伟业叫到办公室。领导开口就说：你都到厅级了，干嘛非要回去当局长？想清楚了？伟业没有接话，他只说了一句：胡晓月是我的徒弟。",
     "OST": 0
   },
   {
@@ -263,14 +387,18 @@ FAZU2_SCRIPT_REFERENCE_ITEMS_JSON = """[
     "_id": 37,
     "timestamp": "00:28:22,530-00:28:23,490",
     "picture": "罗博咬碎后槽牙，冷笑",
-    "narration": "罗博咬着牙挤出两个字：「有意思。」",
+    "narration": "「有意思。」",
     "OST": 1
   }
 ]"""
 
 
-def build_fazu2_script_output_reference() -> str:
+def build_fazu2_script_output_reference(
+    settings: Optional[Dict[str, Any]] = None,
+) -> str:
     """故事讲述型 JSON 参考模板。"""
+    cfg = get_documentary_compact_settings(settings)
+    min_ost1, max_ost1 = compute_ost1_segment_bounds(settings=cfg)
     return f"""## 输出 JSON 参考模板（故事讲述型 · 必须严格仿照）
 
 ```json
@@ -284,8 +412,8 @@ def build_fazu2_script_output_reference() -> str:
 |------|-------|-------|
 | `narration` | 30–100 字，**讲故事+嵌入对白**，禁止拉片分析 | **仅一句**金句台词（引号） |
 | `timestamp` | 字幕/画面真实毫秒范围 | 字幕对白**精确**起止 |
-| `picture` | 10–20 字，人物+动作+场景 | 说话人画面 |
-| `OST` | 0（默认） | 1（≤6 段/全片） |
+| `picture` | 15–30 字，人物+动作+场景+情绪 | 说话人画面 |
+| `OST` | 0（默认） | 1（**{min_ost1}–{max_ost1}** 段/全片） |
 """
 
 
@@ -310,8 +438,9 @@ def build_fazu2_generation_anti_patterns() -> str:
 
 
 def _config_file_path() -> str:
-    root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.realpath(__file__))))
-    return os.path.join(root, "config.toml")
+    from app.config import config
+
+    return config.config_file
 
 
 def _read_documentary_config_section() -> Dict[str, Any]:
@@ -376,7 +505,7 @@ def get_narration_script_llm_params(
 
 
 def get_documentary_compact_settings(overrides: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
-    """逐帧精剪：默认故事讲述型（35–45 段，原声 ≤6，解说 30–100 字/段）。"""
+    """逐帧精剪：默认故事讲述型（35–50 段，原声 5–10 段，解说 30–100 字/段）。"""
     settings = get_documentary_settings()
     for key, value in DOCUMENTARY_COMPACT_OVERRIDES.items():
         settings[key] = value
@@ -388,6 +517,46 @@ def get_documentary_compact_settings(overrides: Optional[Dict[str, Any]] = None)
             if key in DOCUMENTARY_SETTING_KEYS and value is not None:
                 settings[key] = value
     return settings
+
+
+DOCUMENTARY_COMPACT_CONFIG_KEYS = (
+    "enable_opening_closing_hook",
+    "opening_hook_template",
+    "closing_hook_template",
+    "fazu2_core_theme",
+    "default_custom_prompt",
+    "default_video_theme",
+    "append_custom_prompt",
+)
+
+
+def save_documentary_compact_settings_to_config(settings: Dict[str, Any]) -> bool:
+    """将逐帧精剪参数写入 config.toml 的 [documentary_compact] 段。"""
+    config_path = _config_file_path()
+    try:
+        if os.path.isfile(config_path):
+            config_data = toml.load(config_path)
+        else:
+            config_data = {}
+        section = dict(config_data.get("documentary_compact") or {})
+        for key in DOCUMENTARY_COMPACT_CONFIG_KEYS:
+            if key in settings:
+                section[key] = settings[key]
+        config_data["documentary_compact"] = section
+        with open(config_path, "w", encoding="utf-8") as f:
+            f.write(toml.dumps(config_data))
+        try:
+            import app.config.config as config_py
+
+            config_py._cfg["documentary_compact"] = section
+            config_py.documentary_compact = section
+        except Exception:
+            pass
+        logger.info("逐帧精剪规则已保存到 config.toml [documentary_compact]")
+        return True
+    except Exception as e:
+        logger.error(f"保存逐帧精剪配置失败: {e}")
+        return False
 
 
 def is_compact_documentary_settings(settings: Optional[Dict[str, Any]] = None) -> bool:
@@ -444,18 +613,46 @@ def compute_compact_segment_bounds(
     return min_floor, target, max_cap
 
 
+def compute_ost1_segment_bounds(
+    total_items: int = 0,
+    settings: Optional[Dict[str, Any]] = None,
+) -> tuple[int, int]:
+    """返回 OST=1 原声段数 (最少, 最多)。"""
+    cfg = settings or get_documentary_settings()
+    min_cfg = int(cfg.get("min_ost1_segments", 0) or 0)
+    max_cfg = int(cfg.get("max_ost1_segments", 0) or 0)
+
+    if is_fazu2_compact_settings(cfg):
+        min_ost1 = max(1, min_cfg if min_cfg > 0 else 5)
+        max_ost1 = max(min_ost1, max_cfg if max_cfg > 0 else 10)
+        return min_ost1, max_ost1
+
+    every_n = max(1, int(cfg.get("ost1_every_n_segments", 10) or 10))
+    auto_max = max(1, round(total_items / every_n)) if total_items > 0 else 1
+    if max_cfg > 0:
+        max_ost1 = min(auto_max, max_cfg)
+    else:
+        max_ost1 = auto_max
+    min_ost1 = max(1, min_cfg) if min_cfg > 0 else 1
+    return min(min_ost1, max_ost1), max_ost1
+
+
 def compute_max_ost1_segments(
     total_items: int,
     settings: Optional[Dict[str, Any]] = None,
 ) -> int:
-    """按「约每 N 段 1 原声」估算 OST=1 上限；max_ost1_segments>0 时为硬封顶。"""
-    cfg = settings or get_documentary_settings()
-    every_n = max(1, int(cfg.get("ost1_every_n_segments", 10) or 10))
-    hard_cap = int(cfg.get("max_ost1_segments", 0) or 0)
-    auto_max = max(1, round(total_items / every_n)) if total_items > 0 else 1
-    if hard_cap > 0:
-        return min(auto_max, hard_cap)
-    return auto_max
+    """OST=1 原声段数上限。"""
+    _, max_ost1 = compute_ost1_segment_bounds(total_items, settings)
+    return max_ost1
+
+
+def compute_min_ost1_segments(
+    total_items: int = 0,
+    settings: Optional[Dict[str, Any]] = None,
+) -> int:
+    """OST=1 原声段数下限。"""
+    min_ost1, _ = compute_ost1_segment_bounds(total_items, settings)
+    return min_ost1
 
 
 def format_ost1_segment_hint(
@@ -478,9 +675,11 @@ def format_ost1_segment_hint(
     else:
         count_hint = f"全片 **约每 {every_n} 段 items 插入 1 段** OST=1"
     if is_fazu2_compact_settings(cfg):
-        max_ost1 = int(cfg.get("max_ost1_segments", 6) or 6)
+        min_ost1, max_ost1 = compute_ost1_segment_bounds(
+            estimated_items or 0, cfg
+        )
         return (
-            f"- **原声点睛**：全片 OST=1 **≤{max_ost1} 段**（通常 3–5 段），每段 **{ost_min}–{ost_max} 秒**，总时长 **≤50 秒**\n"
+            f"- **原声点睛**：全片 OST=1 **{min_ost1}–{max_ost1} 段**，每段 **{ost_min}–{ost_max} 秒**\n"
             f"- 仅用于标志性金句/情绪爆点；**前面至少 1 段 OST=0 铺垫**；**严禁相邻原声**\n"
             f"- OST=1：`narration` **只写该句台词**（引号）；其余对白**写入 OST=0 解说正文**\n"
         )
@@ -535,21 +734,21 @@ def build_compact_coverage_instructions(
 
     target_minutes = float(cfg.get("target_output_minutes", 12) or 12)
     ost0_min = int(cfg.get("ost0_segment_min", 30) or 30)
-    max_ost1 = int(cfg.get("max_ost1_segments", 6) or 6)
+    min_ost1, max_ost1 = compute_ost1_segment_bounds(target_segments, cfg)
 
     if is_fazu2_compact_settings(cfg):
         return f"""## 精剪覆盖（必须遵守 · 故事讲述型）
 
 ### 风格目标
 - 像说书人**从头到尾讲清剧情**，有细节、情绪、转折；**不要**拉片/镜头分析
-- **OST=0** 为主体：对白融入叙述；**OST=1** 仅 3–5 个金句爆点
+- **OST=0** 为主体：对白融入叙述；**OST=1** 为 **{min_ost1}–{max_ost1}** 个金句爆点
 
 ### 全片指标（目标成片约 {target_minutes:.0f} 分钟）
 | 指标 | 要求 |
 |------|------|
 | 总片段数 | **{min_segments}–{max_segments} 段**（目标约 {target_segments}） |
 | 解说 OST=0 | **≥{ost0_min} 段**，每段 **{chars_min}–{chars_max} 字** |
-| 原声 OST=1 | **≤{max_ost1} 段**，总时长 **≤50 秒** |
+| 原声 OST=1 | **{min_ost1}–{max_ost1} 段** |
 
 {ost1_hint}- 按**剧情顺序**选情节点，允许跳剪；`_id` 为播放顺序；时间戳**必须从字幕复制**
 - 遵守「逐帧精剪 · 故事讲述型脚本规则」；**禁止 OST=2**
@@ -608,6 +807,26 @@ def resolve_documentary_custom_prompt(
     return user_text or default_prompt
 
 
+def build_effective_documentary_prompt(
+    user_prompt: str = "",
+    append_prompt: str = "",
+    settings: Optional[Dict[str, Any]] = None,
+) -> str:
+    """合并自定义提示词与追加提示词（仅用于脚本生成，不参与抽帧视觉分析）。"""
+    cfg = get_documentary_settings(settings)
+    base = resolve_documentary_custom_prompt(user_prompt, cfg)
+    append = (append_prompt or "").strip()
+    if not append:
+        append = str(cfg.get("append_custom_prompt") or "").strip()
+    if not append:
+        return base
+    if base:
+        if append in base:
+            return base
+        return f"{base}\n\n## 追加要求\n{append}"
+    return f"## 追加要求\n{append}"
+
+
 def build_compact_ost_instructions(settings: Optional[Dict[str, Any]] = None) -> str:
     """精剪模式 OST 规则。"""
     cfg = settings or get_documentary_compact_settings()
@@ -620,7 +839,7 @@ def build_compact_ost_instructions(settings: Optional[Dict[str, Any]] = None) ->
 
     ost_min = int(cfg.get("ost1_duration_min", 3))
     ost_max = int(cfg.get("ost1_duration_max", 8))
-    max_ost1 = int(cfg.get("max_ost1_segments", 6) or 6)
+    min_ost1, max_ost1 = compute_ost1_segment_bounds(settings=cfg)
     chars_min = int(cfg.get("narration_chars_min", 80))
     chars_max = int(cfg.get("narration_chars_max", 150))
 
@@ -638,11 +857,11 @@ def build_compact_ost_instructions(settings: Optional[Dict[str, Any]] = None) ->
 - 一段一事；段末可留情绪或过渡（如「可谁也没想到……」）
 - `timestamp` 取自字幕，时长 ≈ 字数÷10×1.5 秒
 
-### OST=1（全片 ≤{max_ost1} 段，每段 {ost_min}–{ost_max} 秒）
+### OST=1（全片 **{min_ost1}–{max_ost1} 段**，每段 {ost_min}–{ost_max} 秒）
 - 仅标志性台词（如「天就快亮了」）；`narration` **只写该句**；`timestamp` 精确取自字幕
 - 前面至少 1 段 OST=0 铺垫；**禁止相邻 OST=1**
 
-{build_fazu2_script_output_reference()}
+{build_fazu2_script_output_reference(cfg)}
 只输出 `{{"items":[...]}}`，不要 markdown 代码块包裹。
 """
 
@@ -652,7 +871,7 @@ def build_compact_ost_instructions(settings: Optional[Dict[str, Any]] = None) ->
 | OST | 含义 |
 |-----|------|
 | **0** | 纯 AI 解说（默认） |
-| **1** | 纯原声，≤{max_ost1} 段，{ost_min}–{ost_max} 秒 |
+| **1** | 纯原声，**{min_ost1}–{max_ost1} 段**，{ost_min}–{ost_max} 秒 |
 | **2** | **禁止** |
 
 {picture_line}
@@ -756,7 +975,7 @@ def build_frame_highlight_hint(settings: Optional[Dict[str, Any]] = None) -> str
     if is_fazu2_compact_settings(cfg):
         hints.append(
             "画面描述须写出**人物姓名**（从字幕/剧情推断），禁止警员1、说话人2等编号；"
-            "人物+动作+场景，10–20 字，供 picture 字段引用。"
+            "人物+动作+场景+情绪，15–30 字，供 picture 字段引用。"
         )
         hints.append(
             "若该帧有可作 OST=1 的标志性台词，标注 `[金句原声]` 并摘录对白+字幕时间。"
@@ -797,14 +1016,15 @@ def build_compact_narration_style_instructions(
         theme = resolve_fazu2_core_theme(core_theme, cfg)
         min_segments, _, max_segments = compute_compact_segment_bounds(cfg)
         ost0_min = int(cfg.get("ost0_segment_min", 30) or 30)
-        rules_block = build_compact_story_script_rules(theme)
+        min_ost1, max_ost1 = compute_ost1_segment_bounds(min_segments, cfg)
+        rules_block = build_compact_story_script_rules(theme, settings=cfg)
         return f"""{rules_block}
 
 ## 解说风格（必须遵守 · 故事讲述型）
 
-- 全片 **{min_segments}–{max_segments} 段**，解说 ≥{ost0_min}，原声 ≤6
+- 全片 **{min_segments}–{max_segments} 段**，解说 ≥{ost0_min}，原声 **{min_ost1}–{max_ost1}** 段
 - OST=0：每段 **{chars_min}–{chars_max} 字**，讲故事、嵌入对白，禁止拉片分析
-- OST=1：仅 3–5 个金句，每句单独成段，前后有解说铺垫
+- OST=1：**{min_ost1}–{max_ost1}** 个金句，每句单独成段，前后有解说铺垫
 - 纵览前后约 {window} 秒画面与字幕，保持剧情连贯，像给观众**讲一集电视剧**
 """
 

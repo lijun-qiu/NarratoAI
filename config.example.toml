@@ -1,3 +1,15 @@
+##########################################
+# 多开模式（可选）
+##########################################
+# 通过环境变量或 run_webui.py 启动多个 WebUI 实例，互不干扰：
+#   python run_webui.py -i 1    # 端口 8501，数据目录 instances/1/
+#   python run_webui.py -i 2    # 端口 8502，数据目录 instances/2/
+# Windows: .\scripts\start_instance.ps1 -Instance 2
+#
+# 环境变量:
+#   NARRATO_INSTANCE_ID  实例 ID（数字自动映射端口 8501、8502…）
+#   NARRATO_PORT         显式指定端口（非数字 ID 时必须设置）
+
 [app]
     project_version="0.7.8"
 
@@ -145,6 +157,7 @@
 
     # Edge TTS 配置
     edge_voice_name = "zh-CN-XiaoyiNeural-Female"
+    voice_name = "zh-CN-XiaoyiNeural-Female"
     edge_volume = 80
     edge_rate = 1.0
     edge_pitch = 0
@@ -242,25 +255,44 @@ closing_hook_template = "本集的核心冲突、留下的悬念和下一集的�
     narration_chars_min = 20
     narration_chars_max = 40
     default_custom_prompt = "尽量覆盖全片时间线，每 30 秒至少一段解说，不要大段跳过。"
+    default_video_theme = "罚罪2"
+    append_custom_prompt = ""
     # 有 SRT 时与抽帧分析交叉验证（对白以字幕为准，表情动作以画面为准）
     enable_subtitle_enrichment = true
     subtitle_max_chars = 15000
     subtitle_analysis_max_frame_chars = 8000
     subtitle_batch_pad_sec = 5
+    # 对照抽帧校正 ASR 字幕（WebUI 第三步，输出 *_refined.srt）
+    enable_subtitle_refinement = true
+    subtitle_refinement_max_entries_per_call = 25
+    subtitle_refinement_temperature = 0.3
+    subtitle_refinement_min_similarity = 0.5
+    subtitle_refinement_max_length_ratio_delta = 0.4
+    # 硬字幕 OCR 校准（裁剪关键帧底部，输出 *_ocr_refined.srt，优先于 *_refined.srt）
+    enable_hard_subtitle_ocr = true
+    auto_subtitle_calibration_on_frame_analysis = true
+    subtitle_ocr_crop_ratio = 0.22
+    subtitle_ocr_batch_size = 10
+    subtitle_ocr_max_concurrency = 2
+    subtitle_ocr_match_pad_ms = 1500
+    subtitle_ocr_min_confidence_frames = 1
+    subtitle_ocr_min_similarity = 0.5
+    subtitle_ocr_max_length_ratio_delta = 0.35
     frame_interval_input = 3
     # 解说生成上下文控制（长视频自动分块）
     narration_input_max_chars = 65000
     narration_input_max_tokens = 85000
     narration_compact_markdown_chars = 120000
     narration_chunk_max_chars = 50000
-    narration_chunk_max_sections = 12
-    narration_chunk_max_items_per_call = 20
-    # 脚本生成（分块/补段每次调用）：max_tokens 建议 12000–16000；temperature 建议 0.3–0.5
+    narration_chunk_max_sections = 30
+    narration_chunk_max_items_per_call = 15
+    narration_segment_max_retries = 3
+    # 脚本生成 max_tokens 建议 12000–16000；temperature 建议 0.3–0.5
     narration_script_max_tokens = 16000
     narration_script_temperature = 0.4
 
 [documentary_compact]
-    # 逐帧精剪：故事讲述型（35–45 段，原声 ≤6，解说 30–100 字/段）
+    # 逐帧精剪：故事讲述型（35–50 段，原声 5–10 段，解说 30–100 字/段）
     documentary_compact_mode = true
     documentary_compact_style = "fazu2"
     default_narration_ost = 0
@@ -269,7 +301,7 @@ closing_hook_template = "本集的核心冲突、留下的悬念和下一集的�
     target_output_ratio = 0.3
     frame_interval_input = 3
     min_total_segments = 35
-    max_total_segments = 45
+    max_total_segments = 50
     ost0_segment_min = 30
     enable_picture_narration = false
     enable_humor_narration = false
@@ -277,17 +309,26 @@ closing_hook_template = "本集的核心冲突、留下的悬念和下一集的�
     context_window_sec = 45
     narration_chars_min = 30
     narration_chars_max = 100
-    ost1_duration_min = 3
+    ost1_duration_min = 1
     ost1_duration_max = 8
     ost1_duration_hard_max = 10
-    max_ost1_segments = 6
-    ost1_every_n_segments = 999
+    min_ost1_segments = 5
+    max_ost1_segments = 10
+    ost1_every_n_segments = 10
     # 全片核心主题（可选，留空则用 WebUI「视频主题」或由模型自拟，如「为谁而战」）
     fazu2_core_theme = ""
-    narration_chunk_max_items_per_call = 20
+    # 首尾招呼：{work_name} 替换为 WebUI「视频主题」；也可在 WebUI「开场白/结尾」中修改
+    enable_opening_closing_hook = true
+    opening_hook_template = "宝子们，我们开始《{work_name}》啦！"
+    closing_hook_template = "宝子们，我们下期再见！"
+    narration_chunk_max_items_per_call = 15
     narration_script_max_tokens = 16000
     narration_script_temperature = 0.4
-    default_custom_prompt = "故事讲述型精剪：像说书人讲清剧情，对白融入解说；35–45段，原声≤6；必须写具体人名，禁止警员1/警员2/说话人1；禁止拉片、禁止然后/接着。"
+    # 完整规则由 WebUI「自定义提示词」反显（get_compact_custom_prompt_display），此处可留空
+    default_custom_prompt = ""
+    default_video_theme = "罚罪2"
+    # 本集/本片专属要求，由 WebUI「追加提示词」编辑，叠加在自定义提示词之后
+    append_custom_prompt = ""
 
 ##########################################
 # 完美字幕（影视解说：解说 + 原声双轨）

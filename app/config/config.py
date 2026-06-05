@@ -7,8 +7,16 @@ from loguru import logger
 from app.config.defaults import build_default_app_config, merge_missing_app_defaults
 
 root_dir = os.path.dirname(os.path.dirname(os.path.dirname(os.path.realpath(__file__))))
-config_file = f"{root_dir}/config.toml"
+base_config_file = f"{root_dir}/config.toml"
 version_file = f"{root_dir}/project_version"
+
+from app.config.instance import init_instance_paths
+
+_instance_paths = init_instance_paths(root_dir, base_config_file)
+config_file = _instance_paths.config_file
+instance_id = _instance_paths.instance_id
+instance_port = _instance_paths.port
+instance_storage_root = _instance_paths.storage_root
 
 
 def get_version_from_file():

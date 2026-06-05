@@ -60,8 +60,9 @@ FILM_TV_DEFAULTS: Dict[str, Any] = {
 
 
 def _config_file_path() -> str:
-    root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.realpath(__file__))))
-    return os.path.join(root, "config.toml")
+    from app.config import config
+
+    return config.config_file
 
 
 def _read_film_tv_config_section() -> Dict[str, Any]:

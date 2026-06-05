@@ -14,11 +14,13 @@ from app.services.documentary.frame_analysis_service import DocumentaryFrameAnal
 from app.services.documentary.documentary_settings import (
     get_documentary_compact_settings,
     get_documentary_settings,
+    compute_ost1_segment_bounds,
 )
 from app.services.subtitle_video_pairing import (
     find_paired_subtitle_path,
     load_subtitle_content,
 )
+from webui.utils.script_stats import render_script_ost_summary
 
 
 def _resolve_subtitle_content(video_path: str) -> str:
@@ -50,7 +52,7 @@ def generate_script_docu(params, *, compact: bool = False):
     适合场景: 纪录片、动物搞笑解说、荒野建造等。
     可选上传或转录 SRT，与抽帧分析结合（config: enable_subtitle_enrichment）。
 
-    compact=True 时为逐帧精剪：故事讲述型（30–100 字/段，35–45 段，原声≤6）。
+    compact=True 时为逐帧精剪：故事讲述型（30–100 字/段，35–50 段，原声 5–10 段）。
     """
     progress_bar = st.progress(0)
     status_text = st.empty()
@@ -72,30 +74,39 @@ def generate_script_docu(params, *, compact: bool = False):
             vision_llm_provider = (
                 st.session_state.get("vision_llm_provider") or config.app.get("vision_llm_provider", "openai")
             ).lower()
-            vision_api_key = (
-                st.session_state.get(f"vision_{vision_llm_provider}_api_key")
-                or config.app.get(f"vision_{vision_llm_provider}_api_key")
+            reuse_frame_analysis = bool(st.session_state.get("doc_reuse_frame_analysis", True))
+            resolved_analysis_path = DocumentaryFrameAnalysisService().resolve_reusable_analysis_path(
+                params.video_origin_path,
+                explicit_path=(st.session_state.get("frame_analysis_json_path") or "").strip() or None,
+                reuse=reuse_frame_analysis,
             )
-            vision_model = (
-                st.session_state.get(f"vision_{vision_llm_provider}_model_name")
-                or config.app.get(f"vision_{vision_llm_provider}_model_name")
-            )
-            vision_base_url = (
-                st.session_state.get(f"vision_{vision_llm_provider}_base_url")
-                or config.app.get(f"vision_{vision_llm_provider}_base_url", "")
-            )
-            if not vision_api_key or not vision_model:
+            if not resolved_analysis_path:
                 raise ValueError(
-                    f"未配置 {vision_llm_provider} 的 API Key 或模型名称。"
-                    f"请在设置页面配置 vision_{vision_llm_provider}_api_key 和 vision_{vision_llm_provider}_model_name"
+                    "未找到可用的抽帧分析 JSON。请先在「抽帧分析」中点击「抽帧并分析」，"
+                    "或上传/复用已有分析文件后再生成脚本。"
                 )
+            update_progress(10, "将复用已有抽帧分析，正在生成脚本...")
 
             doc_settings = get_documentary_compact_settings() if compact else get_documentary_settings()
-            if "doc_enable_subtitle_enrichment" in st.session_state:
+            if "doc_enable_subtitle_enrichment" in st.session_state or compact:
                 doc_settings = dict(doc_settings)
-                doc_settings["enable_subtitle_enrichment"] = bool(
-                    st.session_state.get("doc_enable_subtitle_enrichment")
-                )
+                if "doc_enable_subtitle_enrichment" in st.session_state:
+                    doc_settings["enable_subtitle_enrichment"] = bool(
+                        st.session_state.get("doc_enable_subtitle_enrichment")
+                    )
+                if compact:
+                    for key in (
+                        "enable_opening_closing_hook",
+                        "opening_hook_template",
+                        "closing_hook_template",
+                        "append_custom_prompt",
+                    ):
+                        if key in st.session_state:
+                            doc_settings[key] = st.session_state[key]
+                elif "append_custom_prompt" in st.session_state:
+                    doc_settings["append_custom_prompt"] = st.session_state[
+                        "append_custom_prompt"
+                    ]
             subtitle_content = ""
             if doc_settings.get("enable_subtitle_enrichment", True):
                 subtitle_content = _resolve_subtitle_content(params.video_origin_path)
@@ -114,23 +125,26 @@ def generate_script_docu(params, *, compact: bool = False):
             )
 
             mode_label = "逐帧精剪" if compact else "逐帧解说"
-            update_progress(10, f"正在提取关键帧（{mode_label}）...")
+            update_progress(12, f"复用抽帧分析，正在生成{mode_label}脚本...")
             service = DocumentaryFrameAnalysisService()
             script_items = asyncio.run(
                 service.generate_documentary_script(
                     video_path=params.video_origin_path,
                     video_theme=st.session_state.get("video_theme", ""),
                     custom_prompt=st.session_state.get("custom_prompt", ""),
+                    append_custom_prompt=st.session_state.get("append_custom_prompt", ""),
                     frame_interval_input=frame_interval_input,
                     vision_batch_size=vision_batch_size,
                     vision_llm_provider=vision_llm_provider,
                     progress_callback=update_progress,
-                    vision_api_key=vision_api_key,
-                    vision_model_name=vision_model,
-                    vision_base_url=vision_base_url,
+                    vision_api_key=None,
+                    vision_model_name=None,
+                    vision_base_url=None,
                     max_concurrency=vision_max_concurrency,
                     documentary_settings=doc_settings,
                     subtitle_content=subtitle_content,
+                    analysis_json_path=(st.session_state.get("frame_analysis_json_path") or "").strip() or None,
+                    reuse_frame_analysis=reuse_frame_analysis,
                 )
             )
 
@@ -147,6 +161,18 @@ def generate_script_docu(params, *, compact: bool = False):
         progress_bar.progress(100)
         status_text.text("🎉 脚本生成完成！")
         st.success("✅ 视频脚本生成成功！")
+        max_ost1 = None
+        min_ost1 = None
+        if compact:
+            min_ost1, max_ost1 = compute_ost1_segment_bounds(
+                len(st.session_state.get("video_clip_json") or script_items),
+                doc_settings,
+            )
+        render_script_ost_summary(
+            st.session_state.get("video_clip_json") or script_items,
+            min_ost1=min_ost1,
+            max_ost1=max_ost1,
+        )
 
     except Exception as err:
         st.error(f"❌ 生成过程中发生错误: {str(err)}")

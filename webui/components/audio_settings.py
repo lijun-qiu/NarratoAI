@@ -163,64 +163,55 @@ def render_tts_settings(tr):
 
 def render_edge_tts_settings(tr):
     """渲染 Edge TTS 引擎设置"""
-    # 获取支持的语音列表
-    support_locales = ["zh-CN", "en-US"]
-    all_voices = voice.get_all_azure_voices(filter_locals=support_locales)
+    support_locales = ["zh-CN", "zh-HK", "zh-TW", "en-US"]
+    edge_voices = voice.get_edge_tts_voices(filter_locals=support_locales)
 
-    # 只保留标准版本的语音（Edge TTS专用，不包含V2）
-    edge_voices = [v for v in all_voices if "-V2" not in v]
+    friendly_names = {v: voice.format_edge_voice_display(v, tr) for v in edge_voices}
 
-    # 创建友好的显示名称
-    friendly_names = {}
-    for v in edge_voices:
-        friendly_names[v] = v.replace("Female", tr("Female")).replace("Male", tr("Male")).replace("Neural", "")
+    saved_voice_name = config.ui.get(
+        "edge_voice_name", "zh-CN-XiaoyiNeural-Female"
+    )
 
-    # 获取保存的语音设置
-    saved_voice_name = config.ui.get("edge_voice_name", "zh-CN-XiaoxiaoNeural-Female")
-
-    # 确保保存的音色在可用列表中
     if saved_voice_name not in friendly_names:
-        # 选择与UI语言匹配的第一个语音
         for v in edge_voices:
             if v.lower().startswith(st.session_state.get("ui_language", "zh-CN").lower()):
                 saved_voice_name = v
                 break
         else:
-            # 如果没找到匹配的，使用第一个
             saved_voice_name = edge_voices[0] if edge_voices else ""
 
-    # 音色选择下拉框（Edge TTS音色相对较少，保留下拉框）
+    # 推荐解说音色快捷选择
+    st.write("**推荐解说音色**")
+    rec_cols = st.columns(3)
+    rec_voice_keys = [item[0] for item in voice.RECOMMENDED_EDGE_VOICES]
+    rec_labels = [item[1] for item in voice.RECOMMENDED_EDGE_VOICES]
+    for idx, (rec_key, rec_label) in enumerate(zip(rec_voice_keys, rec_labels)):
+        if rec_key not in friendly_names:
+            continue
+        with rec_cols[idx % 3]:
+            if st.button(rec_label, key=f"edge_rec_voice_{idx}", use_container_width=True):
+                saved_voice_name = rec_key
+                config.ui["edge_voice_name"] = rec_key
+                st.rerun()
+
+    # 全部音色下拉框
     selected_friendly_name = st.selectbox(
-        "音色选择",
+        "全部音色",
         options=list(friendly_names.values()),
         index=list(friendly_names.keys()).index(saved_voice_name) if saved_voice_name in friendly_names else 0,
-        help="选择Edge TTS音色"
+        help="从 Edge TTS 在线列表中选择音色（含普通话、方言、粤语、台湾腔及英文）"
     )
 
-    # 获取实际的语音名称
     voice_name = list(friendly_names.keys())[
         list(friendly_names.values()).index(selected_friendly_name)
     ]
 
-    # 显示音色信息
     with st.expander("💡 Edge TTS 音色说明", expanded=False):
-        st.write("**中文音色：**")
-        zh_voices = [v for v in edge_voices if v.startswith("zh-CN")]
-        for v in zh_voices:
-            gender = "女声" if "Female" in v else "男声"
-            name = v.replace("-Female", "").replace("-Male", "").replace("zh-CN-", "").replace("Neural", "")
-            st.write(f"• {name} ({gender})")
-
-        st.write("")
-        st.write("**英文音色：**")
-        en_voices = [v for v in edge_voices if v.startswith("en-US")][:5]  # 只显示前5个
-        for v in en_voices:
-            gender = "女声" if "Female" in v else "男声"
-            name = v.replace("-Female", "").replace("-Male", "").replace("en-US-", "").replace("Neural", "")
-            st.write(f"• {name} ({gender})")
-
-        if len([v for v in edge_voices if v.startswith("en-US")]) > 5:
-            st.write("• ... 更多英文音色")
+        st.write("**普通话：** 晓晓、云扬、云希、云健等")
+        st.write("**方言：** 晓妮（陕西）、晓北（辽宁）")
+        st.write("**粤语 / 台湾：** 晓佳、晓曼、晓臻、晓雨等")
+        st.write("**英文：** en-US 系列（下拉框末尾）")
+        st.info("音色列表从 Edge TTS 在线同步，仅显示当前可用的声音。")
 
     config.ui["edge_voice_name"] = voice_name
     config.ui["voice_name"] = voice_name  # 兼容性
@@ -853,12 +844,23 @@ def render_doubaotts_settings(tr):
     saved_voice_type = config.ui.get("doubaotts_voice_type", "BV700_streaming")
     if saved_voice_type not in voice_options:
         voice_options[saved_voice_type] = f"自定义音色 ({saved_voice_type})"
-    
+
+    st.write("**推荐影视解说音色**")
+    rec_cols = st.columns(3)
+    for idx, (rec_key, rec_label) in enumerate(voice.RECOMMENDED_DOUBAOTTS_VOICES):
+        if rec_key not in voice_options:
+            continue
+        with rec_cols[idx % 3]:
+            if st.button(rec_label, key=f"doubao_rec_voice_{idx}", use_container_width=True):
+                saved_voice_type = rec_key
+                config.ui["doubaotts_voice_type"] = rec_key
+                st.rerun()
+
     selected_voice_display = st.selectbox(
-        "音色选择",
+        "全部音色",
         options=list(voice_options.values()),
         index=list(voice_options.keys()).index(saved_voice_type) if saved_voice_type in voice_options else 0,
-        help="选择豆包语音 TTS 音色"
+        help="选择豆包语音 TTS 音色；上方为影视解说类推荐"
     )
     
     # 获取实际的音色ID
@@ -967,7 +969,9 @@ def render_voice_preview_new(tr, selected_engine):
         voice_pitch = 1.0
 
         if selected_engine == "edge_tts":
-            voice_name = config.ui.get("edge_voice_name", "zh-CN-XiaoyiNeural-Female")
+            voice_name = config.ui.get(
+                "edge_voice_name", "zh-CN-XiaoyiNeural-Female"
+            )
             voice_rate = config.ui.get("edge_rate", 1.0)
             voice_pitch = 1.0 + (config.ui.get("edge_pitch", 0) / 100.0)
         elif selected_engine == "azure_speech":
@@ -1175,14 +1179,14 @@ def render_bgm_settings(tr):
         if custom_bgm_file and os.path.exists(custom_bgm_file):
             st.session_state['bgm_file'] = custom_bgm_file
 
-    # 背景音乐音量 - 使用统一的默认值
+    # 背景音乐音量（默认低于解说/原声）
     bgm_volume = st.slider(
         tr("Background Music Volume"),
         min_value=AudioVolumeDefaults.MIN_VOLUME,
         max_value=AudioVolumeDefaults.MAX_VOLUME,
-        value=AudioVolumeDefaults.BGM_VOLUME,
+        value=float(st.session_state.get('bgm_volume', AudioVolumeDefaults.BGM_VOLUME)),
         step=0.01,
-        help=tr("Adjust the volume of the original audio")
+        help="背景音乐音量；建议低于「视频设置」中的解说/原声音量",
     )
     st.session_state['bgm_volume'] = bgm_volume
 

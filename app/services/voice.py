@@ -77,6 +77,127 @@ def add_subtitle_event(
     sub_maker.offset.append((start_offset, end_offset))
 
 
+# Edge TTS 中文音色友好名称（ShortName 不含 Neural 后缀部分）
+EDGE_VOICE_LABELS: dict[str, str] = {
+    "zh-CN-Xiaoxiao": "晓晓（温暖女声）",
+    "zh-CN-Xiaoyi": "晓伊（活泼女声）",
+    "zh-CN-Yunjian": "云健（纪实男声）",
+    "zh-CN-Yunxi": "云希（年轻男声）",
+    "zh-CN-Yunxia": "云霞（少年男声）",
+    "zh-CN-YunxiNeural-V2": "云希 V2（年轻男声）",
+    "zh-CN-Yunyang": "云扬（新闻播报男声）",
+    "zh-CN-liaoning-Xiaobei": "晓北（辽宁方言·女声）",
+    "zh-CN-shaanxi-Xiaoni": "晓妮（陕西方言·女声）",
+    "zh-HK-HiuGaai": "晓佳（粤语·女声）",
+    "zh-HK-HiuMaan": "晓曼（粤语·女声）",
+    "zh-HK-WanLung": "云龙（粤语·男声）",
+    "zh-TW-HsiaoChen": "晓臻（台湾·女声）",
+    "zh-TW-HsiaoYu": "晓雨（台湾·女声）",
+    "zh-TW-YunJhe": "云哲（台湾·男声）",
+}
+
+# 故事讲述 / 影视解说推荐音色（voice_key 格式：ShortName-Gender）
+RECOMMENDED_EDGE_VOICES: list[tuple[str, str]] = [
+    ("zh-CN-XiaoyiNeural-Female", "晓伊（活泼女声·默认）"),
+    ("zh-CN-liaoning-XiaobeiNeural-Female", "晓北·辽宁方言（亲切女声）"),
+    ("zh-CN-shaanxi-XiaoniNeural-Female", "晓妮·陕西方言（亲切女声）"),
+    ("zh-CN-XiaoxiaoNeural-Female", "晓晓（温暖女声）"),
+    ("zh-CN-YunyangNeural-Male", "云扬（新闻播报男声）"),
+    ("zh-CN-YunxiNeural-Male", "云希（年轻男声）"),
+    ("zh-CN-YunjianNeural-Male", "云健（纪实男声）"),
+]
+
+# 豆包语音 · 影视解说推荐音色（voice_type ID）
+RECOMMENDED_DOUBAOTTS_VOICES: list[tuple[str, str]] = [
+    ("BV411_streaming", "小帅·影视解说（男·经典）"),
+    ("BV412_streaming", "小美·影视解说（女·经典）"),
+    ("BV142_streaming", "沉稳解说男"),
+    ("BV437_streaming", "小帅·多情感"),
+    ("BV410_streaming", "活力解说男"),
+    ("BV701_V2_streaming", "擎苍 2.0（磁性低沉）"),
+]
+
+_edge_voices_cache: tuple[float, list[str]] | None = None
+_EDGE_VOICES_CACHE_TTL = 3600
+
+
+def _voice_key_locale(voice_key: str) -> str:
+    """从 voice_key（如 zh-CN-XiaoxiaoNeural-Female）提取 locale 前缀。"""
+    base = voice_key.rsplit("-", 1)[0] if voice_key.endswith(("-Female", "-Male")) else voice_key
+    parts = base.split("-")
+    if len(parts) >= 2:
+        return f"{parts[0]}-{parts[1]}"
+    return base
+
+
+def format_edge_voice_display(voice_key: str, tr_func=None) -> str:
+    """将 Edge TTS voice_key 转为界面友好名称。"""
+    gender_suffix = ""
+    base = voice_key
+    if voice_key.endswith("-Female"):
+        base = voice_key[:-7]
+        gender_suffix = tr_func("Female") if tr_func else "女声"
+    elif voice_key.endswith("-Male"):
+        base = voice_key[:-5]
+        gender_suffix = tr_func("Male") if tr_func else "男声"
+
+    neural_name = base.replace("Neural", "").replace("-V2", "")
+    label = EDGE_VOICE_LABELS.get(neural_name)
+    if label:
+        return label
+    # 回退：去掉 locale 前缀后展示
+    short = base
+    for prefix in ("zh-CN-", "zh-HK-", "zh-TW-", "en-US-"):
+        if short.startswith(prefix):
+            short = short[len(prefix):]
+            break
+    short = short.replace("Neural", "").replace("-V2", "")
+    if gender_suffix:
+        return f"{short}（{gender_suffix}）"
+    return short
+
+
+async def _fetch_edge_voices_async() -> list[str]:
+    voices = await edge_tts.list_voices()
+    result: list[str] = []
+    for item in voices:
+        name = (item.get("ShortName") or "").strip()
+        gender = (item.get("Gender") or "").strip()
+        if name and gender:
+            result.append(f"{name}-{gender}")
+    return sorted(set(result))
+
+
+def get_edge_tts_voices(filter_locals: list[str] | None = None) -> list[str]:
+    """获取 Edge TTS 可用音色；优先在线拉取，失败时回退内置列表。"""
+    global _edge_voices_cache
+    now = time.time()
+    if _edge_voices_cache is None or now - _edge_voices_cache[0] > _EDGE_VOICES_CACHE_TTL:
+        try:
+            fetched = asyncio.run(_fetch_edge_voices_async())
+            if fetched:
+                _edge_voices_cache = (now, fetched)
+                logger.debug(f"Edge TTS 在线音色列表已更新，共 {len(fetched)} 个")
+        except Exception as exc:
+            logger.warning(f"无法从 Edge TTS 获取音色列表，使用内置列表: {exc}")
+
+    if _edge_voices_cache:
+        voices = _edge_voices_cache[1]
+    else:
+        voices = get_all_azure_voices(filter_locals=None)
+
+    voices = [v for v in voices if "-V2" not in v]
+    if not filter_locals:
+        return sorted(voices)
+
+    filtered: list[str] = []
+    for v in voices:
+        locale = _voice_key_locale(v)
+        if any(locale.lower().startswith(loc.lower()) for loc in filter_locals):
+            filtered.append(v)
+    return sorted(filtered)
+
+
 def get_all_azure_voices(filter_locals=None) -> list[str]:
     if filter_locals is None:
         filter_locals = ["zh-CN", "en-US", "zh-HK", "zh-TW", "vi-VN"]
@@ -1081,10 +1202,16 @@ Gender: Male
 
 
 def parse_voice_name(name: str):
-    # zh-CN-XiaoyiNeural-Female
+    # zh-CN-XiaoyiNeural-Female / zh-CN-shaanxi-XiaoniNeural-女性
     # zh-CN-YunxiNeural-Male
     # zh-CN-XiaoxiaoMultilingualNeural-V2-Female
-    name = name.replace("-Female", "").replace("-Male", "").strip()
+    name = (
+        name.replace("-Female", "")
+        .replace("-Male", "")
+        .replace("-女性", "")
+        .replace("-男性", "")
+        .strip()
+    )
     return name
 
 
@@ -1580,6 +1707,54 @@ def create_subtitle_from_multiple(text: str, sub_maker_list: List[SubMaker], lis
         traceback.print_exc()
 
 
+def _strip_dialogue_brackets(text: str) -> str:
+    """台词引号仅作标识，TTS 不会读出，不参与字幕分句。"""
+    return (
+        text.replace("「", "")
+        .replace("」", "")
+        .replace("『", "")
+        .replace("』", "")
+    )
+
+
+def _prepare_subtitle_script_lines(text: str) -> list[str]:
+    cleaned = _strip_dialogue_brackets(_format_text(text))
+    lines = utils.split_string_by_punctuations(cleaned)
+    return [line.strip() for line in lines if line.strip()]
+
+
+def _normalize_subtitle_match_text(text: str) -> str:
+    return re.sub(r"\W+", "", _strip_dialogue_brackets(text or ""))
+
+
+def _build_subtitle_items_from_sub_maker(
+    sub_maker: submaker.SubMaker,
+    *,
+    formatter,
+    extend_end_times,
+    speech_duration: float,
+) -> list[str]:
+    """对齐失败时，直接使用 TTS 返回的字幕块生成 SRT。"""
+    sub_items: list[str] = []
+    sub_index = 0
+    for offset, sub in zip(sub_maker.offset, sub_maker.subs):
+        sub_text = unescape(sub).strip()
+        if not sub_text:
+            continue
+        sub_index += 1
+        start_time_seconds = offset[0] / 10000000
+        end_time_seconds = offset[1] / 10000000
+        sub_items.append(
+            formatter(
+                idx=sub_index,
+                start_time=start_time_seconds,
+                end_time=end_time_seconds,
+                sub_text=sub_text,
+            )
+        )
+    return extend_end_times(sub_items, speech_duration)
+
+
 def create_subtitle(sub_maker: submaker.SubMaker, text: str, subtitle_file: str):
     """
     优化字幕文件
@@ -1604,7 +1779,7 @@ def create_subtitle(sub_maker: submaker.SubMaker, text: str, subtitle_file: str)
     sub_items = []
     sub_index = 0
 
-    script_lines = utils.split_string_by_punctuations(text)
+    script_lines = _prepare_subtitle_script_lines(text)
 
     def match_line(_sub_line: str, _sub_index: int):
         if len(script_lines) <= _sub_index:
@@ -1614,14 +1789,12 @@ def create_subtitle(sub_maker: submaker.SubMaker, text: str, subtitle_file: str)
         if _sub_line == _line:
             return script_lines[_sub_index].strip()
 
-        _sub_line_ = re.sub(r"[^\w\s]", "", _sub_line)
-        _line_ = re.sub(r"[^\w\s]", "", _line)
+        _sub_line_ = _normalize_subtitle_match_text(_sub_line)
+        _line_ = _normalize_subtitle_match_text(_line)
         if _sub_line_ == _line_:
-            return _line_.strip()
+            return _line.strip()
 
-        _sub_line_ = re.sub(r"\W+", "", _sub_line)
-        _line_ = re.sub(r"\W+", "", _line)
-        if _sub_line_ == _line_:
+        if _sub_line_ and _line_ and (_sub_line_ in _line_ or _line_ in _sub_line_):
             return _line.strip()
 
         return ""
@@ -1716,7 +1889,19 @@ def create_subtitle(sub_maker: submaker.SubMaker, text: str, subtitle_file: str)
 
         sub_items = _extend_subtitle_end_times(sub_items, speech_duration)
 
-        if len(sub_items) == len(script_lines):
+        if len(sub_items) != len(script_lines):
+            logger.warning(
+                f"字幕分句与 TTS 块数不一致（{len(sub_items)} vs {len(script_lines)}），"
+                f"改用 TTS 原始字幕块"
+            )
+            sub_items = _build_subtitle_items_from_sub_maker(
+                sub_maker,
+                formatter=formatter,
+                extend_end_times=_extend_subtitle_end_times,
+                speech_duration=speech_duration,
+            )
+
+        if len(sub_items) > 0:
             with open(subtitle_file, "w", encoding="utf-8") as file:
                 file.write("\n".join(sub_items) + "\n")
             try:
@@ -1731,8 +1916,7 @@ def create_subtitle(sub_maker: submaker.SubMaker, text: str, subtitle_file: str)
                 os.remove(subtitle_file)
         else:
             logger.error(
-                f"字幕创建失败, 字幕长度: {len(sub_items)}, script_lines len: {len(script_lines)}"
-                f"\nsub_items:{json.dumps(sub_items, indent=4, ensure_ascii=False)}"
+                f"字幕创建失败, 无有效字幕块"
                 f"\nscript_lines:{json.dumps(script_lines, indent=4, ensure_ascii=False)}"
             )
             # 返回默认值，避免 None 错误

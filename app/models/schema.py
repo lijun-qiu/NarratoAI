@@ -16,14 +16,9 @@ warnings.filterwarnings(
 class AudioVolumeDefaults:
     """音量配置默认值常量类 - 确保全局一致性"""
 
-    # 语音音量默认值
     VOICE_VOLUME = 1.0
-    TTS_VOLUME = 1.0
-
-    # 原声音量默认值 - 提高原声音量以平衡TTS
-    ORIGINAL_VOLUME = 1.2
-
-    # 背景音乐音量默认值
+    TTS_VOLUME = 1.3
+    ORIGINAL_VOLUME = 1.3
     BGM_VOLUME = 0.3
 
     # 音量范围
@@ -172,7 +167,9 @@ class VideoClipParams(BaseModel):
     # video_source: Optional[str] = "local"
     # video_concat_mode: Optional[VideoConcatMode] = VideoConcatMode.random.value
 
-    voice_name: Optional[str] = Field(default="zh-CN-YunjianNeural", description="语音名称")
+    voice_name: Optional[str] = Field(
+        default="zh-CN-XiaoyiNeural-Female", description="语音名称"
+    )
     voice_volume: Optional[float] = Field(default=AudioVolumeDefaults.VOICE_VOLUME, description="解说语音音量")
     voice_rate: Optional[float] = Field(default=1.0, description="语速")
     voice_pitch: Optional[float] = Field(default=1.0, description="语调")

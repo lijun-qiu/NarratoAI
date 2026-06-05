@@ -9,7 +9,7 @@ from webui.components import basic_settings, video_settings, audio_settings, sub
 # from webui.utils import cache, file_utils
 from app.utils import utils
 from app.utils import ffmpeg_utils
-from app.models.schema import VideoClipParams, VideoAspect
+from app.models.schema import AudioVolumeDefaults, VideoClipParams, VideoAspect
 
 
 # 初始化配置 - 必须是第一个 Streamlit 命令
@@ -118,7 +118,9 @@ def init_global_state():
     if 'ui_language' not in st.session_state:
         st.session_state['ui_language'] = config.ui.get("language", utils.get_system_locale())
     if 'video_clip_json_path' not in st.session_state:
-        st.session_state['video_clip_json_path'] = 'film_tv'
+        st.session_state['video_clip_json_path'] = 'auto_compact'
+    if 'documentary_script_mode' not in st.session_state:
+        st.session_state['documentary_script_mode'] = 'auto_compact'
     # 移除subclip_videos初始化 - 现在使用统一裁剪策略
 
 
@@ -231,7 +233,10 @@ def get_voice_name_for_tts_engine(tts_engine: str) -> str:
     elif tts_engine == 'azure_speech':
         return st.session_state.get('voice_name', config.ui.get('azure_voice_name', 'zh-CN-XiaoxiaoMultilingualNeural'))
     else:
-        return st.session_state.get('voice_name', config.ui.get('edge_voice_name', 'zh-CN-XiaoxiaoNeural-Female'))
+        return st.session_state.get(
+            'voice_name',
+            config.ui.get('edge_voice_name', 'zh-CN-XiaoyiNeural-Female'),
+        )
 
 
 def get_jianying_export_params() -> VideoClipParams:
@@ -260,9 +265,9 @@ def get_jianying_export_params() -> VideoClipParams:
         custom_position=st.session_state.get(
             'custom_position', config.ui.get('custom_position', 60.0)
         ),
-        tts_volume=st.session_state.get('tts_volume', 1.0),
-        original_volume=st.session_state.get('original_volume', 0.7),
-        bgm_volume=st.session_state.get('bgm_volume', 0.3),
+        tts_volume=st.session_state.get('tts_volume', AudioVolumeDefaults.TTS_VOLUME),
+        original_volume=st.session_state.get('original_volume', AudioVolumeDefaults.ORIGINAL_VOLUME),
+        bgm_volume=st.session_state.get('bgm_volume', AudioVolumeDefaults.BGM_VOLUME),
         draft_name=st.session_state.get('draft_name_input', f"NarratoAI_{int(time.time())}")
     )
 
@@ -407,7 +412,15 @@ def main():
     except Exception as e:
         logger.warning(f"资源初始化时出现警告: {e}")
 
-    st.title(f"Narrato:blue[AI]:sunglasses: 📽️")
+    title = "Narrato:blue[AI]:sunglasses: 📽️"
+    if config.instance_id:
+        title += f" · 实例 :blue[{config.instance_id}] (:blue[{config.instance_port}])"
+    st.title(title)
+    if config.instance_id:
+        st.caption(
+            f"多开模式：独立配置 `{config.config_file}`，"
+            f"独立存储 `{config.instance_storage_root}`"
+        )
     st.write(tr("Get Help"))
 
     # 首先渲染不依赖PyTorch的UI部分

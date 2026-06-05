@@ -12,7 +12,9 @@ from loguru import logger
 
 from app.services.documentary.documentary_settings import (
     FAZU2_FORBIDDEN_NARRATION_PHRASES,
+    compute_compact_segment_bounds,
     compute_max_ost1_segments,
+    compute_ost1_segment_bounds,
     get_documentary_compact_settings,
     get_documentary_settings,
     is_compact_documentary_settings,
@@ -194,6 +196,41 @@ def _adjust_fazu2_ost0_timestamps(items: List[Dict[str, Any]]) -> List[Dict[str,
     return ordered
 
 
+def _adjust_fazu2_ost1_timestamps(
+    items: List[Dict[str, Any]],
+    ost1_min: float,
+) -> List[Dict[str, Any]]:
+    """金句原声段过短时延长 time戳，避免被误判后回退为 OST=0。"""
+    if not items or ost1_min <= 0:
+        return items
+    ordered = sorted(items, key=_item_sort_key)
+    next_starts: List[int] = []
+    for item in ordered:
+        start_ms, _ = parse_timestamp_range(str(item.get("timestamp") or ""))
+        next_starts.append(start_ms)
+    min_ms = int(ost1_min * 1000)
+    for index, item in enumerate(ordered):
+        if int(item.get("OST", 0)) != 1:
+            continue
+        start_ms, end_ms = parse_timestamp_range(str(item.get("timestamp") or ""))
+        current_ms = end_ms - start_ms
+        if current_ms >= min_ms:
+            continue
+        needed_end_ms = start_ms + min_ms
+        if index + 1 < len(next_starts):
+            needed_end_ms = min(needed_end_ms, next_starts[index + 1] - 50)
+        if needed_end_ms <= start_ms:
+            continue
+        item["timestamp"] = (
+            f"{_ms_to_timestamp(start_ms)}-{_ms_to_timestamp(needed_end_ms)}"
+        )
+        logger.info(
+            f"片段 #{item.get('_id')} 原声 OST=1 时长 {current_ms / 1000.0:.1f}s 短于 {ost1_min:.1f}s，"
+            f"已延长至 {(needed_end_ms - start_ms) / 1000.0:.1f}s"
+        )
+    return ordered
+
+
 def _break_consecutive_ost1(
     items: List[Dict[str, Any]],
     default_ost: int,
@@ -238,6 +275,32 @@ def _evenly_sample_items(items: List[Dict[str, Any]], count: int) -> List[Dict[s
     return [items[index] for index in indices]
 
 
+def trim_narration_items_to_max(
+    items: List[Dict[str, Any]],
+    max_count: int,
+) -> List[Dict[str, Any]]:
+    """按时间线均匀裁剪至 max_count 段，优先保留 OST=1。"""
+    if not items or max_count <= 0 or len(items) <= max_count:
+        return items
+
+    ordered = sorted(items, key=_item_sort_key)
+    ost1_items = [item for item in ordered if int(item.get("OST", 0)) == 1]
+    other_items = [item for item in ordered if int(item.get("OST", 0)) != 1]
+
+    if len(ost1_items) >= max_count:
+        picked = _evenly_sample_items(ost1_items, max_count)
+    else:
+        picked = list(ost1_items)
+        picked.extend(_evenly_sample_items(other_items, max_count - len(picked)))
+        picked.sort(key=_item_sort_key)
+
+    for index, item in enumerate(picked, 1):
+        item["_id"] = index
+
+    logger.info(f"解说脚本从 {len(items)} 段裁剪至 {len(picked)} 段（上限 {max_count}）")
+    return picked
+
+
 def trim_compact_script_items(
     items: List[Dict[str, Any]],
     settings: Optional[Dict[str, Any]] = None,
@@ -247,36 +310,111 @@ def trim_compact_script_items(
         return []
     cfg = get_documentary_compact_settings(settings)
     max_total = int(cfg.get("max_total_segments", 0) or 0)
-    if max_total <= 0 or len(items) <= max_total:
+    if max_total <= 0:
+        return items
+    return trim_narration_items_to_max(items, max_total)
+
+
+def _format_compact_hook_template(template: str, work_name: str) -> str:
+    name = (work_name or "").strip() or "本期"
+    text = (template or "").strip()
+    return text.replace("{work_name}", name).replace("某某某", name)
+
+
+def _opening_hook_already_applied(existing: str, opening: str) -> bool:
+    text = (existing or "").strip()
+    hook = (opening or "").strip().rstrip("。！!")
+    if not text or not hook:
+        return False
+    if hook in text:
+        return True
+    prefix_len = min(16, len(hook))
+    if prefix_len >= 4 and text.startswith(hook[:prefix_len]):
+        return True
+    return False
+
+
+def _closing_hook_already_applied(existing: str, closing: str) -> bool:
+    text = (existing or "").strip()
+    hook = (closing or "").strip().rstrip("。！!")
+    if not text or not hook:
+        return False
+    if hook in text:
+        return True
+    tail = hook[-min(12, len(hook)) :]
+    return bool(tail) and len(tail) >= 4 and text.endswith(tail)
+
+
+def apply_compact_opening_closing_hooks(
+    items: List[Dict[str, Any]],
+    work_name: str = "",
+    settings: Optional[Dict[str, Any]] = None,
+) -> List[Dict[str, Any]]:
+    """逐帧精剪：为首尾 OST=0 解说段写入宝子们开场/结尾。"""
+    if not items:
+        return items
+    cfg = get_documentary_compact_settings(settings)
+    if not is_fazu2_compact_settings(cfg):
+        return items
+    if not cfg.get("enable_opening_closing_hook", True):
         return items
 
-    ordered = sorted(items, key=_item_sort_key)
-    ost1_items = [item for item in ordered if int(item.get("OST", 0)) == 1]
-    other_items = [item for item in ordered if int(item.get("OST", 0)) != 1]
+    opening = _format_compact_hook_template(
+        str(cfg.get("opening_hook_template") or "宝子们，我们开始《{work_name}》啦！"),
+        work_name,
+    )
+    closing = _format_compact_hook_template(
+        str(cfg.get("closing_hook_template") or "宝子们，我们下期再见！"),
+        work_name,
+    )
+    if not opening and not closing:
+        return items
 
-    if len(ost1_items) >= max_total:
-        picked = _evenly_sample_items(ost1_items, max_total)
-    else:
-        picked = list(ost1_items)
-        picked.extend(_evenly_sample_items(other_items, max_total - len(picked)))
-        picked.sort(key=_item_sort_key)
+    updated = [dict(item) for item in items]
+    ost0_indices = [
+        i for i, item in enumerate(updated) if int(item.get("OST", 0)) == 0
+    ]
+    if not ost0_indices:
+        return items
 
-    for index, item in enumerate(picked, 1):
-        item["_id"] = index
+    first_idx = ost0_indices[0]
+    last_idx = ost0_indices[-1]
 
-    logger.info(f"精剪脚本从 {len(items)} 段裁剪至 {len(picked)} 段（上限 {max_total}）")
-    return picked
+    if opening:
+        existing = str(updated[first_idx].get("narration") or "").strip()
+        hook = opening.rstrip("。！!")
+        if not _opening_hook_already_applied(existing, hook):
+            if existing:
+                updated[first_idx]["narration"] = f"{hook}。{existing.lstrip('。')}"
+            else:
+                updated[first_idx]["narration"] = hook
+            logger.info(f"已应用精剪开场白: {updated[first_idx]['narration'][:50]}...")
+
+    if closing:
+        existing = str(updated[last_idx].get("narration") or "").strip()
+        if not _closing_hook_already_applied(existing, closing):
+            if existing:
+                updated[last_idx]["narration"] = f"{existing.rstrip('。')}。{closing}"
+            else:
+                updated[last_idx]["narration"] = closing
+            logger.info(f"已应用精剪结尾白: {closing}")
+
+    return updated
 
 
 def finalize_documentary_script_items(
     items: List[Dict[str, Any]],
     settings: Optional[Dict[str, Any]] = None,
+    work_name: str = "",
 ) -> List[Dict[str, Any]]:
     """归一化 LLM 输出的逐帧解说脚本 OST 字段。"""
     if not items:
         return []
 
-    cfg = get_documentary_settings(settings)
+    if settings and is_compact_documentary_settings(settings):
+        cfg = get_documentary_compact_settings(settings)
+    else:
+        cfg = get_documentary_settings(settings)
     default_ost = int(cfg.get("default_narration_ost", 2))
     if default_ost not in (0, 2):
         default_ost = 2
@@ -325,10 +463,16 @@ def finalize_documentary_script_items(
                 )
                 ost = default_ost
             elif duration > 0 and duration < ost1_min:
-                logger.warning(
-                    f"片段 #{item['_id']} OST=1 时长 {duration:.1f}s 短于 {ost1_min}s，回退为 OST={default_ost}"
-                )
-                ost = default_ost
+                if not fazu2_mode:
+                    logger.warning(
+                        f"片段 #{item['_id']} OST=1 时长 {duration:.1f}s 短于 {ost1_min}s，回退为 OST={default_ost}"
+                    )
+                    ost = default_ost
+                else:
+                    logger.info(
+                        f"片段 #{item['_id']} OST=1 时长 {duration:.1f}s 短于 {ost1_min}s，"
+                        f"保留原声并在后处理延长 time戳"
+                    )
             elif duration > ost1_hard_max:
                 logger.warning(
                     f"片段 #{item['_id']} OST=1 时长 {duration:.1f}s 超过 {ost1_hard_max}s，"
@@ -374,6 +518,7 @@ def finalize_documentary_script_items(
         result = _break_consecutive_ost1(result, default_ost)
         for item in result:
             _warn_fazu2_forbidden_phrases(item)
+        result = _adjust_fazu2_ost1_timestamps(result, ost1_min)
         result = _adjust_fazu2_ost0_timestamps(result)
         ost0_count = sum(1 for item in result if int(item.get("OST", 0)) == 0)
         ost0_min = int(cfg.get("ost0_segment_min", 30) or 30)
@@ -381,8 +526,32 @@ def finalize_documentary_script_items(
             logger.warning(
                 f"罚罪2模式解说段 {ost0_count} 段，低于建议最少 {ost0_min} 段"
             )
+        ost1_count = sum(1 for item in result if int(item.get("OST", 0)) == 1)
+        min_ost1, max_ost1 = compute_ost1_segment_bounds(len(result), cfg)
+        if ost1_count < min_ost1:
+            logger.warning(
+                f"罚罪2模式原声 OST=1 仅 {ost1_count} 段，低于要求 {min_ost1}–{max_ost1} 段"
+            )
+        elif ost1_count > max_ost1:
+            logger.warning(
+                f"罚罪2模式原声 OST=1 共 {ost1_count} 段，超过上限 {max_ost1} 段"
+            )
 
     if is_compact_documentary_settings(cfg):
-        result = trim_compact_script_items(result, cfg)
+        min_segments, target_segments, max_segments = compute_compact_segment_bounds(
+            cfg, source_duration_sec=None
+        )
+        item_count = len(result)
+        if item_count < min_segments or item_count > max_segments:
+            logger.warning(
+                f"精剪脚本段数 {item_count} 不在 {min_segments}–{max_segments} 段范围内"
+                f"（目标约 {target_segments} 段）"
+            )
+
+    if fazu2_mode:
+        theme_name = (work_name or "").strip() or str(cfg.get("fazu2_core_theme") or "").strip()
+        result = apply_compact_opening_closing_hooks(
+            result, work_name=theme_name, settings=cfg
+        )
 
     return result

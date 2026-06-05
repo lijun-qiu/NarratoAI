@@ -91,26 +91,18 @@ def _build_merge_video_options(
 ) -> dict:
     """构建 merge_materials 的 options 字典。"""
     optimized_volumes = get_recommended_volumes_for_content('mixed')
-    has_original_audio_segments = any(segment.get('OST') == 1 for segment in list_script)
 
-    final_tts_volume = (
-        params.tts_volume
-        if hasattr(params, 'tts_volume') and params.tts_volume != 1.0
-        else optimized_volumes['tts_volume']
+    final_tts_volume = float(
+        getattr(params, 'tts_volume', optimized_volumes['tts_volume'])
+        or optimized_volumes['tts_volume']
     )
-    if has_original_audio_segments:
-        final_original_volume = 1.0
-        logger.info("检测到原声片段，原声音量设置为1.0以保持与原视频一致")
-    else:
-        final_original_volume = (
-            params.original_volume
-            if hasattr(params, 'original_volume') and params.original_volume != 0.7
-            else optimized_volumes['original_volume']
-        )
-    final_bgm_volume = (
-        params.bgm_volume
-        if hasattr(params, 'bgm_volume') and params.bgm_volume != 0.3
-        else optimized_volumes['bgm_volume']
+    final_original_volume = float(
+        getattr(params, 'original_volume', optimized_volumes['original_volume'])
+        or optimized_volumes['original_volume']
+    )
+    final_bgm_volume = float(
+        getattr(params, 'bgm_volume', optimized_volumes['bgm_volume'])
+        or optimized_volumes['bgm_volume']
     )
 
     video_output = get_video_output_settings()

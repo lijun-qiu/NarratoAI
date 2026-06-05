@@ -21,6 +21,9 @@ from webui.tools.generate_script_docu import generate_script_docu
 from webui.tools.generate_script_short import generate_script_short
 from webui.tools.generate_short_summary import generate_script_short_sunmmary
 from webui.tools.generate_film_tv_summary import generate_script_film_tv_summary
+from webui.components.frame_analysis_settings import render_frame_analysis_panel
+from webui.utils.script_stats import render_script_ost_summary
+from app.services.documentary.documentary_settings import get_documentary_compact_settings, compute_ost1_segment_bounds
 from app.services.film_tv_settings import (
     FILM_TV_DEFAULTS,
     get_film_tv_settings,
@@ -52,10 +55,10 @@ def render_script_panel(tr):
         # 根据脚本类型显示不同的布局
         if script_path == "auto":
             # 画面解说
-            render_video_details(tr, compact=False)
+            render_video_details(tr, params, compact=False)
         elif script_path == "auto_compact":
             # 逐帧精剪（纯解说快剪）
-            render_video_details(tr, compact=True)
+            render_video_details(tr, params, compact=True)
         elif script_path == "short":
             # 短剧混剪
             render_short_generate_options(tr)
@@ -90,12 +93,12 @@ def render_script_file(tr, params):
 
     # 模式选项映射
     mode_options = {
-        tr("Select/Upload Script"): MODE_FILE,
-        tr("Auto Generate"): MODE_AUTO,
         tr("Compact Frame Narration"): MODE_AUTO_COMPACT,
+        tr("Auto Generate"): MODE_AUTO,
+        tr("Film TV Narration"): MODE_FILM_TV,
         tr("Short Generate"): MODE_SHORT,
         tr("Short Drama Summary"): MODE_SUMMARY,
-        tr("Film TV Narration"): MODE_FILM_TV,
+        tr("Select/Upload Script"): MODE_FILE,
     }
     
     # 获取当前状态
@@ -116,7 +119,7 @@ def render_script_file(tr, params):
     elif current_path == "film_tv":
         default_index = mode_keys.index(tr("Film TV Narration"))
     elif not current_path:
-        default_index = mode_keys.index(tr("Film TV Narration"))
+        default_index = mode_keys.index(tr("Compact Frame Narration"))
     else:
         default_index = mode_keys.index(tr("Select/Upload Script"))
 
@@ -135,6 +138,13 @@ def render_script_file(tr, params):
             params.video_clip_json_path = new_mode
             if new_mode == MODE_AUTO_COMPACT:
                 st.session_state["documentary_script_mode"] = MODE_AUTO_COMPACT
+                from app.services.documentary.documentary_settings import (
+                    get_compact_custom_prompt_display,
+                )
+
+                prompt_key = "custom_prompt_input_compact"
+                if prompt_key not in st.session_state:
+                    st.session_state[prompt_key] = get_compact_custom_prompt_display()
             elif new_mode == MODE_AUTO:
                 st.session_state["documentary_script_mode"] = MODE_AUTO
             else:
@@ -382,67 +392,147 @@ def render_short_generate_options(tr):
     st.session_state['custom_clips'] = custom_clips
 
 
-def render_video_details(tr, *, compact: bool = False):
+def _ensure_doc_video_theme_default(doc_settings: dict, *, compact: bool) -> None:
+    """逐帧解说/精剪：初始化视频主题默认值。"""
+    theme_key = "doc_video_theme_compact" if compact else "doc_video_theme_full"
+    default_theme = str(doc_settings.get("default_video_theme") or "罚罪2").strip()
+    if theme_key not in st.session_state:
+        existing = str(st.session_state.get("video_theme") or "").strip()
+        st.session_state[theme_key] = existing or default_theme
+
+
+def _apply_compact_hook_session_overrides(doc_settings: dict) -> dict:
+    """将 WebUI 逐帧精剪开场/结尾配置合并进 settings。"""
+    merged = dict(doc_settings)
+    for key in (
+        "enable_opening_closing_hook",
+        "opening_hook_template",
+        "closing_hook_template",
+        "append_custom_prompt",
+    ):
+        if key in st.session_state:
+            merged[key] = st.session_state[key]
+    theme = str(st.session_state.get("doc_video_theme_compact") or "").strip()
+    if theme:
+        merged["default_video_theme"] = theme
+    return merged
+
+
+def render_video_details(tr, params, *, compact: bool = False):
     """画面解说 / 逐帧精剪：渲染视频主题和提示词"""
     from app.services.documentary.documentary_settings import (
+        get_compact_custom_prompt_display,
         get_documentary_compact_settings,
         get_documentary_settings,
+        save_documentary_compact_settings_to_config,
     )
 
     doc_settings = get_documentary_compact_settings() if compact else get_documentary_settings()
+    if compact:
+        doc_settings = _apply_compact_hook_session_overrides(doc_settings)
     default_interval = float(
         doc_settings.get("frame_interval_input")
         or config.frames.get("frame_interval_input", 3)
     )
-    default_prompt = str(doc_settings.get("default_custom_prompt") or "")
+    prompt_key = "custom_prompt_input_compact" if compact else "custom_prompt_input_full"
 
     if compact:
+        if prompt_key not in st.session_state:
+            st.session_state[prompt_key] = get_compact_custom_prompt_display(doc_settings)
+        default_prompt = st.session_state[prompt_key]
         st.caption(
-            "故事讲述型精剪：像说书人讲剧情（30–100 字/段），须写具体人名（禁警员1/说话人1）；"
-            "原声 ≤6 段；35–45 段。视频主题填剧名集数（如《罚罪2》第1集）。"
+            "默认「逐帧精剪」：下方为完整规则（可改）；首尾招呼按模板自动生成。"
+            "视频主题填剧名集数（如《罚罪2》第1集）。"
         )
+        with st.expander("开场白 / 结尾（可配置）", expanded=False):
+            enable_hook = st.checkbox(
+                "启用固定开场白与结尾",
+                value=bool(doc_settings.get("enable_opening_closing_hook", True)),
+                key="doc_compact_enable_opening_closing_hook",
+                help="关闭后不在首尾段自动插入模板；规则区也会标注为已关闭",
+            )
+            opening_tpl = st.text_input(
+                "开场白模板（{work_name} 替换为视频主题）",
+                value=str(
+                    doc_settings.get("opening_hook_template")
+                    or "宝子们，我们开始《{work_name}》啦！"
+                ),
+                key="doc_compact_opening_hook_template",
+                disabled=not enable_hook,
+            )
+            closing_tpl = st.text_input(
+                "结尾模板",
+                value=str(
+                    doc_settings.get("closing_hook_template") or "宝子们，我们下期再见！"
+                ),
+                key="doc_compact_closing_hook_template",
+                disabled=not enable_hook,
+            )
+            st.session_state["enable_opening_closing_hook"] = enable_hook
+            st.session_state["opening_hook_template"] = opening_tpl.strip()
+            st.session_state["closing_hook_template"] = closing_tpl.strip()
+            save_cols = st.columns([1, 3])
+            with save_cols[0]:
+                if st.button("保存到 config.toml", key="doc_compact_save_hooks"):
+                    payload = _apply_compact_hook_session_overrides(
+                        get_documentary_compact_settings()
+                    )
+                    if save_documentary_compact_settings_to_config(payload):
+                        st.success("已保存 [documentary_compact]")
+                    else:
+                        st.error("保存失败，请查看日志")
+        prompt_height = 260
+        prompt_help = "故事讲述型完整规则，修改后参与脚本生成"
+    else:
+        default_prompt = str(doc_settings.get("default_custom_prompt") or "")
+        if prompt_key not in st.session_state:
+            st.session_state[prompt_key] = default_prompt
+        prompt_height = 120
+        prompt_help = tr("Custom prompt for LLM, leave empty to use default prompt")
 
-    render_documentary_subtitle_options(tr, doc_settings)
+    render_documentary_subtitle_options(tr, doc_settings, params=params, compact=compact)
+    render_frame_analysis_panel(tr, params, compact=compact)
 
-    video_theme = st.text_input(tr("Video Theme"))
+    _ensure_doc_video_theme_default(doc_settings, compact=compact)
+    theme_key = "doc_video_theme_compact" if compact else "doc_video_theme_full"
+    video_theme = st.text_input(
+        tr("Video Theme"),
+        key=theme_key,
+        help="默认「罚罪2」；精剪模式建议写清集数，如《罚罪2》第1集",
+    )
+    if compact:
+        reset_cols = st.columns([1, 4])
+        with reset_cols[0]:
+            if st.button("恢复默认规则", key="reset_compact_prompt_rules"):
+                fresh = get_documentary_compact_settings()
+                fresh = _apply_compact_hook_session_overrides(fresh)
+                st.session_state[prompt_key] = get_compact_custom_prompt_display(fresh)
+                st.rerun()
     custom_prompt = st.text_area(
         tr("Generation Prompt"),
-        value=st.session_state.get("video_plot", default_prompt),
-        help=tr("Custom prompt for LLM, leave empty to use default prompt"),
-        height=180,
-        key="custom_prompt_input_compact" if compact else "custom_prompt_input_full",
+        help=prompt_help,
+        height=prompt_height,
+        key=prompt_key,
     )
-    interval_key = "frame_interval_input_compact" if compact else "frame_interval_input_full"
-    # 非短视频模式下显示原有的三个输入框
-    input_cols = st.columns(2)
-
-    with input_cols[0]:
-        st.number_input(
-            tr("Frame Interval (seconds)"),
-            min_value=0.0,
-            value=float(st.session_state.get(interval_key, default_interval)),
-            help=tr("Frame Interval (seconds) (More keyframes consume more tokens)"),
-            key=interval_key,
-        )
-
-    with input_cols[1]:
-        st.number_input(
-            tr("Batch Size"),
-            min_value=0,
-            value=st.session_state.get('vision_batch_size', config.frames.get('vision_batch_size', 10)),
-            help=tr("Batch Size (More keyframes consume more tokens)"),
-            key="vision_batch_size"
-        )
+    append_key = "append_prompt_input_compact" if compact else "append_prompt_input_full"
+    if append_key not in st.session_state:
+        st.session_state[append_key] = str(doc_settings.get("append_custom_prompt") or "")
+    append_prompt = st.text_area(
+        "追加提示词",
+        help=(
+            "叠加在上方自定义提示词之后，仅参与脚本生成（不参与抽帧视觉分析）。"
+            "适合写本集固定要求，如必讲情节、人物关系、留白段落等。"
+        ),
+        height=72,
+        key=append_key,
+    )
     st.session_state["video_theme"] = video_theme
     st.session_state["custom_prompt"] = custom_prompt
-    st.session_state["frame_interval_input"] = st.session_state.get(
-        interval_key,
-        default_interval,
-    )
+    st.session_state["append_custom_prompt"] = append_prompt
     return video_theme, custom_prompt
 
 
-def render_documentary_subtitle_options(tr, doc_settings: dict):
+def render_documentary_subtitle_options(tr, doc_settings, *, params=None, compact: bool = False):
     """逐帧解说 / 精剪：可选字幕与抽帧结合。"""
     default_enabled = bool(doc_settings.get("enable_subtitle_enrichment", True))
     st.checkbox(
@@ -453,6 +543,8 @@ def render_documentary_subtitle_options(tr, doc_settings: dict):
     )
     if not st.session_state.get("doc_enable_subtitle_enrichment", default_enabled):
         return
+
+    st.caption("请先完成字幕转写/上传，再执行下方「抽帧并分析」，以便一次完成硬字幕校准与脚本生成。")
 
     render_fun_asr_transcription(tr)
 
@@ -501,6 +593,74 @@ def render_documentary_subtitle_options(tr, doc_settings: dict):
             st.rerun()
         except Exception as e:
             st.error(f"{tr('Upload failed')}: {str(e)}")
+
+    if doc_settings.get("enable_subtitle_refinement", True):
+        _render_subtitle_refinement_panel(tr, params=params, compact=compact)
+
+
+def _render_subtitle_refinement_panel(tr, *, params=None, compact: bool = False):
+    """对照抽帧分析校正 ASR 字幕（产出 *_refined.srt / *_ocr_refined.srt）。"""
+    from app.services.documentary.documentary_settings import get_documentary_compact_settings, get_documentary_settings
+    from app.services.documentary.frame_analysis_pairing import find_paired_frame_analysis_path
+    from app.services.documentary.hard_subtitle_ocr_service import get_ocr_refined_subtitle_path
+    from app.services.documentary.subtitle_refinement_service import get_refined_subtitle_path
+    from webui.tools.ocr_calibrate_subtitle_docu import ocr_calibrate_subtitle_docu
+    from webui.tools.refine_subtitle_docu import refine_subtitle_docu
+
+    video_path = (st.session_state.get("video_origin_path") or "").strip()
+    if not video_path:
+        return
+
+    doc_settings = get_documentary_compact_settings() if compact else get_documentary_settings()
+
+    with st.expander("对照抽帧校正字幕（手动重跑）", expanded=False):
+        st.caption(
+            "抽帧/上传分析 JSON 时会**自动**完成硬字幕 OCR + LLM 校正（与抽帧同一次视觉调用，不重复计费）。"
+            "此处按钮仅用于手动重跑。优先使用 `*_ocr_refined.srt` / `*_refined.srt`。"
+        )
+
+        ocr_path = get_ocr_refined_subtitle_path(video_path)
+        refined_path = get_refined_subtitle_path(video_path)
+        if ocr_path and os.path.isfile(ocr_path):
+            st.success(f"已有 OCR 校准字幕: **{os.path.basename(ocr_path)}**")
+        elif refined_path and os.path.isfile(refined_path):
+            st.success(f"已有 LLM 校正字幕: **{os.path.basename(refined_path)}**")
+        else:
+            st.caption("尚未生成校正字幕")
+
+        analysis_path = (st.session_state.get("frame_analysis_json_path") or "").strip()
+        if not analysis_path or not os.path.isfile(analysis_path):
+            analysis_path = find_paired_frame_analysis_path(video_path) or ""
+        if analysis_path:
+            st.caption(f"将对照: `{os.path.basename(analysis_path)}`")
+        else:
+            st.warning("请先完成抽帧分析，再校正字幕")
+
+        subtitle_ready = bool(
+            (st.session_state.get("subtitle_path") or find_paired_subtitle_path(video_path))
+        )
+        can_refine = bool(analysis_path and subtitle_ready and params is not None)
+
+        if doc_settings.get("enable_hard_subtitle_ocr", True):
+            st.caption(
+                "手动重跑 OCR：旧版 JSON 无 burned_in_subtitle 时会二次调用视觉模型裁剪 OCR。"
+            )
+            if st.button(
+                "手动重跑硬字幕 OCR",
+                key="doc_ocr_calibrate_subtitle_btn",
+                use_container_width=True,
+                disabled=not can_refine,
+            ):
+                ocr_calibrate_subtitle_docu(params, compact=compact)
+
+        if doc_settings.get("enable_subtitle_refinement", True):
+            if st.button(
+                "手动重跑 LLM 校正",
+                key="doc_refine_subtitle_btn",
+                use_container_width=True,
+                disabled=not can_refine,
+            ):
+                refine_subtitle_docu(params, compact=compact)
 
 
 def short_drama_summary(tr):
@@ -1151,6 +1311,18 @@ def render_script_buttons(tr, params):
             load_script(tr, script_path)
 
     # 视频脚本编辑区
+    script_items = st.session_state.get("video_clip_json") or []
+    script_path = st.session_state.get("video_clip_json_path", "")
+    min_ost1_hint = None
+    max_ost1_hint = None
+    if script_path == "auto_compact":
+        min_ost1_hint, max_ost1_hint = compute_ost1_segment_bounds(
+            len(script_items), get_documentary_compact_settings()
+        )
+    render_script_ost_summary(
+        script_items, min_ost1=min_ost1_hint, max_ost1=max_ost1_hint
+    )
+
     video_clip_json_details = st.text_area(
         tr("Video Script"),
         value=json.dumps(st.session_state.get('video_clip_json', []), indent=2, ensure_ascii=False),

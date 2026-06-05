@@ -627,9 +627,13 @@ class ScriptProcessor:
                 # 更新当前时间点
                 current_time += duration
 
-            # 保存结果
-            file_name = f"storage/json/step2_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
-            os.makedirs(os.path.dirname(file_name), exist_ok=True)
+            from app.utils import utils
+
+            json_dir = utils.storage_dir("json", create=True)
+            file_name = os.path.join(
+                json_dir,
+                f"step2_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json",
+            )
 
             with open(file_name, 'w', encoding='utf-8') as file:
                 json.dump(frame_content_list, file, ensure_ascii=False, indent=4)

@@ -18,9 +18,9 @@ class AudioConfig:
     
     # 默认音量配置
     DEFAULT_VOLUMES = {
-        'tts_volume': 0.8,          # TTS音量稍微降低
-        'original_volume': 1.3,     # 原声音量提高
-        'bgm_volume': 0.3,          # 背景音乐保持较低
+        'tts_volume': 1.3,
+        'original_volume': 1.3,
+        'bgm_volume': 0.3,
     }
     
     # 音频质量配置
@@ -134,7 +134,7 @@ class AudioConfig:
             'balanced': {
                 'tts_volume': 0.8,
                 'original_volume': 1.2,
-                'bgm_volume': 0.3,
+                'bgm_volume': 0.2,
             },
             'voice_focused': {
                 'tts_volume': 1.0,
@@ -181,24 +181,24 @@ def get_recommended_volumes_for_content(content_type: str = 'mixed') -> Dict[str
     """
     recommendations = {
         'mixed': {
-            'tts_volume': 0.8,
+            'tts_volume': 1.3,
             'original_volume': 1.3,
             'bgm_volume': 0.3,
         },
         'voice_only': {
             'tts_volume': 1.0,
-            'original_volume': 0.5,
-            'bgm_volume': 0.2,
-        },
-        'original_heavy': {
-            'tts_volume': 0.6,
-            'original_volume': 1.6,
+            'original_volume': 0.8,
             'bgm_volume': 0.1,
         },
+        'original_heavy': {
+            'tts_volume': 0.9,
+            'original_volume': 1.5,
+            'bgm_volume': 0.08,
+        },
         'music_video': {
-            'tts_volume': 0.7,
-            'original_volume': 1.8,
-            'bgm_volume': 0.0,  # 不添加额外BGM
+            'tts_volume': 0.9,
+            'original_volume': 1.6,
+            'bgm_volume': 0.0,
         }
     }
     

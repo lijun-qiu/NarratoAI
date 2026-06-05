@@ -119,8 +119,8 @@ class DocumentaryFrameAnalysisServiceScriptGenerationTests(unittest.IsolatedAsyn
 
             with patch.object(
                 DocumentaryFrameAnalysisService,
-                "analyze_video",
-                AsyncMock(return_value={"analysis_json_path": str(analysis_path)}),
+                "resolve_reusable_analysis_path",
+                return_value=str(analysis_path),
             ), patch.dict(
                 "app.services.documentary.frame_analysis_service.config.app",
                 {
@@ -167,8 +167,8 @@ class DocumentaryFrameAnalysisServiceScriptGenerationTests(unittest.IsolatedAsyn
 
             with patch.object(
                 DocumentaryFrameAnalysisService,
-                "analyze_video",
-                AsyncMock(return_value={"analysis_json_path": str(analysis_path)}),
+                "resolve_reusable_analysis_path",
+                return_value=str(analysis_path),
             ), patch.dict(
                 "app.services.documentary.frame_analysis_service.config.app",
                 {
@@ -243,8 +243,8 @@ class DocumentaryFrameAnalysisServiceScriptGenerationTests(unittest.IsolatedAsyn
 
             with patch.object(
                 DocumentaryFrameAnalysisService,
-                "analyze_video",
-                AsyncMock(return_value={"analysis_json_path": str(analysis_path)}),
+                "resolve_reusable_analysis_path",
+                return_value=str(analysis_path),
             ), patch.dict(
                 "app.services.documentary.frame_analysis_service.config.app",
                 {
@@ -277,7 +277,7 @@ class DocumentaryFrameAnalysisServiceScriptGenerationTests(unittest.IsolatedAsyn
         service = DocumentaryFrameAnalysisService()
 
         with patch.dict(
-            "app.services.documentary.frame_analysis_service.config.app",
+            "app.services.documentary.frame_extraction_service.config.app",
             {
                 "vision_llm_provider": "openai",
                 "vision_openai_api_key": "config-key",
@@ -285,7 +285,7 @@ class DocumentaryFrameAnalysisServiceScriptGenerationTests(unittest.IsolatedAsyn
                 "vision_openai_base_url": "https://config.example/v1",
             },
         ), patch(
-            "app.services.documentary.frame_analysis_service.os.path.exists",
+            "app.services.documentary.frame_extraction_service.os.path.exists",
             return_value=True,
         ), patch.object(
             service,
@@ -304,7 +304,7 @@ class DocumentaryFrameAnalysisServiceScriptGenerationTests(unittest.IsolatedAsyn
             "_build_video_clip_json",
             return_value=[],
         ), patch(
-            "app.services.documentary.frame_analysis_service.create_vision_analyzer",
+            "app.services.documentary.frame_extraction_service.create_vision_analyzer",
             return_value=object(),
         ) as mocked_create_analyzer:
             await service.analyze_video(

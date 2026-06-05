@@ -709,6 +709,9 @@ def render_text_llm_settings(tr):
         DEFAULT_TEXT_OPENAI_MODEL_NAME,
         provider=DEFAULT_TEXT_LLM_PROVIDER,
     )
+    if st.session_state.get("_text_model_config_source") != full_text_model_name:
+        st.session_state["text_model_input"] = current_model
+        st.session_state["_text_model_config_source"] = full_text_model_name
 
     # 定义支持的 provider 列表
     OPENAI_COMPATIBLE_PROVIDERS = ["openai"]
@@ -804,9 +807,11 @@ def render_text_llm_settings(tr):
     if st_text_model_name:
         is_valid, error_msg = validate_openai_compatible_model_name(st_text_model_name, "文案生成")
         if is_valid:
-            config.app["text_openai_model_name"] = st_text_model_name
-            st.session_state["text_openai_model_name"] = st_text_model_name
-            text_config_changed = True
+            saved_model = config.app.get("text_openai_model_name") or ""
+            if st_text_model_name != saved_model:
+                config.app["text_openai_model_name"] = st_text_model_name
+                st.session_state["text_openai_model_name"] = st_text_model_name
+                text_config_changed = True
         else:
             text_validation_errors.append(error_msg)
 

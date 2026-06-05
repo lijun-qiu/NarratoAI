@@ -12,6 +12,7 @@ from loguru import logger
 
 from app.config import config
 from app.services.documentary.documentary_settings import (
+    compute_ost1_segment_bounds,
     get_documentary_settings,
     is_compact_documentary_settings,
     is_fazu2_compact_settings,
@@ -110,12 +111,13 @@ def build_subtitle_cross_validation_instructions(
         "- 写 `timestamp` 时优先采用字幕/抽帧已有时间范围，严禁重叠",
     ]
     if is_fazu2_compact_settings(cfg):
+        min_ost1, max_ost1 = compute_ost1_segment_bounds(settings=cfg)
         lines.extend(
             [
                 "",
                 "### 精剪 · 故事讲述型",
                 "- 列出本集剧情情节点（按时间顺序）；多数对白写入 OST=0 解说叙述",
-                "- 从字幕列出 ≤6 个 OST=1 金句候选：精确时间戳 + 台词原文",
+                f"- 从字幕列出 **{min_ost1}–{max_ost1}** 个 OST=1 金句候选：精确时间戳 + 台词原文",
                 "- 禁止规划相邻 OST=1；禁止镜头/导演分析；脚本须用**人名**勿用警员1/说话人1",
             ]
         )
@@ -173,6 +175,7 @@ def analyze_subtitle_with_frames(
 
     compact = is_compact_documentary_settings(cfg)
     if is_fazu2_compact_settings(cfg):
+        min_ost1, max_ost1 = compute_ost1_segment_bounds(settings=cfg)
         prompt = f"""你是电视剧「故事讲述型」解说策划，请结合**抽帧画面**与**原始字幕**，输出供写脚本用的对照分析（350–550 字）。
 
 作品/主题：{theme}
@@ -180,7 +183,7 @@ def analyze_subtitle_with_frames(
 请包含：
 1. **主要人物表**：姓名 + 身份/关系（如胡小月-女警、秦枫-师弟、罗博-金鼎集团）
 2. **本集剧情主线**（按时间顺序 5–8 个情节点，口语化，写清**人名**）
-3. **OST=1 金句候选（≤6 条）**：台词原文 + **字幕精确时间戳** + 说话人**姓名**
+3. **OST=1 金句候选（{min_ost1}–{max_ost1} 条）**：台词原文 + **字幕精确时间戳** + 说话人**姓名**
 4. **可写入解说的关键对白**（10–15 条）：说话人姓名 + 台词摘要
 5. 禁忌：不要警员1/说话人1等编号；不要镜头/导演分析；不要然后/接着
 """

@@ -1,6 +1,12 @@
 .DS_Store
 /config.toml
 /storage/
+# instances 下仅跟踪 instances/<id>/config.toml，storage/temp 等仍忽略
+/instances/*
+!/instances/*/
+/instances/*/*
+/instances/*.srt
+!/instances/*/config.toml
 /.idea/
 /app/services/__pycache__
 /app/__pycache__/
@@ -12,7 +18,8 @@
 /**/.streamlit
 __pycache__
 logs/
-
+*.mp4
+*.mp3
 node_modules
 # VuePress 默认临时文件目录
 /sites/docs/.vuepress/.temp
@@ -23,6 +30,7 @@ node_modules
 # 模型目录
 /models/
 ./models/*
+resource/scripts/*.srt
 resource/scripts/*.json
 resource/videos/*.mp4
 resource/songs/*.mp3
@@ -51,3 +59,6 @@ tests/*
 !tests/test_script_service_documentary_unittest.py
 !tests/test_generate_narration_script_documentary_unittest.py
 !tests/test_generate_script_docu_unittest.py
+!tests/test_subtitle_refinement_unittest.py
+!tests/test_hard_subtitle_ocr_unittest.py
+!tests/test_subtitle_typo_calibration_unittest.py

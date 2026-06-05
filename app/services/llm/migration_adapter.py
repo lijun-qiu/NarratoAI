@@ -141,6 +141,7 @@ class LegacyLLMAdapter:
                 response_format="json",
                 api_key=api_key,
                 api_base=base_url,
+                model=model,
                 for_script=True,
             )
             cleaned = LegacyLLMAdapter._clean_json_output(

@@ -25,8 +25,9 @@ VIDEO_OUTPUT_DEFAULTS: Dict[str, Any] = {
 
 
 def _config_file_path() -> str:
-    root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.realpath(__file__))))
-    return os.path.join(root, "config.toml")
+    from app.config import config
+
+    return config.config_file
 
 
 def get_video_output_settings(overrides: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:

@@ -1,5 +1,6 @@
 import unittest
 import os
+import json
 from tempfile import TemporaryDirectory
 from unittest.mock import patch
 
@@ -148,13 +149,17 @@ class DocumentaryFrameAnalysisServiceTests(unittest.TestCase):
             [
                 {
                     "frame_path": "/tmp/keyframe_000000_000000000.jpg",
-                    "timestamp": "",
+                    "timestamp": "00:00:00,000",
                     "observation": "第一帧画面",
+                    "burned_in_subtitle": "",
+                    "has_burned_in_subtitle": False,
                 },
                 {
                     "frame_path": "/tmp/keyframe_000075_000003000.jpg",
-                    "timestamp": "",
+                    "timestamp": "00:00:03,000",
                     "observation": "第二帧画面",
+                    "burned_in_subtitle": "",
+                    "has_burned_in_subtitle": False,
                 },
             ],
             batch.frame_observations,
@@ -190,7 +195,7 @@ class DocumentaryFrameAnalysisServiceTests(unittest.TestCase):
     def test_cache_key_changes_when_interval_changes(self):
         service = DocumentaryFrameAnalysisService()
 
-        with patch("app.services.documentary.frame_analysis_service.os.path.getmtime", return_value=100.0):
+        with patch("app.services.documentary.frame_extraction_service.os.path.getmtime", return_value=100.0):
             key_a = service._build_cache_key("video.mp4", 3.0, "prompt-v1", "model-a", 10, 2)
             key_b = service._build_cache_key("video.mp4", 5.0, "prompt-v1", "model-a", 10, 2)
 
@@ -199,7 +204,7 @@ class DocumentaryFrameAnalysisServiceTests(unittest.TestCase):
     def test_cache_key_changes_when_model_changes(self):
         service = DocumentaryFrameAnalysisService()
 
-        with patch("app.services.documentary.frame_analysis_service.os.path.getmtime", return_value=100.0):
+        with patch("app.services.documentary.frame_extraction_service.os.path.getmtime", return_value=100.0):
             key_a = service._build_cache_key("video.mp4", 3.0, "prompt-v1", "model-a", 10, 2)
             key_b = service._build_cache_key("video.mp4", 3.0, "prompt-v1", "model-b", 10, 2)
 
@@ -208,7 +213,7 @@ class DocumentaryFrameAnalysisServiceTests(unittest.TestCase):
     def test_cache_key_starts_with_legacy_video_hash_prefix(self):
         service = DocumentaryFrameAnalysisService()
 
-        with patch("app.services.documentary.frame_analysis_service.os.path.getmtime", return_value=123.0):
+        with patch("app.services.documentary.frame_extraction_service.os.path.getmtime", return_value=123.0):
             key = service._build_cache_key("video.mp4", 3.0, "prompt-v1", "model-a", 10, 2)
 
         expected_prefix = utils.md5("video.mp4" + "123.0")
@@ -220,7 +225,7 @@ class DocumentaryFrameAnalysisServiceTests(unittest.TestCase):
             analysis_dir = os.path.join(temp_root, "analysis")
             os.makedirs(analysis_dir, exist_ok=True)
 
-            with patch("app.services.documentary.frame_analysis_service.os.path.getmtime", return_value=123.0):
+            with patch("app.services.documentary.frame_extraction_service.os.path.getmtime", return_value=123.0):
                 target_key_a = service._build_cache_key("video.mp4", 3.0, "prompt-v1", "model-a", 10, 2)
                 target_key_b = service._build_cache_key("video.mp4", 5.0, "prompt-v1", "model-a", 10, 2)
                 keep_key = service._build_cache_key("other.mp4", 3.0, "prompt-v1", "model-a", 10, 2)
@@ -240,6 +245,59 @@ class DocumentaryFrameAnalysisServiceTests(unittest.TestCase):
             self.assertFalse(os.path.exists(target_dir_a))
             self.assertFalse(os.path.exists(target_dir_b))
             self.assertTrue(os.path.exists(keep_dir))
+
+
+    def test_default_analysis_path_uses_video_stem(self):
+        with TemporaryDirectory() as temp_dir:
+            with patch.object(utils, "storage_dir", return_value=temp_dir):
+                path = DocumentaryFrameAnalysisService.default_analysis_path_for_video(
+                    r"C:\videos\6月4日(1).mp4"
+                )
+                self.assertTrue(path.endswith("6月4日(1)_frame_analysis.json"))
+                self.assertIn(os.path.join("temp", "analysis"), path)
+
+    def test_resolve_reusable_analysis_path_prefers_default_video_file(self):
+        service = DocumentaryFrameAnalysisService()
+        with TemporaryDirectory() as temp_dir:
+            video_path = os.path.join(temp_dir, "demo.mp4")
+            with open(video_path, "wb") as fp:
+                fp.write(b"demo")
+
+            with patch.object(utils, "storage_dir", return_value=temp_dir):
+                default_path = service.default_analysis_path_for_video(video_path)
+                os.makedirs(os.path.dirname(default_path), exist_ok=True)
+                artifact = {
+                    "artifact_version": "documentary-frame-analysis-v2",
+                    "video_path": video_path,
+                    "batches": [{"batch_index": 1, "frame_observations": []}],
+                }
+                with open(default_path, "w", encoding="utf-8") as fp:
+                    json.dump(artifact, fp)
+
+                resolved = service.resolve_reusable_analysis_path(
+                    video_path,
+                    reuse=True,
+                )
+                self.assertEqual(default_path, resolved)
+
+    def test_save_analysis_artifact_writes_video_named_file(self):
+        service = DocumentaryFrameAnalysisService()
+        with TemporaryDirectory() as temp_dir:
+            video_path = os.path.join(temp_dir, "episode1.mp4")
+            with patch.object(utils, "storage_dir", return_value=temp_dir):
+                saved_path = service._save_analysis_artifact(
+                    {
+                        "artifact_version": "documentary-frame-analysis-v2",
+                        "video_path": video_path,
+                        "batches": [],
+                    },
+                    video_path=video_path,
+                )
+                self.assertEqual(
+                    service.default_analysis_path_for_video(video_path),
+                    saved_path,
+                )
+                self.assertTrue(os.path.isfile(saved_path))
 
 
 class DocumentaryAnalysisConfigTests(unittest.TestCase):

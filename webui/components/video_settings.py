@@ -48,16 +48,30 @@ def render_video_config(tr, params):
     )
     st.session_state['video_quality'] = video_qualities[quality_index][1]
 
-    # 原声音量 - 使用统一的默认值
-    params.original_volume = st.slider(
-        tr("Original Volume"),
-        min_value=AudioVolumeDefaults.MIN_VOLUME,
-        max_value=AudioVolumeDefaults.MAX_VOLUME,
-        value=AudioVolumeDefaults.ORIGINAL_VOLUME,
-        step=0.01,
-        help=tr("Adjust the volume of the original audio")
-    )
-    st.session_state['original_volume'] = params.original_volume
+    # 成片音量：解说 / 原声应明显高于 BGM
+    vol_cols = st.columns(3)
+    with vol_cols[0]:
+        params.tts_volume = st.slider(
+            "解说配音音量",
+            min_value=AudioVolumeDefaults.MIN_VOLUME,
+            max_value=AudioVolumeDefaults.MAX_VOLUME,
+            value=float(st.session_state.get('tts_volume', AudioVolumeDefaults.TTS_VOLUME)),
+            step=0.01,
+            help="合成成片时 AI 解说轨音量",
+        )
+        st.session_state['tts_volume'] = params.tts_volume
+    with vol_cols[1]:
+        params.original_volume = st.slider(
+            tr("Original Volume"),
+            min_value=AudioVolumeDefaults.MIN_VOLUME,
+            max_value=AudioVolumeDefaults.MAX_VOLUME,
+            value=float(st.session_state.get('original_volume', AudioVolumeDefaults.ORIGINAL_VOLUME)),
+            step=0.01,
+            help=tr("Adjust the volume of the original audio"),
+        )
+        st.session_state['original_volume'] = params.original_volume
+    with vol_cols[2]:
+        st.caption("BGM 音量在「音频设置 → 背景音乐」中调节")
 
 
 def render_video_output_settings(tr):
@@ -147,6 +161,7 @@ def get_video_params():
     return {
         'video_aspect': st.session_state.get('video_aspect', VideoAspect.portrait.value),
         'video_quality': st.session_state.get('video_quality', '1080p'),
+        'tts_volume': st.session_state.get('tts_volume', AudioVolumeDefaults.TTS_VOLUME),
         'original_volume': st.session_state.get('original_volume', AudioVolumeDefaults.ORIGINAL_VOLUME),
         'watermark_text': vo.get('watermark_text', VIDEO_OUTPUT_DEFAULTS['watermark_text']),
         'enable_picture_narration': enable_picture_narration,

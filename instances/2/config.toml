@@ -1,0 +1,189 @@
+[app]
+project_version = "0.7.8"
+llm_vision_timeout = 120
+llm_text_timeout = 180
+llm_script_timeout = 600
+llm_timeout_retries = 2
+llm_max_retries = 3
+vision_llm_provider = "openai"
+vision_openai_model_name = "gemini-3.1-flash-lite"
+vision_openai_api_key = "sk-hp3uSiaWUqTf00aUJVREZ8PNz9cC8Ql2HGSoF7k3c817sZVd"
+vision_openai_base_url = "https://api.4022543.xyz/v1"
+text_llm_provider = "openai"
+text_openai_model_name = "deepseek-v4-flash"
+text_openai_api_key = "sk-hp3uSiaWUqTf00aUJVREZ8PNz9cC8Ql2HGSoF7k3c817sZVd"
+text_openai_base_url = "https://api.4022543.xyz/v1"
+hide_config = true
+video_clip_json_path = "C:\\my\\NarratoAI\\resource\\scripts\\2026-0604-175051.json"
+
+[azure]
+speech_key = ""
+speech_region = ""
+
+[tencent]
+secret_id = ""
+secret_key = ""
+region = "ap-beijing"
+
+[soulvoice]
+api_key = ""
+voice_uri = "speech:mcg3fdnx:clzkyf4vy00e5qr6hywum4u84:bzznlkuhcjzpbosexitr"
+api_url = "https://tts.scsmtech.cn/tts"
+model = "FunAudioLLM/CosyVoice2-0.5B"
+
+[tts_qwen]
+api_key = ""
+model_name = "qwen3-tts-flash"
+
+[fun_asr]
+api_key = "sk-6a206a58793046b1bd1fe3ba40668f59"
+model = "fun-asr"
+
+[indextts2]
+api_url = "http://127.0.0.1:8081/tts"
+infer_mode = "普通推理"
+temperature = 1.0
+top_p = 0.8
+top_k = 30
+do_sample = true
+num_beams = 3
+repetition_penalty = 10.0
+
+[doubaotts]
+ak = ""
+sk = ""
+appid = ""
+token = ""
+cluster = "volcano_tts"
+volume = 1.0
+pitch = 1.0
+silence_duration = 0.125
+
+[ui]
+tts_engine = "edge_tts"
+edge_voice_name = "zh-CN-XiaoyiNeural-Female"
+edge_volume = 60
+edge_rate = 1.0
+edge_pitch = 0
+azure_voice_name = "zh-CN-liaoning-XiaobeiNeural-Female"
+azure_volume = 80
+azure_rate = 1.0
+azure_pitch = 0
+doubaotts_voice_type = "BV700_V2_streaming"
+doubaotts_rate = 1.0
+language = "zh"
+jianying_draft_path = ""
+voice_name = "zh-CN-XiaoyiNeural-Female"
+font_name = "simhei.ttf"
+text_fore_color = "#FFFFFF"
+font_size = 46
+subtitle_position = "custom"
+custom_position = 60.0
+
+[proxy]
+http = ""
+https = ""
+enabled = false
+
+[frames]
+frame_interval_input = 3
+vision_batch_size = 10
+vision_max_concurrency = 2
+
+[documentary]
+enable_original_audio_highlights = true
+ost1_duration_min = 3
+ost1_duration_max = 12
+ost1_every_n_segments = 10
+default_narration_ost = 2
+enable_full_timeline_coverage = true
+coverage_interval_sec = 30
+narration_chars_min = 20
+narration_chars_max = 40
+enable_subtitle_enrichment = true
+frame_interval_input = 3
+narration_chunk_max_items_per_call = 20
+narration_script_max_tokens = 16000
+narration_script_temperature = 0.4
+
+[documentary_compact]
+documentary_compact_mode = true
+documentary_compact_style = "fazu2"
+default_narration_ost = 0
+enable_full_timeline_coverage = false
+target_output_minutes = 12
+frame_interval_input = 3
+min_total_segments = 35
+max_total_segments = 45
+ost0_segment_min = 30
+enable_humor_narration = false
+enable_logic_roast = false
+narration_chars_min = 30
+narration_chars_max = 100
+ost1_duration_min = 3
+ost1_duration_max = 8
+ost1_duration_hard_max = 10
+min_ost1_segments = 5
+max_ost1_segments = 10
+ost1_every_n_segments = 10
+fazu2_core_theme = ""
+narration_chunk_max_items_per_call = 20
+narration_script_max_tokens = 16000
+narration_script_temperature = 0.4
+
+[gemini_asr]
+api_key = "sk-hp3uSiaWUqTf00aUJVREZ8PNz9cC8Ql2HGSoF7k3c817sZVd"
+model = "gemini-3.1-flash-lite"
+base_url = "https://api.4022543.xyz/v1"
+provider = "auto"
+fallback_whisper = true
+
+[whisper_asr]
+api_key = "sk-hp3uSiaWUqTf00aUJVREZ8PNz9cC8Ql2HGSoF7k3c817sZVd"
+base_url = "https://api.4022543.xyz/v1"
+model = "whisper-1"
+language = "zh"
+engine = "api"
+
+[film_tv]
+rules_source_mode = "markdown"
+rules_markdown_file = "fazu2_8min_master.md"
+preset_id = "fazu2"
+target_duration_percent = 20
+ost1_duration_min = 8
+ost1_duration_max = 12
+ost1_duration_long_max = 12
+ost1_segment_min = 10
+ost1_segment_max = 14
+ost0_segment_min = 12
+ost0_segment_max = 16
+original_audio_percent = 48
+narration_percent = 52
+allow_consecutive_ost1 = true
+enforce_narration_after_ost1 = true
+narration_chars_min = 48
+narration_chars_max = 72
+opening_chars_max = 130
+max_consecutive_ost0 = 3
+max_consecutive_ost1 = 3
+content_type = "tv_series"
+episode_number = 1
+tv_opening_line_template = "宝子们，我们开始《{film_name}》第{episode}集啦！"
+tv_closing_line_template = "好啦宝子们，我们下集再见！"
+tv_recap_prev_episode = true
+tv_recap_chars_min = 40
+tv_recap_chars_max = 80
+
+[transcription]
+enable_fallback = true
+
+[perfect_subtitle]
+
+[video_output]
+watermark_text = "@小超剪辑"
+enable_picture_narration = true
+picture_narration_font_size = 44
+picture_narration_color = "#FFE066"
+original_subtitle_color = "#FFE066"
+picture_narration_max_chars = 16
+picture_narration_duration = 5.0

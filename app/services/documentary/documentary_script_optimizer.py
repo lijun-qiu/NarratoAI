@@ -38,6 +38,7 @@ from app.services.srt_utils import (
     normalize_script_timestamp_range,
     parse_srt,
     parse_timestamp_range,
+    repair_or_drop_invalid_timestamp_items,
 )
 
 
@@ -373,8 +374,21 @@ def _apply_clip_range_to_item(
         return False
     if ost1_hard_max_ms and clip_end - clip_start > ost1_hard_max_ms:
         clip_end = clip_start + ost1_hard_max_ms
+
+    clip_start_final = clip_start
     if previous_end_ms is not None and clip_start < previous_end_ms:
-        clip_start = previous_end_ms
+        if previous_end_ms < clip_end:
+            clip_start_final = previous_end_ms
+        else:
+            logger.debug(
+                f"片段 #{item.get('_id')} 对位区间与前段结束重叠且无法推移，"
+                f"保留原 clip_start"
+            )
+
+    if clip_end <= clip_start_final:
+        return False
+
+    clip_start = clip_start_final
 
     old_start, old_end = parse_timestamp_range(str(item.get("timestamp") or ""))
     if clip_start == old_start and clip_end == old_end:
@@ -431,12 +445,25 @@ def _align_items_to_frame_time_ranges(
             item_end_ms=end_ms,
         )
         ost1_cap = max_ost1_span_ms if int(item.get("OST", 0)) == 1 else None
-        if _apply_clip_range_to_item(
+        applied = _apply_clip_range_to_item(
             item,
             clip_range,
             previous_end_ms=previous_end_ms,
             ost1_hard_max_ms=ost1_cap,
-        ):
+        )
+        if not applied and previous_end_ms is not None and clip_range:
+            applied = _apply_clip_range_to_item(
+                item,
+                clip_range,
+                previous_end_ms=None,
+                ost1_hard_max_ms=ost1_cap,
+            )
+            if applied:
+                logger.info(
+                    f"片段 #{item.get('_id')} 对位：前段结束约束导致区间无效，"
+                    f"已改用抽帧 time_range 原区间"
+                )
+        if applied:
             try:
                 _, previous_end_ms = parse_timestamp_range(str(item.get("timestamp") or ""))
             except Exception:
@@ -464,12 +491,20 @@ def _align_items_to_frame_time_ranges(
         if cue_end <= cue_start:
             continue
         fallback_range = f"{format_timestamp_ms(cue_start)}-{format_timestamp_ms(cue_end)}"
-        if _apply_clip_range_to_item(
+        applied = _apply_clip_range_to_item(
             item,
             fallback_range,
             previous_end_ms=previous_end_ms,
             ost1_hard_max_ms=ost1_cap,
-        ):
+        )
+        if not applied and previous_end_ms is not None:
+            applied = _apply_clip_range_to_item(
+                item,
+                fallback_range,
+                previous_end_ms=None,
+                ost1_hard_max_ms=ost1_cap,
+            )
+        if applied:
             item["_clip_aligned"] = "subtitle_fallback"
             logger.info(f"片段 #{item.get('_id')} 原声未命中抽帧段，回退字幕整句对位")
         try:
@@ -477,7 +512,11 @@ def _align_items_to_frame_time_ranges(
         except Exception:
             pass
 
-    return items
+    return repair_or_drop_invalid_timestamp_items(
+        ordered,
+        subtitle_content=subtitle_content,
+        ost1_min_duration_ms=max(800, int(max(3.0, ost1_hard_max or 8) * 500)),
+    )
 
 
 def _strip_internal_clip_flags(items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:

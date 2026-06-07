@@ -66,6 +66,23 @@ def check_format(script_content: str) -> Dict[str, Any]:
                     'details': f'正确格式: "HH:MM:SS,mmm-HH:MM:SS,mmm"，示例: "00:00:00,600-00:00:07,559"'
                 }
 
+            # 验证 timestamp 区间有效（结束须晚于开始）
+            try:
+                from app.services.srt_utils import parse_timestamp_range
+
+                start_ms, end_ms = parse_timestamp_range(clip["timestamp"])
+                if end_ms <= start_ms:
+                    return {
+                        "success": False,
+                        "message": f'第{i+1}个片段的timestamp起止相同或无效',
+                        "details": (
+                            f'当前值: {clip["timestamp"]}；'
+                            f'结束时间须晚于开始时间（零时长会导致裁剪失败）'
+                        ),
+                    }
+            except Exception:
+                pass
+
             # 验证 picture 字段
             if not isinstance(clip['picture'], str) or not clip['picture'].strip():
                 return {

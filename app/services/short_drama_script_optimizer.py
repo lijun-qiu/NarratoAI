@@ -19,10 +19,8 @@ from app.services.short_drama_settings import (
     get_short_drama_settings,
 )
 from app.services.srt_utils import (
-    find_subtitle_span_for_line,
-    format_timestamp_ms,
-    parse_srt,
     parse_timestamp_range,
+    repair_or_drop_invalid_timestamp_items,
 )
 
 AUTO_NARRATION_MARKER = "__AUTO_NARRATION__"
@@ -116,7 +114,7 @@ def break_consecutive_ost1(
     max_run: int = 2,
     protect_ids: Optional[set[int]] = None,
 ) -> List[Dict[str, Any]]:
-    """连续原声超过 max_run 时，将多余段转为 OST=0 串场（仅极端情况，默认允许 4 段成块）。"""
+    """连续原声超过 max_run 时，将多余段转为 OST=0 串场解说。"""
     if max_run < 1:
         return items
     protected = protect_ids or {1}
@@ -231,51 +229,6 @@ def trim_excess_ost1_segments(
     return ordered
 
 
-def fix_zero_duration_timestamps(
-    items: List[Dict[str, Any]],
-    subtitle_content: str = "",
-    *,
-    min_ost1_ms: int = 3000,
-) -> List[Dict[str, Any]]:
-    """修正零时长或极短 timestamp；OST=1 尽量对齐字幕整句。"""
-    entries = parse_srt(subtitle_content or "")
-    for item in items:
-        ts = str(item.get("timestamp") or "").strip()
-        if "-" not in ts:
-            continue
-        try:
-            start_ms, end_ms = parse_timestamp_range(ts)
-        except Exception:
-            continue
-
-        if end_ms > start_ms and (end_ms - start_ms) >= min_ost1_ms:
-            continue
-
-        if int(item.get("OST", 0) or 0) == 1 and entries:
-            line = str(item.get("original_line") or item.get("narration") or "")
-            line = re.sub(r"^播放原片\d*$", "", line).strip()
-            span = find_subtitle_span_for_line(
-                entries,
-                line,
-                near_start_ms=start_ms,
-                near_end_ms=max(end_ms, start_ms + 500),
-            )
-            if span:
-                cue_start, cue_end = span
-                if cue_end > cue_start:
-                    item["timestamp"] = (
-                        f"{format_timestamp_ms(cue_start)}-{format_timestamp_ms(cue_end)}"
-                    )
-                    logger.info(f"片段 #{item.get('_id')} 零时长已按字幕对位修正")
-                    continue
-
-        if end_ms <= start_ms:
-            end_ms = start_ms + min_ost1_ms
-            item["timestamp"] = f"{format_timestamp_ms(start_ms)}-{format_timestamp_ms(end_ms)}"
-            logger.warning(f"片段 #{item.get('_id')} 时长无效，已延长 {min_ost1_ms}ms")
-    return items
-
-
 def enforce_short_drama_ost_ratio(
     items: List[Dict[str, Any]],
     settings: Optional[Dict[str, Any]] = None,
@@ -285,7 +238,7 @@ def enforce_short_drama_ost_ratio(
         return items
 
     cfg = get_short_drama_settings(settings)
-    max_run = int(cfg.get("max_consecutive_ost1", 2) or 2)
+    max_run = int(cfg.get("max_consecutive_ost1", 4) or 4)
     result = break_consecutive_ost1(items, max_run=max_run, protect_ids={1})
 
     validation = validate_short_drama_script_counts(result, cfg)
@@ -366,12 +319,6 @@ def optimize_short_drama_script_items(
     ost1_max = float(cfg.get("ost1_duration_max", 18) or 18)
     min_ost1_ms = int(float(cfg.get("ost1_duration_min", 8) or 8) * 1000)
 
-    items = fix_zero_duration_timestamps(
-        items,
-        subtitle_content,
-        min_ost1_ms=min_ost1_ms,
-    )
-
     if (frame_analysis_path or "").strip():
         items = align_short_drama_items_to_frame_time_ranges(
             items,
@@ -386,5 +333,11 @@ def optimize_short_drama_script_items(
     items = format_ost1_picture_narrations(
         items,
         wrap_quotes=bool(cfg.get("picture_wrap_double_quotes", True)),
+    )
+
+    items = repair_or_drop_invalid_timestamp_items(
+        items,
+        subtitle_content=subtitle_content,
+        ost1_min_duration_ms=min_ost1_ms,
     )
     return items

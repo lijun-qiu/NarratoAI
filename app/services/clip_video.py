@@ -82,7 +82,7 @@ def _clamp_clip_range_to_source(
     if end_sec <= start_sec:
         logger.error(
             f"片段 #{segment_id} 裁剪区间无效: {start_time} -> {end_time} "
-            f"(原片 {source_duration:.2f}s)"
+            f"(原片 {source_duration:.2f}s)，请检查脚本 timestamp 或重新生成"
         )
         return None
 

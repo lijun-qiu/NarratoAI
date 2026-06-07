@@ -8,7 +8,9 @@ from __future__ import annotations
 import os
 import re
 from dataclasses import dataclass
-from typing import Iterable, Optional
+from typing import Any, Iterable, Optional
+
+from loguru import logger
 
 from app.models import const
 from app.utils import utils
@@ -167,10 +169,10 @@ def format_timestamp_ms(ms: int) -> str:
     return utils.format_time(max(0, int(ms)) / 1000.0)
 
 
-def normalize_script_timestamp_range(timestamp: str) -> str:
+def normalize_script_timestamp_range(timestamp: str, *, fix_invalid: bool = True) -> str:
     """
     将 LLM/后处理产生的各种时间戳统一为 HH:MM:SS,mmm-HH:MM:SS,mmm。
-    支持 `.` 毫秒、单段、SRT 箭头等；无法解析时返回 1 秒占位区间。
+    fix_invalid=False 时保留 end<=start，供校验/剔除逻辑识别。
     """
     text = (timestamp or "").strip()
     if _SCRIPT_TIMESTAMP_RANGE_RE.match(text):
@@ -185,15 +187,105 @@ def normalize_script_timestamp_range(timestamp: str) -> str:
 
     if "-" not in normalized:
         start_ms = _time_str_to_ms(normalized)
+        if not fix_invalid:
+            return f"{format_timestamp_ms(start_ms)}-{format_timestamp_ms(start_ms)}"
         end_ms = start_ms + 1000
         return f"{format_timestamp_ms(start_ms)}-{format_timestamp_ms(end_ms)}"
 
     start_text, end_text = normalized.split("-", 1)
     start_ms = _time_str_to_ms(start_text.strip())
     end_ms = _time_str_to_ms(end_text.strip())
-    if end_ms <= start_ms:
+    if end_ms <= start_ms and fix_invalid:
         end_ms = start_ms + 1000
     return f"{format_timestamp_ms(start_ms)}-{format_timestamp_ms(end_ms)}"
+
+
+def script_timestamp_duration_ms(timestamp: str) -> int:
+    if "-" not in (timestamp or ""):
+        return 0
+    start_ms, end_ms = parse_timestamp_range(timestamp)
+    return max(0, end_ms - start_ms)
+
+
+def is_valid_script_timestamp_range(
+    timestamp: str,
+    *,
+    min_duration_ms: int = 200,
+) -> bool:
+    if "-" not in (timestamp or ""):
+        return False
+    try:
+        start_ms, end_ms = parse_timestamp_range(timestamp)
+    except Exception:
+        return False
+    min_ms = max(1, int(min_duration_ms or 0))
+    return end_ms > start_ms and (end_ms - start_ms) >= min_ms
+
+
+def repair_or_drop_invalid_timestamp_items(
+    items: list[dict[str, Any]],
+    *,
+    subtitle_content: str = "",
+    min_duration_ms: int = 500,
+    ost1_min_duration_ms: int = 800,
+) -> list[dict[str, Any]]:
+    """
+    无效或过短 timestamp：优先按字幕重新对位；仍无效则剔除并重排 _id。
+    不盲目延长区间。
+    """
+    entries = parse_srt(subtitle_content or "")
+    kept: list[dict[str, Any]] = []
+
+    for item in items:
+        row = dict(item)
+        ts = str(row.get("timestamp") or "").strip()
+        is_ost1 = int(row.get("OST", 0) or 0) == 1
+        min_ms = ost1_min_duration_ms if is_ost1 else min_duration_ms
+
+        if is_valid_script_timestamp_range(ts, min_duration_ms=min_ms):
+            kept.append(row)
+            continue
+
+        start_ms, end_ms = parse_timestamp_range(ts) if "-" in ts else (0, 0)
+        span: tuple[int, int] | None = None
+
+        if entries:
+            line = str(row.get("original_line") or row.get("narration") or "")
+            line = re.sub(r"^播放原片\d*$", "", line).strip()
+            span = find_subtitle_span_for_line(
+                entries,
+                line,
+                near_start_ms=start_ms,
+                near_end_ms=max(end_ms, start_ms + 500),
+            )
+            if not span:
+                span = find_subtitle_span_for_line(
+                    entries,
+                    "",
+                    near_start_ms=start_ms,
+                    near_end_ms=max(end_ms, start_ms + 500),
+                )
+
+        if span and span[1] > span[0] and (span[1] - span[0]) >= min_ms:
+            row["timestamp"] = (
+                f"{format_timestamp_ms(span[0])}-{format_timestamp_ms(span[1])}"
+            )
+            logger.info(f"片段 #{row.get('_id')} 已按字幕重新对位: {row['timestamp']}")
+            kept.append(row)
+            continue
+
+        logger.warning(
+            f"片段 #{row.get('_id')} timestamp 无效/过短且无法对位，已移除: {ts}"
+        )
+
+    for index, row in enumerate(kept, 1):
+        row["_id"] = index
+    if len(kept) < len(items):
+        logger.info(
+            f"timestamp 校验：保留 {len(kept)}/{len(items)} 段，"
+            f"移除 {len(items) - len(kept)} 段无效片段"
+        )
+    return kept
 
 
 def parse_timestamp_range(timestamp: str) -> tuple[int, int]:

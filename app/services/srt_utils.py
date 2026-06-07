@@ -157,6 +157,45 @@ def write_srt_file(entries: Iterable[SrtEntry], output_path: str) -> str:
     return output_path
 
 
+_SCRIPT_TIMESTAMP_RANGE_RE = re.compile(
+    r"^\d{2}:\d{2}:\d{2},\d{3}-\d{2}:\d{2}:\d{2},\d{3}$"
+)
+
+
+def format_timestamp_ms(ms: int) -> str:
+    """脚本 timestamp 单端：HH:MM:SS,mmm（与 check_script 校验一致）。"""
+    return utils.format_time(max(0, int(ms)) / 1000.0)
+
+
+def normalize_script_timestamp_range(timestamp: str) -> str:
+    """
+    将 LLM/后处理产生的各种时间戳统一为 HH:MM:SS,mmm-HH:MM:SS,mmm。
+    支持 `.` 毫秒、单段、SRT 箭头等；无法解析时返回 1 秒占位区间。
+    """
+    text = (timestamp or "").strip()
+    if _SCRIPT_TIMESTAMP_RANGE_RE.match(text):
+        return text
+
+    normalized = (
+        text.replace("-->", "-")
+        .replace("—", "-")
+        .replace("–", "-")
+    )
+    normalized = re.sub(r"\s*-\s*", "-", normalized)
+
+    if "-" not in normalized:
+        start_ms = _time_str_to_ms(normalized)
+        end_ms = start_ms + 1000
+        return f"{format_timestamp_ms(start_ms)}-{format_timestamp_ms(end_ms)}"
+
+    start_text, end_text = normalized.split("-", 1)
+    start_ms = _time_str_to_ms(start_text.strip())
+    end_ms = _time_str_to_ms(end_text.strip())
+    if end_ms <= start_ms:
+        end_ms = start_ms + 1000
+    return f"{format_timestamp_ms(start_ms)}-{format_timestamp_ms(end_ms)}"
+
+
 def parse_timestamp_range(timestamp: str) -> tuple[int, int]:
     text = (timestamp or "").strip()
     if "-" not in text:
@@ -391,3 +430,136 @@ def resolve_overlaps(entries: list[SrtEntry], min_gap_ms: int = 50) -> list[SrtE
             continue
         resolved.append(entry)
     return resolved
+
+
+def dialogue_match_key(text: str) -> str:
+    """对白匹配用：去标点空白，便于 original_line 与字幕条目对齐。"""
+    cleaned = clean_subtitle_dialogue_text(str(text or ""))
+    cleaned = cleaned.strip("「」\"'“”‘’")
+    return re.sub(r"[\s\W_]+", "", cleaned)
+
+
+def _merge_contiguous_entries(
+    entries: list[SrtEntry],
+    center_index: int,
+    *,
+    merge_gap_ms: int,
+    max_span_ms: int,
+) -> tuple[int, int]:
+    lo = hi = center_index
+    while lo > 0 and entries[lo].start_ms - entries[lo - 1].end_ms <= merge_gap_ms:
+        if entries[hi].end_ms - entries[lo - 1].start_ms > max_span_ms:
+            break
+        lo -= 1
+    while hi < len(entries) - 1 and entries[hi + 1].start_ms - entries[hi].end_ms <= merge_gap_ms:
+        if entries[hi + 1].end_ms - entries[lo].start_ms > max_span_ms:
+            break
+        hi += 1
+    return entries[lo].start_ms, entries[hi].end_ms
+
+
+def find_subtitle_span_for_line(
+    entries: list[SrtEntry],
+    line_text: str,
+    *,
+    near_start_ms: int,
+    near_end_ms: int | None = None,
+    max_span_ms: int = 22_000,
+    merge_gap_ms: int = 400,
+    search_window_ms: int = 8_000,
+) -> tuple[int, int] | None:
+    """
+    为 OST=1 原声查找字幕完整起止：优先匹配 original_line 所在条目，
+    并向前后合并间隔很短的字幕条，避免半句被截断。
+    """
+    if not entries:
+        return None
+
+    anchor_end = near_end_ms if near_end_ms is not None else near_start_ms
+    needle = dialogue_match_key(line_text)
+    best_index: int | None = None
+    best_score = -1
+
+    for index, entry in enumerate(entries):
+        if entry.end_ms < near_start_ms - search_window_ms:
+            continue
+        if entry.start_ms > anchor_end + search_window_ms:
+            break
+
+        hay = dialogue_match_key(entry.text)
+        matched = False
+        if needle and hay:
+            if needle in hay or hay in needle:
+                matched = True
+            elif len(needle) >= 4 and len(hay) >= 4 and needle[:4] == hay[:4]:
+                matched = True
+        elif not needle and entry.start_ms <= anchor_end and entry.end_ms >= near_start_ms:
+            matched = True
+
+        if not matched:
+            continue
+
+        distance = abs(entry.start_ms - near_start_ms)
+        overlap = min(entry.end_ms, anchor_end) - max(entry.start_ms, near_start_ms)
+        score = overlap if overlap > 0 else -distance
+        if score > best_score:
+            best_score = score
+            best_index = index
+
+    if best_index is None:
+        overlapping = [
+            index
+            for index, entry in enumerate(entries)
+            if entry.end_ms >= near_start_ms and entry.start_ms <= anchor_end + 500
+        ]
+        if not overlapping:
+            return None
+        best_index = overlapping[0]
+
+    return _merge_contiguous_entries(
+        entries,
+        best_index,
+        merge_gap_ms=merge_gap_ms,
+        max_span_ms=max_span_ms,
+    )
+
+
+def find_subtitle_span_global(
+    entries: list[SrtEntry],
+    line_text: str,
+    *,
+    max_span_ms: int = 22_000,
+    merge_gap_ms: int = 400,
+) -> tuple[int, int] | None:
+    """在全片字幕中查找台词所在条目并合并相邻短间隔字幕条。"""
+    if not entries:
+        return None
+
+    needle = dialogue_match_key(line_text)
+    best_index: int | None = None
+    best_score = -1
+
+    for index, entry in enumerate(entries):
+        hay = dialogue_match_key(entry.text)
+        matched = False
+        if needle and hay:
+            if needle in hay or hay in needle:
+                matched = True
+            elif len(needle) >= 4 and len(hay) >= 4 and needle[:4] == hay[:4]:
+                matched = True
+        if not matched:
+            continue
+        score = len(hay)
+        if score > best_score:
+            best_score = score
+            best_index = index
+
+    if best_index is None:
+        return None
+
+    return _merge_contiguous_entries(
+        entries,
+        best_index,
+        merge_gap_ms=merge_gap_ms,
+        max_span_ms=max_span_ms,
+    )

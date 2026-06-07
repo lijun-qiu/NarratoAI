@@ -266,6 +266,7 @@ class SubtitleAnalyzerAdapter:
         plot_analysis: str,
         subtitle_content: str,
         work_brief: str = "",
+        subtitle_frame_analysis: str = "",
     ) -> Dict[str, str]:
         config = self._get_category_config()
         parameters = {
@@ -273,6 +274,22 @@ class SubtitleAnalyzerAdapter:
             "plot_analysis": plot_analysis,
             "subtitle_content": subtitle_content,
         }
+        if self.prompt_category == "short_drama_narration":
+            parameters["subtitle_frame_analysis"] = (
+                subtitle_frame_analysis
+                or "（未提供字幕×抽帧对照分析，请主要依据剧情概述与字幕）"
+            )
+            parameters["segment_count_hint"] = self.script_extra_params.get(
+                "segment_count_hint",
+                "按字幕长度自然切段，保持快节奏细切，不要人为压缩段数。",
+            )
+            from app.services.short_drama_settings import get_short_drama_script_prompt_params
+
+            parameters.update(
+                get_short_drama_script_prompt_params(
+                    expected_total_segments=30,
+                )
+            )
         if self.prompt_category == "film_tv_narration":
             from app.services.film_tv_settings import get_film_tv_script_prompt_params
             parameters.update(get_film_tv_script_prompt_params())
@@ -347,6 +364,7 @@ class SubtitleAnalyzerAdapter:
         film_name: str = "",
         work_brief: str = "",
         vision_scene_notes: str = "",
+        frame_summary: str = "",
     ) -> Dict[str, Any]:
         """
         分析字幕内容 - 兼容原有接口
@@ -369,7 +387,11 @@ class SubtitleAnalyzerAdapter:
                     or "（未启用视觉拉片，请主要依据字幕分析）",
                 }
             else:
-                parameters = {"subtitle_content": subtitle_content}
+                parameters = {
+                    "subtitle_content": subtitle_content,
+                    "frame_summary": frame_summary
+                    or "（未提供抽帧分析，请主要依据字幕分析）",
+                }
 
             prompt = PromptManager.get_prompt(
                 category=self.prompt_category,
@@ -408,6 +430,7 @@ class SubtitleAnalyzerAdapter:
         subtitle_content: str = "",
         temperature: float = 0.7,
         work_brief: str = "",
+        subtitle_frame_analysis: str = "",
     ) -> Dict[str, Any]:
         """
         生成解说文案 - 兼容原有接口
@@ -427,17 +450,28 @@ class SubtitleAnalyzerAdapter:
                 category=self.prompt_category,
                 name="script_generation",
                 parameters=self._build_script_generation_parameters(
-                    short_name, plot_analysis, subtitle_content, work_brief
+                    short_name,
+                    plot_analysis,
+                    subtitle_content,
+                    work_brief,
+                    subtitle_frame_analysis=subtitle_frame_analysis,
                 ),
             )
             
             # 使用统一服务生成文案
+            max_tokens = None
+            if self.prompt_category == "short_drama_narration":
+                from app.config import config as app_config
+                max_tokens = int(
+                    app_config.app.get("short_drama_script_max_tokens", 16000) or 16000
+                )
             result = self._run_async_safely(
                 UnifiedLLMService.generate_text,
                 prompt=prompt,
                 system_prompt=self._get_category_config()["script_system"],
                 provider=self.provider,
                 temperature=temperature,
+                max_tokens=max_tokens,
                 response_format="json",
                 api_key=self.api_key,
                 api_base=self.base_url,

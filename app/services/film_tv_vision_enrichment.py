@@ -88,10 +88,11 @@ def _parse_json_payload(raw: str) -> Any:
 
 
 def resolve_vision_credentials() -> Optional[Dict[str, Any]]:
+    from app.config.llm_gateway_router import resolve_llm_credentials
+
     provider = (config.app.get("vision_llm_provider") or "openai").lower()
-    api_key = config.app.get(f"vision_{provider}_api_key") or ""
     model = config.app.get(f"vision_{provider}_model_name") or ""
-    base_url = config.app.get(f"vision_{provider}_base_url") or ""
+    api_key, base_url = resolve_llm_credentials(model, role="vision")
     if not api_key or not model:
         return None
     return {

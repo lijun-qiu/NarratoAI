@@ -2,24 +2,31 @@
 
 from __future__ import annotations
 
-DEFAULT_OPENAI_COMPATIBLE_BASE_URL = "https://api.siliconflow.cn/v1"
+from app.config.llm_model_presets import DEFAULT_ALT_BASE_URL, DEFAULT_DASHSCOPE_BASE_URL
+
+DEFAULT_OPENAI_COMPATIBLE_BASE_URL = DEFAULT_DASHSCOPE_BASE_URL
 DEFAULT_OPENAI_COMPATIBLE_PROVIDER = "openai"
 
 DEFAULT_VISION_LLM_PROVIDER = DEFAULT_OPENAI_COMPATIBLE_PROVIDER
-DEFAULT_VISION_OPENAI_MODEL_NAME = "Qwen/Qwen3.5-122B-A10B"
+DEFAULT_VISION_OPENAI_MODEL_NAME = "gemini-3.1-flash-lite"
 
 DEFAULT_TEXT_LLM_PROVIDER = DEFAULT_OPENAI_COMPATIBLE_PROVIDER
-DEFAULT_TEXT_OPENAI_MODEL_NAME = "Pro/zai-org/GLM-5"
+DEFAULT_TEXT_OPENAI_MODEL_NAME = "deepseek-v4-flash"
 
 DEFAULT_LLM_APP_CONFIG = {
     "vision_llm_provider": DEFAULT_VISION_LLM_PROVIDER,
     "vision_openai_model_name": DEFAULT_VISION_OPENAI_MODEL_NAME,
     "vision_openai_api_key": "",
-    "vision_openai_base_url": DEFAULT_OPENAI_COMPATIBLE_BASE_URL,
+    "vision_openai_base_url": DEFAULT_ALT_BASE_URL,
     "text_llm_provider": DEFAULT_TEXT_LLM_PROVIDER,
     "text_openai_model_name": DEFAULT_TEXT_OPENAI_MODEL_NAME,
     "text_openai_api_key": "",
-    "text_openai_base_url": DEFAULT_OPENAI_COMPATIBLE_BASE_URL,
+    "text_openai_base_url": DEFAULT_ALT_BASE_URL,
+    "llm_dashscope_api_key": "",
+    "llm_dashscope_base_url": DEFAULT_DASHSCOPE_BASE_URL,
+    "llm_alt_api_key": "",
+    "llm_alt_base_url": DEFAULT_ALT_BASE_URL,
+    "llm_qwen_use_alt_gateway": False,
 }
 
 

@@ -5,7 +5,9 @@
 
 from __future__ import annotations
 
+import json
 import math
+import re
 import os
 from copy import deepcopy
 from typing import Any, Dict, Optional
@@ -48,7 +50,7 @@ DOCUMENTARY_DEFAULTS: Dict[str, Any] = {
     "subtitle_refinement_max_length_ratio_delta": 0.4,
     # 硬字幕 OCR 校准（裁剪关键帧底部，输出 *_ocr_refined.srt）
     "enable_hard_subtitle_ocr": True,
-    "auto_subtitle_calibration_on_frame_analysis": True,
+    "auto_subtitle_calibration_on_frame_analysis": False,
     "subtitle_ocr_min_similarity": 0.5,
     "subtitle_ocr_max_length_ratio_delta": 0.35,
     "subtitle_ocr_crop_ratio": 0.22,
@@ -77,7 +79,41 @@ DOCUMENTARY_DEFAULTS: Dict[str, Any] = {
     "append_custom_prompt": "",
 }
 
-# 逐帧精剪：故事讲述型（35–50 段，原声 5–10 段，解说 30–100 字/段，台词融入叙述）
+FAZU2_WRONG_CHARACTER_NAMES: tuple[tuple[str, str], ...] = (
+    ("胡小月", "胡小跃"),
+    ("胡晓月", "胡小跃"),
+    ("小月", "小跃"),
+    ("伟叶", "伟业"),
+    ("秦峰", "秦枫"),
+    ("罗伯", "罗博"),
+)
+
+# 抽帧 characters：无法确认姓名时使用
+FRAME_UNKNOWN_CHARACTER_MALE = "未名人员(男)"
+FRAME_UNKNOWN_CHARACTER_FEMALE = "未名人员(女)"
+FRAME_UNKNOWN_CHARACTER_UNKNOWN = "未名人员(不明)"
+
+# 剧情人物参考（写每段前须与当段抽帧/字幕核对，勿凭印象套性别）
+FAZU2_CHARACTER_ROLES: tuple[tuple[str, str, str], ...] = (
+    ("胡小跃", "刑警（男）", "字幕/抽帧确认为男性时用「他」，勿写成女性"),
+    ("小跃", "刑警（男）", "胡小跃简称，同上"),
+    ("伟业", "局长/警察（男）", "专属人名；与之对话的上级不是伟业，勿混称"),
+    ("老叶", "长辈/领导（男）", "硬字幕出现「老叶」时可写；与伟业(男)是两人"),
+    ("叶天佑", "局长（男）", "正式姓名；硬字幕有时标「老叶」或「叶天佑」"),
+    ("秦枫", "刑警（男）", "二师兄，禁止秦峰"),
+    ("罗博", "反派", "禁止罗伯"),
+    ("常征", "警察", "—"),
+    ("赵鹏超", "—", "—"),
+    ("马金", "—", "—"),
+)
+
+FAZU2_DEFAULT_OPENING_CLIMAX_HINT = (
+    "胡小跃楼顶跳楼牺牲名场面（夜色楼顶纵身跃下），"
+    "原声金句优先「天就快亮了。」（时间戳从字幕原样复制）。"
+    "禁止用中段抓捕/争吵（如「你跟我说这是狗贩子」）顶替第 1 段；此类放正叙 OST=1。"
+)
+
+# 逐帧精剪：罚罪2 高潮前置版 V2（30–55 段，原声/解说约 1:1 穿插，解说 30–100 字/段）
 DOCUMENTARY_COMPACT_OVERRIDES: Dict[str, Any] = {
     "documentary_compact_mode": True,
     "documentary_compact_style": "fazu2",
@@ -87,28 +123,38 @@ DOCUMENTARY_COMPACT_OVERRIDES: Dict[str, Any] = {
     "target_output_ratio": 0.3,
     "target_output_minutes": 12,
     "frame_interval_input": 3,
-    "min_total_segments": 35,
-    "max_total_segments": 50,
-    "ost0_segment_min": 30,
+    "min_total_segments": 30,
+    "max_total_segments": 55,
+    "ost0_segment_min": 15,
+    "original_audio_ratio": 0.5,
     "enable_picture_narration": False,
     "enable_humor_narration": False,
     "enable_logic_roast": False,
     "context_window_sec": 45,
     "narration_chars_min": 30,
     "narration_chars_max": 100,
-    "ost1_duration_min": 1,
-    "ost1_duration_max": 8,
-    "ost1_duration_hard_max": 10,
-    "min_ost1_segments": 5,
-    "max_ost1_segments": 10,
-    "ost1_every_n_segments": 10,
+    "ost1_duration_min": 8,
+    "ost1_duration_max": 18,
+    "ost1_duration_hard_max": 22,
+    "min_ost1_segments": 15,
+    "max_ost1_segments": 28,
+    "ost1_every_n_segments": 2,
     "fazu2_core_theme": "",
+    "fazu2_opening_climax_hint": FAZU2_DEFAULT_OPENING_CLIMAX_HINT,
     "enable_opening_closing_hook": True,
-    "opening_hook_template": "宝子们，我们开始《{work_name}》啦！",
+    "opening_hook_template": "",
+    # 仅第 1 集开头高潮末尾使用；第 2 集起由模型按当集名场面自拟转场
+    "transition_hook_template": "故事，得从头讲起。",
     "closing_hook_template": "宝子们，我们下期再见！",
     "default_custom_prompt": "",
     "default_video_theme": "罚罪2",
     "append_custom_prompt": "",
+    # 逐帧精剪：生成脚本前必须有字幕，并完成字幕×抽帧对照分析
+    "require_subtitle_for_script": True,
+    "subtitle_analysis_max_frame_chars": 20000,
+    "subtitle_analysis_max_subtitle_chars": 12000,
+    "subtitle_analysis_min_chars": 500,
+    "subtitle_analysis_max_tokens": 4096,
 }
 
 DOCUMENTARY_SETTING_KEYS = frozenset(
@@ -118,6 +164,9 @@ DOCUMENTARY_SETTING_KEYS = frozenset(
         "enable_subtitle_enrichment",
         "subtitle_max_chars",
         "subtitle_analysis_max_frame_chars",
+        "subtitle_analysis_max_subtitle_chars",
+        "subtitle_analysis_min_chars",
+        "subtitle_analysis_max_tokens",
         "subtitle_batch_pad_sec",
         "enable_subtitle_refinement",
         "subtitle_refinement_max_entries_per_call",
@@ -150,8 +199,11 @@ DOCUMENTARY_SETTING_KEYS = frozenset(
         "documentary_compact_mode",
         "documentary_compact_style",
         "fazu2_core_theme",
+        "fazu2_opening_climax_hint",
+        "original_audio_ratio",
         "enable_opening_closing_hook",
         "opening_hook_template",
+        "transition_hook_template",
         "closing_hook_template",
         "coverage_interval_sec",
         "target_output_ratio",
@@ -160,8 +212,47 @@ DOCUMENTARY_SETTING_KEYS = frozenset(
         "ost1_duration_hard_max",
         "min_ost1_segments",
         "max_ost1_segments",
+        "require_subtitle_for_script",
     }
 )
+
+
+def build_compact_pre_script_workflow_instructions(
+    settings: Optional[Dict[str, Any]] = None,
+) -> str:
+    """逐帧精剪：生成 JSON 脚本前的材料与分析要求。"""
+    cfg = settings or get_documentary_compact_settings()
+    min_ost1, max_ost1 = compute_ost1_segment_bounds(settings=cfg)
+    return f"""## 脚本生成工作流（前置条件 · 必须遵守）
+
+本任务分两步，**不可跳过第 1 步直接写 JSON**：
+
+### 素材优先级（硬性）
+| 优先级 | 素材 | 用途 |
+|--------|------|------|
+| **主** | **原始字幕** | 剧情主线、`narration` 内容、`original_line` 台词、人名、**所有 `timestamp`** |
+| **辅** | **抽帧画面分析** | 仅写 `picture` 画面描述；截取时间范围的**对齐参考**（须落在字幕区间内） |
+| **辅** | **字幕×抽帧对照分析** | 策划蓝图（情节点、OST=1 清单等），剧情与时间戳仍以字幕为准 |
+
+### 第 1 步：充分阅读已有材料（生成前必做）
+1. **原始字幕**（`<subtitles>` / 下文「原始字幕」）— **第一依据**
+   - **所有 `timestamp` 必须从此处逐字复制**，禁止编造
+   - 剧情推进、对白引用、OST=1 金句选取均以字幕为准
+2. **字幕×抽帧对照分析**（下文「字幕×抽帧 对照分析」）
+   - 策划蓝图：人物表、开头高潮、正叙时间线、OST=1 清单、高潮复现、下集钩子
+   - 若该节为空，说明前置分析未完成，**不得臆造剧情**
+3. **抽帧画面分析**（下文「抽帧画面分析」）— **画面参考**
+   - 仅供 `picture` 字段：人物动作、表情、场景、昼夜/光线
+   - 截取时间可参考抽帧 moment，但**起止须落在对应字幕时间范围内**
+
+### 第 2 步：严格依据上述材料 + 高潮前置版规则输出 JSON
+- 若存在**本集追加要求**且指定开头高潮 → 第 1 个 item（OST=1）**必须以追加为准**
+- 对照分析中的**开头高潮方案** → 第 1 个 item（OST=1）
+- 对照分析中的**正叙时间线** → 主体 OST=0 段（段数见下方配置范围）
+- 对照分析中的 **OST=1 金句清单（{min_ost1}–{max_ost1} 条）** → 逐一落实，时间戳与字幕一致
+- 对照分析中的**高潮复现 / 下集钩子** → 对应收尾 items
+- **禁止**脱离字幕编造剧情、台词、时间戳、人名；`picture` 环境氛围须与抽帧对照，但不得覆盖字幕剧情
+"""
 
 
 def is_fazu2_compact_settings(settings: Optional[Dict[str, Any]] = None) -> bool:
@@ -199,6 +290,206 @@ FAZU2_FORBIDDEN_NARRATION_PHRASES: tuple[str, ...] = (
     "说话人2",
 )
 
+def resolve_fazu2_opening_climax_hint(
+    settings: Optional[Dict[str, Any]] = None,
+) -> str:
+    cfg = settings or get_documentary_compact_settings()
+    return str(
+        cfg.get("fazu2_opening_climax_hint") or FAZU2_DEFAULT_OPENING_CLIMAX_HINT
+    ).strip()
+
+
+def build_fazu2_picture_narration_sync_section() -> str:
+    """解说以字幕为主，画面对位参考抽帧。"""
+    return """### 声画对位（硬性 · 字幕为主，抽帧为辅）
+- **`timestamp`**：必须从**字幕**原样复制；可参考抽帧 moment 在字幕区间内微调起止，**禁止**编造或超出字幕范围
+- **`narration`**：剧情、对白复述、点评均以**字幕**为准；勿凭抽帧臆造字幕未出现的台词或情节
+- **`picture`**：以**抽帧**可见画面为准（人物、动作、场景、昼夜/光线）；与字幕剧情不矛盾即可
+- 写每段：先定字幕时间范围与剧情 → 再查同段抽帧补 `picture` → 最后写 `narration`
+- **示例（正确）**：
+  - 字幕：伟业与领导对峙，台词「胡小跃是我的徒弟」
+  - picture（抽帧）：办公室内，伟业目光坚定
+  - narration（字幕）：领导把材料摔在桌上。伟业一字一句回道……
+- **示例（错误）**：抽帧是蹲守画面，解说却写「正在激烈抓捕」——动作阶段与画面对不上
+- OST=1：`original_line` 台词来自字幕；`timestamp` 须覆盖该句字幕**完整起止**（可含前后连贯短条），勿截在半句
+"""
+
+
+def build_fazu2_ost_interleave_section(
+    settings: Optional[Dict[str, Any]] = None,
+) -> str:
+    """原文与解说约 1:1 穿插，解说须在原声播完后开始。"""
+    cfg = settings or get_documentary_compact_settings()
+    ratio = float(cfg.get("original_audio_ratio", 0.5) or 0.5)
+    pct = int(round(ratio * 100))
+    narr_pct = 100 - pct
+    min_ost1, max_ost1 = compute_ost1_segment_bounds(settings=cfg)
+    ost_dur_min = int(cfg.get("ost1_duration_min", 8))
+    ost_dur_max = int(cfg.get("ost1_duration_max", 18))
+    return f"""### 原文与解说穿插（约 **{pct}:{narr_pct}** · 硬性）
+| 要求 | 说明 |
+|------|------|
+| 段数比例 | OST=1 原声与 OST=0 解说各约 **{pct}%**（全片 **{min_ost1}–{max_ost1}** 段原声） |
+| 原声时长 | 每段 OST=1 **{ost_dur_min}–{ost_dur_max} 秒**；金句/名场面偏长，勿切成 2–3 秒碎片 |
+| 播放顺序 | 按 `_id` 依次播放；**一段播完再进下一段** |
+| 时间戳 | **后一段 `timestamp` 开始 ≥ 前一段结束**；须等 OST=1 **当前台词/片段说完**再切解说 |
+| 原声完整性 | OST=1 的 `timestamp` 须覆盖字幕**整句或连续对白**，**禁止**半句、半段突然切走 |
+| 穿插节奏 | 第1段 OST=1（开头高潮）→ 第2段 OST=0 → 第3段起可 **连续 2–3 段 OST=1** 组成原声块，整块播完再接解说 |
+| OST=1 段 | 仅原片声音，`narration`=「播放原片」+ `original_line`；**禁止**段内夹解说 |
+| OST=0 段 | 仅 TTS 解说；须等**上一段（及同组连续）OST=1 原声完全结束**后再起止 |
+
+- **禁止** OST=1 → OST=0 → OST=1 模式中解说**打断**未播完的原声（解说插在两个原声之间）
+- **允许** 连续多段 OST=1；整块原声播完后再接 OST=0 点评
+- **推荐** **OST=0 → OST=1**：解说先**埋伏、铺垫或制造悬疑**，引出下一段原声金句
+- **禁止** 连续过多 OST=0 破坏原声/解说约 1:1 比例
+
+### 解说引出原声（推荐写法）
+| 手法 | 解说（OST=0）示例 | 下一段原声（OST=1） |
+|------|-------------------|---------------------|
+| **铺垫** | 领导叹口气，举报材料堆成山，伟业脸刷地白了。 | 「胡小跃是我的徒弟。」 |
+| **埋伏** | 他嘴上答应配合，心里却另有盘算。下一秒—— | 原片对峙/反转台词 |
+| **悬疑** | 您猜他怎么回？往下看！ / 更狠的还在后面。 | 金句原声 |
+| **钩子** | 注意看，这群人已经蹲守三天了。且看他们怎么收网。 | 行动现场原声 |
+
+- 引出原声的 OST=0 段：`timestamp` 取**原声开始之前**的剧情画面；**不要**与下一段 OST=1 时间重叠
+- 原声播完后，再用 OST=0 **点评/承接**；形成「铺垫引出原声 → 原声整句播完 → 点评」节奏
+- **突兀感红线**：观众应听完一句完整原台词或一个完整原声片段，再听到解说；勿在话说到一半切走
+"""
+
+
+def build_fazu2_character_roles_section() -> str:
+    rows = "\n".join(
+        f"| {name} | {role} | {note} |"
+        for name, role, note in FAZU2_CHARACTER_ROLES
+    )
+    return f"""### 角色身份与性别（须画面对照 · 勿凭印象写错）
+| 姓名 | 剧情参考 | 写作注意 |
+|------|----------|----------|
+{rows}
+
+- **性别、职级、人称（他/她）必须与当段抽帧画面和字幕一致**；画面是男警察就写男/他，画面是女警察才可写女/她
+- **不是禁止「女警」这个词**——若本段画面里确实是女警，可以照实写
+- 写每段前先查抽帧：这段画面里**是谁**、**什么性别**、**什么职级**；勿把 A 角色的性别套到 B 身上
+- 例：胡小跃是男刑警 → 指胡小跃时用「他」「刑警」；勿在胡小跃段落写成女警（与画面/剧情不符）
+"""
+
+
+def _character_gender_from_role(role: str) -> str:
+    text = str(role or "")
+    if "（男）" in text or "(男)" in text:
+        return "男"
+    if "（女）" in text or "(女)" in text:
+        return "女"
+    return ""
+
+
+def build_fazu2_frame_character_gender_reference() -> str:
+    """抽帧视觉分析：已知人物性别参考（须与画面对照，画面优先）。"""
+    refs = [
+        f"{name}={gender}"
+        for name, role, _ in FAZU2_CHARACTER_ROLES
+        if (gender := _character_gender_from_role(role))
+    ]
+    if not refs:
+        return ""
+    return (
+        "剧情人物性别参考（仅在与字幕/画面对上姓名后用来核对，**画面可见性别优先**）："
+        f"{', '.join(refs)}。"
+        "例：字幕出现胡小跃时若画面为男性刑警，characters 须标「胡小跃(男)」，勿写成女警/她。"
+    )
+
+
+def build_frame_character_naming_hint(settings: Optional[Dict[str, Any]] = None) -> str:
+    """视觉分析阶段：人名须有据，无据用未名人员+性别。"""
+    cfg = settings or get_documentary_settings()
+    hints: list[str] = [
+        "人名**仅在本批次硬字幕或对白摘录中明确出现**时才能写入 characters / observation；",
+        f"无法从字幕确认身份时，characters 用「{FRAME_UNKNOWN_CHARACTER_MALE}」「{FRAME_UNKNOWN_CHARACTER_FEMALE}」，"
+        f"observation 用「{FRAME_UNKNOWN_CHARACTER_MALE}与……并肩」等，**禁止臆造姓名**；",
+        f"禁止用「领导」「警员」「男子A」等泛称写入 characters（无真名时用未名人员+性别）；",
+        "「伟业」是局长人物专属名，勿把与之对话的上级/长辈称为伟业；",
+        "硬字幕出现「老叶」时可写「老叶(男)」，与「伟业(男)」区分两人。",
+    ]
+    if is_fazu2_compact_settings(cfg):
+        hints.append(
+            "observation 示例：「楼顶天台，老叶与伟业并肩，阴天冷色调」"
+            f"（两人均有字幕依据时）；若仅知性别不知名：「楼顶天台，{FRAME_UNKNOWN_CHARACTER_MALE}与伟业并肩，阴天冷色调」。"
+        )
+    return " ".join(hints)
+
+
+def build_frame_gender_hint(settings: Optional[Dict[str, Any]] = None) -> str:
+    """视觉分析阶段：人物性别须据画面判断，供抽帧 prompt 注入。"""
+    cfg = settings or get_documentary_settings()
+    hints: list[str] = [
+        "人物性别**仅据画面**判断（面容、发型、体型、着装、胡须等可见特征），"
+        "勿凭姓名谐音、剧情印象或字幕语气臆测；",
+        "characters 使用「姓名(男)」「姓名(女)」"
+        f"「{FRAME_UNKNOWN_CHARACTER_MALE}」「{FRAME_UNKNOWN_CHARACTER_FEMALE}」「姓名(不明)」格式；"
+        f"有字幕真名写姓名(性别)，无真名写{FRAME_UNKNOWN_CHARACTER_MALE}/{FRAME_UNKNOWN_CHARACTER_FEMALE}；",
+        "frame_observations 的 observation 须写出可见人物（真名或未名人员+性别）与场景光线；",
+        "action/key_visual 描述人物时也须带性别（如「男刑警胡小跃」「未名人员(男)与老叶并肩」）；",
+        "同一批次内同一人物的性别须前后一致；仅见背影/侧脸无法确认时标「不明」，勿猜测。",
+    ]
+    if is_fazu2_compact_settings(cfg):
+        reference = build_fazu2_frame_character_gender_reference()
+        if reference:
+            hints.append(reference)
+    return " ".join(hints)
+
+
+def warn_frame_analysis_gender_mismatch(
+    *,
+    scene_segments: list[dict[str, Any]],
+    frame_observations: list[dict[str, Any]],
+    batch_index: int = 0,
+    time_range: str = "",
+    settings: Optional[Dict[str, Any]] = None,
+) -> None:
+    """抽帧结果中已知男性角色被标成女性时打日志，便于排查视觉模型误判。"""
+    if not is_fazu2_compact_settings(settings):
+        return
+
+    male_names = [
+        name
+        for name, role, _ in FAZU2_CHARACTER_ROLES
+        if _character_gender_from_role(role) == "男"
+    ]
+    if not male_names:
+        return
+
+    texts: list[str] = []
+    for segment in scene_segments:
+        if isinstance(segment, dict):
+            texts.append(json.dumps(segment, ensure_ascii=False))
+    for observation in frame_observations:
+        if isinstance(observation, dict):
+            texts.append(str(observation.get("observation") or ""))
+
+    location = f"批次 #{batch_index} · {time_range}".strip(" ·")
+    for text in texts:
+        for name in male_names:
+            if name not in text:
+                continue
+            female_markers = (
+                f"{name}(女)",
+                f"{name}（女）",
+                f"女警{name}",
+                f"女刑警{name}",
+                f"女警察{name}",
+            )
+            if any(marker in text for marker in female_markers):
+                logger.warning(
+                    f"抽帧分析{location}：{name} 被标为女性或与女警混用，"
+                    "请对照画面重新抽帧或重跑该批次"
+                )
+                continue
+            if re.search(rf"{re.escape(name)}[^。；，,\n]{{0,12}}她", text):
+                logger.warning(
+                    f"抽帧分析{location}：{name} 附近出现「她」，疑似性别与画面对不上，"
+                    "请对照画面重新抽帧或重跑该批次"
+                )
+
 
 def resolve_fazu2_core_theme(
     video_theme: str = "",
@@ -219,23 +510,37 @@ def build_fazu2_narration_copy_hard_requirements(
     core_theme: str = "",
     settings: Optional[Dict[str, Any]] = None,
 ) -> str:
-    """逐帧精剪：故事讲述型脚本规则（写入脚本生成提示）。"""
+    """逐帧精剪：高潮前置版脚本规则（写入脚本生成提示）。"""
     return build_compact_story_script_rules(core_theme, settings=settings)
 
 
-def _build_compact_hooks_rules_section(settings: Optional[Dict[str, Any]] = None) -> str:
-    """首尾招呼规则：从 [documentary_compact] 开场/结尾模板生成。"""
+def _build_compact_hooks_rules_section(
+    settings: Optional[Dict[str, Any]] = None,
+    work_hint: str = "",
+) -> str:
+    """罚罪2 V2：开篇、正叙开场与结尾硬性约束。"""
     cfg = settings or get_documentary_compact_settings()
-    if not cfg.get("enable_opening_closing_hook", True):
-        return """### 7. 首尾招呼
-- **已关闭**固定开场/结尾模板；首末段 OST=0 按剧情自然起收即可
-"""
-    opening_tpl = str(cfg.get("opening_hook_template") or "宝子们，我们开始《{work_name}》啦！")
+    transition_tpl = str(
+        cfg.get("transition_hook_template") or "故事，得从头讲起。"
+    ).strip()
     closing_tpl = str(cfg.get("closing_hook_template") or "宝子们，我们下期再见！")
-    return f"""### 7. 首尾招呼（必须）
-- **首段** OST=0 的 `narration` 开头须有开场招呼（可与剧情衔接），模板示例：**{opening_tpl}**（`{{work_name}}` 替换为作品名/集数）
-- **末段** OST=0 的 `narration` 结尾须有道别，模板示例：**{closing_tpl}**（可先写本集收束，再道别）
-- 成片后处理也会按上述模板补全，模型生成时尽量自带，避免与正文重复两遍
+    hook_enabled = cfg.get("enable_opening_closing_hook", True)
+    closing_line = (
+        f"- **最后一段**（OST=0 或 OST=1）须含结束语：**{closing_tpl}**"
+        if hook_enabled
+        else "- **已关闭**固定结尾模板；最后一段按剧情自然收束即可"
+    )
+    return f"""### 开篇、正叙与结尾（硬性）
+
+| 段落 | OST | 要求 |
+|------|-----|------|
+| 第 1 段（开头高潮） | 1 | **纯原声**，`narration` 固定「播放原片」；**禁止**旁白、**禁止**「宝子们」 |
+| 第 2 段（转场+正叙） | 0 | **必须以「宝子们」开头**，接「{transition_tpl}」进入正叙 |
+| 最后一段 | 0 或 1 | 可复现开头名场面；须含道别语 |
+
+- **「宝子们」**仅出现在第 2 段与最后一段，第 1 段不出现
+{closing_line}
+- 成片后处理会补全缺失的「宝子们」开场与结尾道别，模型生成时尽量自带
 """
 
 
@@ -243,77 +548,125 @@ def build_compact_story_script_rules(
     core_theme: str = "",
     settings: Optional[Dict[str, Any]] = None,
 ) -> str:
-    """逐帧精剪 · 故事讲述型：角色设定与创作规则。"""
+    """逐帧精剪 · 罚罪2 高潮前置版 V2：角色设定与创作规则。"""
     cfg = settings or get_documentary_compact_settings()
     work_hint = (core_theme or "").strip() or "（填写「视频主题」如《罚罪2》第1集）"
-    hooks_section = _build_compact_hooks_rules_section(cfg)
-    min_seg = int(cfg.get("min_total_segments", 35))
-    max_seg = int(cfg.get("max_total_segments", 50))
-    ost0_min = int(cfg.get("ost0_segment_min", 30) or 30)
+    hooks_section = _build_compact_hooks_rules_section(cfg, work_hint)
+    transition_tpl = str(
+        cfg.get("transition_hook_template") or "故事，得从头讲起。"
+    ).strip()
+    min_seg = int(cfg.get("min_total_segments", 30))
+    max_seg = int(cfg.get("max_total_segments", 55))
+    ost0_min = int(cfg.get("ost0_segment_min", 24) or 24)
     min_ost1, max_ost1 = compute_ost1_segment_bounds(settings=cfg)
     ost_dur_min = int(cfg.get("ost1_duration_min", 3))
     ost_dur_max = int(cfg.get("ost1_duration_hard_max", 10) or 10)
-    return f"""## 逐帧精剪 · 故事讲述型脚本规则（优先级最高）
+    target_min = float(cfg.get("target_output_minutes", 12))
+    pre_workflow = build_compact_pre_script_workflow_instructions(cfg)
+    char_name_rows = "\n".join(
+        f"| {wrong} | {correct} |"
+        for wrong, correct in FAZU2_WRONG_CHARACTER_NAMES
+    )
+    return f"""{pre_workflow}
+
+## 《罚罪2》解说脚本制作规则（V2 · 优先级最高）
 
 ### 角色设定
-你是一位**资深影视解说文案撰写人**，擅长把电视剧剧情转成流畅、有情绪、易传播的**故事讲述型**短视频脚本。
-受众是普通观众：他们要快速看懂**剧情脉络、人物冲突、情感高潮**，**不要**分析镜头语言、导演手法或社会隐喻。
+你是一位**30 年经验的资深说书人**，擅长《罚罪2》类悬疑刑侦剧的**高潮前置型**短视频脚本。
+当前数据可能不是整集内容（如某一集的一半），分析时应结合整集/整部剧来把握情节。
+受众是普通观众：开头先给最炸裂名场面勾住人，再从头讲清剧情，结尾形成闭环。
+**不要**分析镜头语言、导演手法或社会隐喻。
 
 ### 任务目标
-根据 `<subtitles>` 与**精确字幕时间戳**（结合抽帧画面），生成解说脚本。作品：**{work_hint}**
+在**已充分理解**下文「抽帧画面分析」「原始字幕」「字幕×抽帧 对照分析」之后，生成解说脚本。作品：**{work_hint}**
+对照分析是策划蓝图，JSON 是其执行结果，二者须一致。
 
 ### 输出格式（必须严格遵守）
-- 只输出纯 JSON：`{{"items":[{{"_id", "timestamp", "picture", "narration", "OST"}}]}}`
-- **不要**使用 Markdown 代码块（不要 ```json ... ```），直接输出 JSON 文本
-- **不要**添加任何注释、前后缀或解释文字
+- 只输出纯 JSON **数组**：`[{{"_id", "timestamp", "picture", "narration", "OST"}}, ...]`
+- OST=1 的 item **必须**额外包含 `"original_line"` 字段
+- **不要**使用 Markdown 代码块，直接输出 JSON 文本
+- **不要**添加任何注释、前后缀或解释文字；不要用 `{{"items":[...]}}` 包裹
 
-### 1. 整体风格
-- **故事讲述型**：像说书人从头到尾讲清剧情，有细节、情绪、转折
-- **贴合时间轴**：`timestamp` **必须从原字幕逐字复制**（`HH:MM:SS,mmm-HH:MM:SS,mmm`）；允许解说段跨越多个原字幕行（画面连续即可），但起止时间必须真实存在
-- **语言通俗**：短句、口语（如「结果到了地方，根本不是狗贩子」）
-- **情绪递进**：紧张/愤怒/悲伤/希望；可用小钩子（如「可谁也没想到……」）
-- **跳过无关内容**：可完全跳过与主线无关的过渡对话、重复场景、琐碎日常，只保留推动剧情或塑造人物的关键情节
+### 一、核心数据指标
+| 项目 | 标准 |
+|------|------|
+| 单集总时长 | 约 {target_min:.0f} 分钟 |
+| 总段落数 | **{min_seg}–{max_seg} 段**（可微调） |
+| 原文台词占比 | **约 50%**（OST=1 与原片声音，段数约一半） |
+| 解说占比 | **约 50%**（OST=0，段数约一半） |
+| 每段时长 | 平均 **15–20 秒**，根据内容灵活调整 |
+| 时间戳依据 | **字幕**中的实际时间位置（抽帧仅作截取对齐参考） |
+| 剪辑顺序 | 开头高潮可取自剧中任意位置，正叙部分按时间线排列 |
 
-### 2. 人物称呼（硬性）
-- `narration` 与 `picture` 必须使用**具体人名**（如胡小月、秦枫、伟业、罗博、马金），与字幕/剧情一致
-- 优先使用已知姓名；字幕从未给出姓名时，可用**稳定且唯一**的描述性称呼（如「狗场匪徒」「罗博的手下」「龙湾村的一位老人」），首次可简短说明
-- **禁止**编号式称呼：❌ 警员1/警员2、说话人1、男子1、女子A、黑衣人1 等
-- 全片人名前后统一，不要同一人又叫「年轻警员」又叫「警员2」
+### 二、OST 字段定义
+| OST | 含义 | narration 要求 | 额外字段 |
+|-----|------|----------------|----------|
+| **0** | 旁白解说 | 完整解说词（非空） | 无 |
+| **1** | 原声播放（原文台词） | 固定填写 **「播放原片」**（非空） | `"original_line": "「原台词」"` |
 
-### 3. 解说段 OST=0（默认，全片 ≥30 段）
-- 每段 **30–100 字**，朗读约 4–15 秒；**一段一个情节点**，不要塞太多信息
-- **把人物对白融入解说**：用「秦枫开口就说」「胡小月突然吼了出来」等转述，对白用引号嵌入正文
-- **禁止流水账词**：❌ 然后、接着、接下来、我们可以看到、这里讲的是
-- **禁止分析性词汇**：❌ 权力博弈、试探底线、导演手法、社会隐喻（改用动作和对话展现，如「罗博步步紧逼」）
-- 段与段**自然过渡**（例：「可谁也没想到，真正的麻烦还在后面。」）
+**特殊约束：**
+- 第 1 段（开头高潮）**必须** OST=1（播放原片，**不夹杂旁白**）
+- 最后一段可以是 OST=0 或 OST=1，但**必须**含结束语「宝子们，我们下期再见！」
+- 「宝子们」出现在第 2 段与最后一段，**第 1 段不出现**
 
-### 4. 原声段 OST=1（全片 **{min_ost1}–{max_ost1} 段**）
-- **仅**标志性金句/情绪爆点/绝望叹息（如「天就快亮了」「有意思」）
-- 每段 **{ost_dur_min}–{ost_dur_max} 秒**；若原声台词过长，必须截取最核心的 {ost_dur_min}–{ost_dur_max} 秒
-- `timestamp` 精确取自字幕（截取部分的起止时间）
-- `narration` **只写这一句台词原文**（引号包裹），**不得**添加叙述动作（如「罗博咬着牙挤出两个字」应放在前一段 OST=0）
-- 必须前面有一段 OST=0 铺垫；后面可跟 OST=0 点评或过渡
-- **严禁**相邻两段 OST=1；**禁止**「播放原片N」
+### 三、整体结构（按段落顺序）
+| 部分 | 段落位置 | 内容要点 | OST |
+|------|----------|----------|-----|
+| ① 开头高潮 | 第 1 段 | **默认跳楼牺牲**（胡小跃楼顶纵身跃下，金句「天就快亮了。」），**纯原声，无旁白** | 1 |
+| ② 转场+正叙开始 | 第 2 段 | 以「宝子们」开头，接「{transition_tpl}」，然后进入正叙 | 0 |
+| ③ 正叙剧情 | 第 3 段至倒数第 2 段 | 按时间线推进；**推荐 OST=0 铺垫/悬疑引出 OST=1 原声**，原声播完再接 OST=0 点评 | 混合 |
+| ④ 高潮复现+后续+结束语 | 最后一段 | 可复现开头名场面，推进高潮后情节，以道别收尾 | 0 或 1 |
 
-### 5. picture（15–30 字）
-- 写出**人物姓名** + 动作 + 场景 + 情绪（可省略部分）
-- 例：「秦枫冷冷看着罗博，灵堂内气氛压抑」
-- ❌ 「警员1站在门口」→ ✅ 「秦枫站在灵堂门口」
+**`_id` = 成片播放顺序**（1→2→3…）。① 可用本集中后段时间戳倒叙开场，③ 再从片头正叙；`timestamp` 均须从字幕原样复制。
 
-### 6. 时间戳与 `_id`
-- `_id` = **成片播放顺序**（1→2→3…），按**剧情推进**编排，不必按原片时间先后（倒叙可提前讲）
-- 每段 `timestamp` 仍须是原字幕中**真实存在**的区间
-- 解说段时长 ≈ 字数÷10×1.5 秒；段与段可略有重叠，**禁止大段空白跳跃**
-- 多线叙事时，建议每条线索完整讲述再切换；切换前可用过渡句（如「与此同时，龙湾村也在开会」）
+### ③ 开头高潮选取（第 1 段 OST=1 · 硬性）
+- **默认优先**：{resolve_fazu2_opening_climax_hint(cfg)}
+- 用户「追加提示词」若指定开头名场面 → **以追加为准**
+- 中段冲突台词（如狗贩子争吵、掏枪对峙）可作正叙 **OST=1**，**不得**顶替跳楼作第 1 段
+- 最后一段「高潮复现」应呼应**第 1 段跳楼**，不是中段台词
 
-{hooks_section}
-### 8. 全片指标（约 40 分钟原片 → 12–15 分钟成片）
+{build_fazu2_character_roles_section()}
+{build_fazu2_picture_narration_sync_section()}
+{build_fazu2_ost_interleave_section(cfg)}
+### 四、原文台词处理细则
+- 标点：使用 **「 」** 将原台词括起来（写在 `original_line` 中）
+- 选取标准：冲突爆发、情感高潮、反转时刻、反派嚣张名场面
+- 占比控制：OST=1 与 OST=0 **各约 50%**；第 3 段起形成「铺垫引出原声 → 原声 → 点评」节奏
+- **引出原声**：关键金句前优先用 OST=0 **埋伏、铺垫、悬疑**（如「您猜他怎么回？」「且看他们怎么收网」），再接 OST=1
+- OST=1 段：`narration` **固定**「播放原片」，台词原文写在 `original_line`
+- **切解说原则**：下一段 OST=0 只能在上一段 OST=1 **这句话说完、这个原声片段播完**后开始；半句切走极突兀
+
+### 五、解说词写作风格
+- 解说开头：第 2 段以「宝子们」开头，然后叙述
+- 情绪词：好家伙、您品、憋屈、头皮发麻、鼻子一酸、这嘴脸、恨不得抽他
+- 节奏：平静叙述 → **铺垫/悬疑引出原声** → 原声金句 → 点评承接
+- 小钩子：每 1–2 分钟加一句「您猜怎么着？」「接下来更狠」，**优先放在 OST=1 原声之前**作引出
+- **禁止**：猎奇式调侃、过度玩梗破坏沉重氛围
+- **禁止流水账词**：❌ 然后、接着、接下来、我们可以看到
+
+### 六、角色名规范（依据字幕文件）
+| 正确 | 错误（禁止） |
+|------|-------------|
+{char_name_rows}
+
+- `narration` 与 `picture` 必须用**具体人名**；**禁止**警员1/说话人1 等编号
+
+### 七、声画对位（硬性 · 字幕为主，抽帧为辅）
+- **剧情、对白、人名、时间戳** → 以**字幕**为准
+- **`picture`** → 以当段**抽帧**可见画面为准（场景、光线、昼夜、人物动作）
+- **人物性别、职级、人称**：人名来自字幕，性别/职级与抽帧画面对照；勿张冠李戴
+- **`narration` 讲什么**由字幕剧情决定；动作阶段（蹲守/抓捕等）须与 `picture` 一致，可用「注意看」引导
+- 情绪靠**字幕台词、画面动作、表情**表达，不靠臆造天气/光线
+
+### 八、段数与时长
 | 指标 | 要求 |
 |------|------|
 | 总段数 | **{min_seg}–{max_seg} 段** |
-| 解说 OST=0 | **≥{ost0_min} 段** |
-| 原声 OST=1 | **{min_ost1}–{max_ost1} 段**，原声总时长 **≤80 秒** |
-| 解说总时长 | 约 11–14 分钟 |
+| 解说 OST=0 | **≥{ost0_min} 段**，每段 **30–100 字** |
+| 原声 OST=1 | **{min_ost1}–{max_ost1} 段**，每段 **{ost_dur_min}–{ost_dur_max} 秒** |
+| 结构 | ①开头高潮 → ②转场正叙 → ③正叙 → ④收尾 |
+
+{hooks_section}
 """
 
 
@@ -330,7 +683,9 @@ def get_compact_custom_prompt_display(
     ost_min = int(cfg.get("ost1_duration_min", 3))
     ost_max = int(cfg.get("ost1_duration_max", 8))
     target_min = float(cfg.get("target_output_minutes", 12))
-    opening_tpl = str(cfg.get("opening_hook_template") or "宝子们，我们开始《{work_name}》啦！")
+    ep1_transition_tpl = str(
+        cfg.get("transition_hook_template") or "故事，得从头讲起。"
+    ).strip()
     closing_tpl = str(cfg.get("closing_hook_template") or "宝子们，我们下期再见！")
     auto_hook = "开启" if cfg.get("enable_opening_closing_hook", True) else "关闭"
 
@@ -339,7 +694,7 @@ def get_compact_custom_prompt_display(
         or "（填写「视频主题」如《罚罪2》第1集）",
         settings=cfg,
     )
-    return f"""# 逐帧精剪 · 故事讲述型规则
+    return f"""# 逐帧精剪 · 罚罪2 脚本规则（V2）
 （本框内容会作为「补充创作要求」参与生成；与系统内置规则一致，可直接修改）
 
 {rules}
@@ -351,11 +706,12 @@ def get_compact_custom_prompt_display(
 | 解说字数/段 | {chars_min}–{chars_max} |
 | 原声 OST=1 | **{min_ost1}–{max_ost1} 段**，每段 {ost_min}–{ost_max} 秒 |
 | 目标成片 | 约 {target_min:.0f} 分钟 |
-| 首尾招呼 | {auto_hook}；开场模板「{opening_tpl}」；结尾「{closing_tpl}」 |
+| 第1集转场句 | 「{ep1_transition_tpl}」（第2集起按当集高潮自拟） |
+| 结尾道别 | {auto_hook}；「{closing_tpl}」 |
 
 ## JSON 输出示例（结构参考）
 ```json
-{{"items": {FAZU2_SCRIPT_REFERENCE_ITEMS_JSON}}}
+{FAZU2_SCRIPT_REFERENCE_ITEMS_JSON}
 ```
 
 ---
@@ -364,31 +720,47 @@ def get_compact_custom_prompt_display(
 FAZU2_SCRIPT_REFERENCE_ITEMS_JSON = """[
   {
     "_id": 1,
-    "timestamp": "00:00:01,940-00:00:12,740",
-    "picture": "办公室内，领导与伟业对坐，气氛凝重",
-    "narration": "宝子们，我们开始《罚罪2》啦！开场省厅领导就把伟业叫到办公室。领导开口就说：你都到厅级了，干嘛非要回去当局长？想清楚了？伟业没有接话，他只说了一句：胡晓月是我的徒弟。",
-    "OST": 0
+    "timestamp": "00:20:05,000-00:20:13,000",
+    "picture": "夜色楼顶，胡小跃站在边缘，纵身跃下",
+    "narration": "播放原片",
+    "OST": 1,
+    "original_line": "「天就快亮了。」"
   },
   {
     "_id": 2,
-    "timestamp": "00:00:12,820-00:00:22,500",
-    "picture": "领导眉头紧锁，语气沉重",
-    "narration": "领导叹了口气，说我知道，但她确实是死于自杀，还有一些关于举报她的材料也正在核实。伟业当场就反驳了。",
+    "timestamp": "00:00:01,940-00:00:09,940",
+    "picture": "楼顶天台，老叶与伟业并肩",
+    "narration": "宝子们，故事得从头讲起。伟业，厅级干部，放着舒服日子不过，非要回汉州当局长……",
     "OST": 0
   },
   {
-    "_id": 33,
-    "timestamp": "00:20:05,120-00:20:06,240",
-    "picture": "胡小月抬头看向夜空",
-    "narration": "「天就快亮了。」",
-    "OST": 1
+    "_id": 3,
+    "timestamp": "00:00:11,000-00:00:16,890",
+    "picture": "领导叹气，语重心长",
+    "narration": "领导叹口气：胡小跃是你徒弟，我知道。可人家是自杀，举报材料堆成山。伟业脸刷地白了。您猜他怎么回？往下看！",
+    "OST": 0
   },
   {
-    "_id": 37,
-    "timestamp": "00:28:22,530-00:28:23,490",
-    "picture": "罗博咬碎后槽牙，冷笑",
-    "narration": "「有意思。」",
-    "OST": 1
+    "_id": 4,
+    "timestamp": "00:00:16,940-00:00:26,700",
+    "picture": "伟业目光坚定，一字一句",
+    "narration": "播放原片",
+    "OST": 1,
+    "original_line": "「胡小跃是我的徒弟。」"
+  },
+  {
+    "_id": 5,
+    "timestamp": "00:00:26,700-00:00:36,020",
+    "picture": "伟业情绪激动，反驳领导",
+    "narration": "一句话把领导噎住了。伟业接着崩了：我了解小跃，她不是对组织失去信心，更不是害怕逃避。她是不甘心被陷害，想用自己的命加速破案。听得我后背发凉。这师傅够硬！",
+    "OST": 0
+  },
+  {
+    "_id": 45,
+    "timestamp": "00:20:05,000-00:20:13,000",
+    "picture": "【复现】夜色楼顶，胡小跃纵身跃下",
+    "narration": "还记得开头吗？胡小跃从楼顶一跃而下，「天就快亮了。」一个刑警，用自己的命换来了重启调查的机会。宝子们，汉州的天，是该亮了。我们下期再见！",
+    "OST": 0
   }
 ]"""
 
@@ -396,44 +768,57 @@ FAZU2_SCRIPT_REFERENCE_ITEMS_JSON = """[
 def build_fazu2_script_output_reference(
     settings: Optional[Dict[str, Any]] = None,
 ) -> str:
-    """故事讲述型 JSON 参考模板。"""
+    """高潮前置版 JSON 参考模板。"""
     cfg = get_documentary_compact_settings(settings)
     min_ost1, max_ost1 = compute_ost1_segment_bounds(settings=cfg)
-    return f"""## 输出 JSON 参考模板（故事讲述型 · 必须严格仿照）
+    return f"""## 输出 JSON 参考模板（V2 · 必须严格仿照）
 
 ```json
-{{"items": {FAZU2_SCRIPT_REFERENCE_ITEMS_JSON}}}
+{FAZU2_SCRIPT_REFERENCE_ITEMS_JSON}
 ```
 
-{build_fazu2_generation_anti_patterns()}
+{build_fazu2_generation_anti_patterns(cfg)}
 
 ### 字段要点
 | 字段 | OST=0 | OST=1 |
 |------|-------|-------|
-| `narration` | 30–100 字，**讲故事+嵌入对白**，禁止拉片分析 | **仅一句**金句台词（引号） |
-| `timestamp` | 字幕/画面真实毫秒范围 | 字幕对白**精确**起止 |
-| `picture` | 15–30 字，人物+动作+场景+情绪 | 说话人画面 |
-| `OST` | 0（默认） | 1（**{min_ost1}–{max_ost1}** 段/全片） |
+| `narration` | 30–100 字，**以字幕剧情为准** | **固定**「播放原片」 |
+| `original_line` | 无 | **必填**，字幕原台词 `"「…」"` |
+| `timestamp` | **从字幕复制**（抽帧仅作对齐参考） | 字幕对白**精确**起止 |
+| `picture` | 参考抽帧：人物+动作+场景+光线 | 参考抽帧：说话人/名场面 |
+| `OST` | 0（约 50%） | 1（**{min_ost1}–{max_ost1}** 段，约 50%） |
+| `_id` | **播放顺序**：①开头高潮(OST=1) → ②转场正叙(OST=0) → ③正叙 → ④收尾 |
 """
 
 
-def build_fazu2_generation_anti_patterns() -> str:
-    """故事讲述型：错误 vs 正确对照。"""
-    return """## 错误示范 vs 正确示范
+def build_fazu2_generation_anti_patterns(
+    settings: Optional[Dict[str, Any]] = None,
+) -> str:
+    """罚罪2 V2：错误 vs 正确对照。"""
+    cfg = settings or get_documentary_compact_settings()
+    ost_dur_min = int(cfg.get("ost1_duration_min", 8))
+    ost_dur_max = int(cfg.get("ost1_duration_max", 18))
+    return f"""## 错误示范 vs 正确示范
 
 ### ❌ 禁止
-- 匿名编号人物：「警员1说」「警员2追问」「说话人1开口」
-- 拉片分析：「注意领导的表情——他在试探」「导演用特写捕捉心理崩塌」
-- 编造时间戳：`00:06:00,000-00:06:12,000` 等整分铺段
-- 金句标 OST=0 却只剩一句裸台词（应 OST=1 或写入前后解说正文）
-- 流水账：然后、接着、接下来、我们可以看到
+- 第 1 段 OST=0 或含旁白/「宝子们」
+- 第 2 段没有「宝子们」开头
+- OST=1 的 `narration` 为空或写解说词（应固定「播放原片」）
+- OST=1 缺少 `original_line` 字段
+- 在 `narration` 中用 `**「金句」**` 代替 `original_line`（旧版格式，已废弃）
+- 原声段过短（应 **{ost_dur_min}–{ost_dur_max} 秒**）；原声与解说比例失衡（应约 **1:1**）
+- OST=1 未播完即开始下一段 OST=0 解说（时间戳重叠、夹在两个原声之间、或原声半句被截断）
+- 人名错误（胡小月/胡晓月/小月/秦峰/罗伯/伟叶）；性别/职级与画面对不上（如胡小跃段落写成女警）
+- 第 1 段不用跳楼而用中段台词（如「你跟我说这是狗贩子」）作开头高潮
+- 匿名编号人物；拉片分析；流水账词（然后、接着、我们可以看到）
+- 编造时间戳；用 `{{"items":[...]}}` 包裹
 
 ### ✅ 必须
-- 具名人名：「秦枫逼问」「胡小月吼了出来」「罗博冷笑」
-- OST=0 示例：「领导开口就说：你都到厅级了……伟业没有接话，他只说了一句：胡晓月是我的徒弟。」
-- OST=1 示例：仅「天就快亮了。」等 3–8 秒金句，前后有解说铺垫
-- 时间戳：`00:00:01,940-00:00:12,740` 这类字幕原样复制
-- `_id` 按剧情顺序 1→2→3… 讲完整集故事线
+- 第 1 段 OST=1：跳楼 sacrifice +「天就快亮了。」类金句；`播放原片` + `original_line`；纯原声无旁白
+- 第 2 段 OST=0：以「宝子们」开头，接「故事，得从头讲起」进入正叙
+- 关键台词前 OST=0 埋伏/悬疑引出 → OST=1：`"narration": "播放原片"` + `"original_line": "「台词」"` → 下段 OST=0 点评
+- 最后一段含「宝子们，我们下期再见！」；可复现开头名场面（OST=0 时台词用「」嵌入 narration）
+- 输出顶层 JSON 数组 `[...]`；`_id` 为播放顺序；人名严格按字幕
 """
 
 
@@ -505,7 +890,7 @@ def get_narration_script_llm_params(
 
 
 def get_documentary_compact_settings(overrides: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
-    """逐帧精剪：默认故事讲述型（35–50 段，原声 5–10 段，解说 30–100 字/段）。"""
+    """逐帧精剪：默认高潮前置版（35–50 段，原声 ≤20 段，解说 30–100 字/段）。"""
     settings = get_documentary_settings()
     for key, value in DOCUMENTARY_COMPACT_OVERRIDES.items():
         settings[key] = value
@@ -522,6 +907,7 @@ def get_documentary_compact_settings(overrides: Optional[Dict[str, Any]] = None)
 DOCUMENTARY_COMPACT_CONFIG_KEYS = (
     "enable_opening_closing_hook",
     "opening_hook_template",
+    "transition_hook_template",
     "closing_hook_template",
     "fazu2_core_theme",
     "default_custom_prompt",
@@ -623,8 +1009,18 @@ def compute_ost1_segment_bounds(
     max_cfg = int(cfg.get("max_ost1_segments", 0) or 0)
 
     if is_fazu2_compact_settings(cfg):
-        min_ost1 = max(1, min_cfg if min_cfg > 0 else 5)
-        max_ost1 = max(min_ost1, max_cfg if max_cfg > 0 else 10)
+        ratio = float(cfg.get("original_audio_ratio", 0.5) or 0.5)
+        ratio = max(0.2, min(0.8, ratio))
+        if total_items > 0:
+            target = max(1, round(total_items * ratio))
+            slack = max(2, int(total_items * 0.06))
+            min_ost1 = max(1, target - slack)
+            max_ost1 = min(total_items - 1, target + slack)
+        else:
+            min_seg = int(cfg.get("min_total_segments", 30))
+            target = max(1, round(min_seg * ratio))
+            min_ost1 = max(1, min_cfg if min_cfg > 0 else target - 2)
+            max_ost1 = max(min_ost1, max_cfg if max_cfg > 0 else target + 3)
         return min_ost1, max_ost1
 
     every_n = max(1, int(cfg.get("ost1_every_n_segments", 10) or 10))
@@ -678,10 +1074,12 @@ def format_ost1_segment_hint(
         min_ost1, max_ost1 = compute_ost1_segment_bounds(
             estimated_items or 0, cfg
         )
+        ratio = float(cfg.get("original_audio_ratio", 0.5) or 0.5)
+        pct = int(round(ratio * 100))
         return (
-            f"- **原声点睛**：全片 OST=1 **{min_ost1}–{max_ost1} 段**，每段 **{ost_min}–{ost_max} 秒**\n"
-            f"- 仅用于标志性金句/情绪爆点；**前面至少 1 段 OST=0 铺垫**；**严禁相邻原声**\n"
-            f"- OST=1：`narration` **只写该句台词**（引号）；其余对白**写入 OST=0 解说正文**\n"
+            f"- **原声 OST=1**：全片 **{min_ost1}–{max_ost1} 段**（约 {pct}%），每段 **{ost_min}–{ost_max} 秒**\n"
+            f"- `narration`=「播放原片」+ `original_line`；推荐 **OST=0 铺垫/悬疑引出 → OST=1 → OST=0 点评**\n"
+            f"- 原声须等当前台词/片段说完再切解说；timestamp 覆盖字幕整句；禁止半句截断\n"
         )
     if is_compact_documentary_settings(cfg):
         return (
@@ -726,7 +1124,7 @@ def build_compact_coverage_instructions(
 {duration_hint}{ost1_hint}- 普通解说段默认 **OST=0**，每段 **{chars_min}–{chars_max} 字**，约 **{avg_tts_sec:.0f} 秒**配音
 - **items 总数硬性范围：{min_segments}–{max_segments} 段**（低于 {min_segments} 或超过 {max_segments} 均无效）
 - **items 目标数量：约 {target_segments} 段**（长片不得因篇幅偷懒只写十几段）
-- 时间戳必须落在 `<video_frame_description>` / 字幕已有范围内，**严禁重叠**，后段开始 ≥ 前段结束
+- 时间戳必须落在**字幕**已有范围内，可参考抽帧对齐画面 moment；**严禁重叠**，后段开始 ≥ 前段结束
 - **精剪≠梗概**：每段须有深度拉片观察，禁止流水账复述；优先华彩镜头，但**不得**为省段数跳过整段 {interval} 秒未覆盖区间
 - **声画对位（何止电影）**：解说抛观点后，可紧接 OST=1 切入能印证该观点的原声对白（时间戳以字幕为准）
 - **禁止** OST=2；本模式只用 OST=0 与 OST=1
@@ -737,21 +1135,23 @@ def build_compact_coverage_instructions(
     min_ost1, max_ost1 = compute_ost1_segment_bounds(target_segments, cfg)
 
     if is_fazu2_compact_settings(cfg):
-        return f"""## 精剪覆盖（必须遵守 · 故事讲述型）
+        return f"""## 精剪覆盖（必须遵守 · 罚罪2 V2）
 
 ### 风格目标
-- 像说书人**从头到尾讲清剧情**，有细节、情绪、转折；**不要**拉片/镜头分析
-- **OST=0** 为主体：对白融入叙述；**OST=1** 为 **{min_ost1}–{max_ost1}** 个金句爆点
+- **高潮前置**：第 1 段纯原声名场面 → 第 2 段「宝子们」转场正叙 → 按时间线推进 → 最后一段收尾道别
+- **OST=0 与 OST=1 约 1:1**（各约 50%，原声 **{min_ost1}–{max_ost1}** 段），第 3 段起交替穿插
 
 ### 全片指标（目标成片约 {target_minutes:.0f} 分钟）
 | 指标 | 要求 |
 |------|------|
 | 总片段数 | **{min_segments}–{max_segments} 段**（目标约 {target_segments}） |
 | 解说 OST=0 | **≥{ost0_min} 段**，每段 **{chars_min}–{chars_max} 字** |
-| 原声 OST=1 | **{min_ost1}–{max_ost1} 段** |
+| 原声 OST=1 | **{min_ost1}–{max_ost1} 段**（约 50%） |
+| 每段时长 | 平均 **15–20 秒** |
+| 结构 | ①开头高潮(纯原声) → ②转场正叙 → ③正叙 → ④收尾 |
 
-{ost1_hint}- 按**剧情顺序**选情节点，允许跳剪；`_id` 为播放顺序；时间戳**必须从字幕复制**
-- 遵守「逐帧精剪 · 故事讲述型脚本规则」；**禁止 OST=2**
+{ost1_hint}- `_id` 为**播放顺序**（可倒叙开场）；时间戳**必须从字幕复制**
+- 遵守「罚罪2 脚本规则 V2」；OST=1 须含 `original_line`；**禁止 OST=2**
 """
 
     ratio = float(cfg.get("target_output_ratio", 0.3))
@@ -807,24 +1207,46 @@ def resolve_documentary_custom_prompt(
     return user_text or default_prompt
 
 
+def resolve_append_custom_prompt(
+    append_prompt: str = "",
+    settings: Optional[Dict[str, Any]] = None,
+) -> str:
+    """解析本集追加提示词（WebUI 输入优先于 config）。"""
+    text = (append_prompt or "").strip()
+    if text:
+        return text
+    cfg = get_documentary_settings(settings)
+    return str(cfg.get("append_custom_prompt") or "").strip()
+
+
+def build_append_requirements_section(
+    append_prompt: str = "",
+    settings: Optional[Dict[str, Any]] = None,
+) -> str:
+    """本集追加要求独立区块（置于 prompt 首位，优先级高于默认规则）。"""
+    append = resolve_append_custom_prompt(append_prompt, settings)
+    if not append:
+        return ""
+    return f"""## 本集追加要求（最高优先级 · 必须遵守）
+
+以下内容由用户在 WebUI「追加提示词」填写，**覆盖**默认开头高潮示例与其它通用建议中冲突的部分：
+
+{append}
+
+硬性要求：
+- 若指定了开头高潮/爆燃名场面（人物、台词、场景），第 1 个 item（OST=1）**必须**使用该场面，`timestamp` 从字幕原样复制
+- 不得改用其他角色的台词或桥段顶替用户指定的开头高潮
+- 开头段后，再按时间线正叙展开；高潮复现段可再次呼应同一金句（若追加要求未禁止）"""
+
+
 def build_effective_documentary_prompt(
     user_prompt: str = "",
     append_prompt: str = "",
     settings: Optional[Dict[str, Any]] = None,
 ) -> str:
-    """合并自定义提示词与追加提示词（仅用于脚本生成，不参与抽帧视觉分析）。"""
+    """合并 config 默认补充与自定义提示词（不含追加提示词，追加由独立区块注入）。"""
     cfg = get_documentary_settings(settings)
-    base = resolve_documentary_custom_prompt(user_prompt, cfg)
-    append = (append_prompt or "").strip()
-    if not append:
-        append = str(cfg.get("append_custom_prompt") or "").strip()
-    if not append:
-        return base
-    if base:
-        if append in base:
-            return base
-        return f"{base}\n\n## 追加要求\n{append}"
-    return f"## 追加要求\n{append}"
+    return resolve_documentary_custom_prompt(user_prompt, cfg)
 
 
 def build_compact_ost_instructions(settings: Optional[Dict[str, Any]] = None) -> str:
@@ -844,25 +1266,25 @@ def build_compact_ost_instructions(settings: Optional[Dict[str, Any]] = None) ->
     chars_max = int(cfg.get("narration_chars_max", 150))
 
     if is_fazu2_compact_settings(cfg):
-        return f"""## 音频模式（必须遵守 · 故事讲述型）
+        return f"""## 音频模式（必须遵守 · 罚罪2 V2）
 
-| OST | 含义 |
-|-----|------|
-| **0** | 解说讲故事（TTS），**对白写在 narration 里** |
-| **1** | 纯原声金句（极少），无 TTS |
-| **2** | **禁止** |
+| OST | 含义 | narration | 额外字段 |
+|-----|------|-----------|----------|
+| **0** | 旁白解说（约 50%） | 完整解说词，与 picture 一致 | 无 |
+| **1** | 原声播放（约 50%） | **固定**「播放原片」 | `"original_line": "「原台词」"` |
+| **2** | **禁止** | — | — |
 
-### OST=0（全片 ≥30 段，每段 {chars_min}–{chars_max} 字）
-- 用「谁对谁说 / 谁喊了一句」把对白自然写进解说；**不要**拆成大量裸台词段
-- 一段一事；段末可留情绪或过渡（如「可谁也没想到……」）
-- `timestamp` 取自字幕，时长 ≈ 字数÷10×1.5 秒
+### OST=0（全片解说段数见配置下限，每段 {chars_min}–{chars_max} 字）
+- 正叙、点评、钩子、道别；复述对白用「」嵌入 narration
+- 金句 OST=1 之后的点评段用 OST=0
 
-### OST=1（全片 **{min_ost1}–{max_ost1} 段**，每段 {ost_min}–{ost_max} 秒）
-- 仅标志性台词（如「天就快亮了」）；`narration` **只写该句**；`timestamp` 精确取自字幕
-- 前面至少 1 段 OST=0 铺垫；**禁止相邻 OST=1**
+### OST=1（全片 **{min_ost1}–{max_ost1} 段**，约 50%，每段 {ost_min}–{ost_max} 秒）
+- `narration` **固定**「播放原片」；台词写在 `original_line`
+- 第 1 段必须为纯原声；第 3 段起可连续多段 OST=1，整块播完再接 OST=0
+- **禁止** OST=1 未播完即开始下一段 OST=0 解说（时间戳不得重叠；禁止夹在两个原声之间）
 
 {build_fazu2_script_output_reference(cfg)}
-只输出 `{{"items":[...]}}`，不要 markdown 代码块包裹。
+只输出 JSON 数组 `[...]`，不要 markdown 代码块包裹。
 """
 
     picture_line = "- `picture` 写画面/人物备注"
@@ -974,8 +1396,9 @@ def build_frame_highlight_hint(settings: Optional[Dict[str, Any]] = None) -> str
     hints: list[str] = []
     if is_fazu2_compact_settings(cfg):
         hints.append(
-            "画面描述须写出**人物姓名**（从字幕/剧情推断），禁止警员1、说话人2等编号；"
-            "人物+动作+场景+情绪，15–30 字，供 picture 字段引用。"
+            "画面描述：人物+动作+场景+可见性别/职级+光线/昼夜/天气+情绪，15–30 字；"
+            f"有字幕真名写「姓名(性别)」，无真名写「{FRAME_UNKNOWN_CHARACTER_MALE}/{FRAME_UNKNOWN_CHARACTER_FEMALE}」，禁止警员1、说话人2等编号；"
+            "禁止把「领导」当人物姓名；伟业是局长专名，勿与上级混称；性别须据画面判断。"
         )
         hints.append(
             "若该帧有可作 OST=1 的标志性台词，标注 `[金句原声]` 并摘录对白+字幕时间。"
@@ -986,18 +1409,18 @@ def build_frame_highlight_hint(settings: Optional[Dict[str, Any]] = None) -> str
         )
     if cfg.get("enable_original_audio_highlights", True):
         hints.append(
-            "若某帧出现爆炸、追逐、尖叫、恐怖、激烈冲突、名场面台词或音效高潮，"
-            "请在 observation 末尾标注 `[高光原声]`。"
+            "若某场景出现爆炸、追逐、尖叫、恐怖、激烈冲突、名场面台词或音效高潮，"
+            "请在 scene_segments 的 audio_cue 中标注，并将 importance 设为「高（高光原声）」。"
         )
     if cfg.get("enable_action_expression_modifiers", True):
         hints.append(
-            "描述每一帧时，写出人物表情、肢体动作与场景氛围，"
+            "scene_segments 的 action / emotion / key_visual 须写出人物表情、肢体动作与场景氛围，"
             "用具体可见的细节帮助后续解说理解画面。"
         )
     if cfg.get("enable_logic_roast", True) and not is_compact_documentary_settings(cfg):
         hints.append(
             "若人物行为明显违背常理或令人费解，"
-            "请在 observation 末尾标注 `[可吐槽]` 并简述原因（供解说员适度点评）。"
+            "请在 key_visual 或 importance 中标注「可吐槽」并简述原因（供解说员适度点评）。"
         )
     return " ".join(hints)
 
@@ -1020,12 +1443,13 @@ def build_compact_narration_style_instructions(
         rules_block = build_compact_story_script_rules(theme, settings=cfg)
         return f"""{rules_block}
 
-## 解说风格（必须遵守 · 故事讲述型）
+## 解说风格（必须遵守 · 罚罪2 V2）
 
-- 全片 **{min_segments}–{max_segments} 段**，解说 ≥{ost0_min}，原声 **{min_ost1}–{max_ost1}** 段
-- OST=0：每段 **{chars_min}–{chars_max} 字**，讲故事、嵌入对白，禁止拉片分析
-- OST=1：**{min_ost1}–{max_ost1}** 个金句，每句单独成段，前后有解说铺垫
-- 纵览前后约 {window} 秒画面与字幕，保持剧情连贯，像给观众**讲一集电视剧**
+- 全片 **{min_segments}–{max_segments} 段**，解说与原声各约 **50%**（OST=0 ≥{ost0_min}，OST=1 **{min_ost1}–{max_ost1}**）
+- 结构：①开头高潮(纯原声) → ②「宝子们」转场 → ③ **铺垫/悬疑引出原声 → 原声 → 点评** → ④收尾
+- OST=0：每段 **{chars_min}–{chars_max} 字**；可埋伏、铺垫、制造悬疑引出下一段 OST=1
+- OST=1：「播放原片」+ `original_line`；须整句/整段播完，下一段 OST=0 再点评承接
+- 纵览前后约 {window} 秒画面与字幕，正叙按时间线连贯推进
 """
 
     return f"""## 解说风格（必须遵守）
@@ -1100,7 +1524,8 @@ def build_narration_style_instructions(
         [
             "",
             "### OST=1 原声段",
-            "- 进入纯原声前，上一段可用一句短铺垫收束；原声段本身不写解说词",
+            "- **推荐**上一段 OST=0 用埋伏、铺垫或悬疑引出原声（「您猜他怎么回？」「且看他们怎么收网」等）",
+            "- 原声播完后，下一段 OST=0 点评承接；原声段本身不写解说词",
         ]
     )
 

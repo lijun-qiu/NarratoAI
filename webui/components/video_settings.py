@@ -6,6 +6,7 @@ from app.services.video_output_settings import (
     get_video_output_settings,
     save_video_output_settings_to_config,
 )
+from app.services.short_drama_settings import resolve_video_output_for_script_mode
 
 
 def render_video_panel(tr):
@@ -148,9 +149,12 @@ def render_video_output_settings(tr):
 
 def get_video_params():
     """获取视频参数"""
-    vo = st.session_state.get("video_output_settings") or get_video_output_settings()
-    enable_picture_narration = vo.get("enable_picture_narration", True)
     script_path = st.session_state.get("video_clip_json_path", "")
+    vo = resolve_video_output_for_script_mode(
+        st.session_state.get("video_output_settings") or get_video_output_settings(),
+        script_path=script_path,
+    )
+    enable_picture_narration = vo.get("enable_picture_narration", True)
     doc_mode = st.session_state.get("documentary_script_mode", "")
     if doc_mode == "auto_compact" or script_path == "auto_compact":
         from app.services.documentary.documentary_settings import get_documentary_compact_settings
@@ -165,4 +169,6 @@ def get_video_params():
         'original_volume': st.session_state.get('original_volume', AudioVolumeDefaults.ORIGINAL_VOLUME),
         'watermark_text': vo.get('watermark_text', VIDEO_OUTPUT_DEFAULTS['watermark_text']),
         'enable_picture_narration': enable_picture_narration,
+        'picture_narration_font_size': int(vo.get('picture_narration_font_size', 44)),
+        'picture_narration_color': vo.get('picture_narration_color', '#FFE066'),
     }

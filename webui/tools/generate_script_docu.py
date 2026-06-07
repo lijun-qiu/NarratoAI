@@ -16,21 +16,38 @@ from app.services.documentary.documentary_settings import (
     get_documentary_settings,
     compute_ost1_segment_bounds,
 )
-from app.services.subtitle_video_pairing import (
-    find_paired_subtitle_path,
-    load_subtitle_content,
+from app.services.documentary.documentary_material_resolver import (
+    load_subtitle_content_for_documentary,
+    resolve_frame_analysis_path_for_documentary,
+    normalize_material_source_video_path,
 )
 from webui.utils.script_stats import render_script_ost_summary
 
 
+def _material_source_video_path() -> str:
+    return normalize_material_source_video_path(
+        str(st.session_state.get("doc_material_source_video_path") or "")
+    )
+
+
 def _resolve_subtitle_content(video_path: str) -> str:
     session_content = (st.session_state.get("subtitle_content") or "").strip()
-    subtitle_path = (st.session_state.get("subtitle_path") or "").strip()
-    if not subtitle_path and video_path:
-        subtitle_path = find_paired_subtitle_path(video_path) or ""
-    if subtitle_path and os.path.isfile(subtitle_path):
-        return load_subtitle_content(subtitle_path).strip() or session_content
-    return session_content
+    explicit_path = (st.session_state.get("subtitle_path") or "").strip() or None
+    if st.session_state.get("doc_subtitle_file_processed") and session_content:
+        return session_content
+    if st.session_state.get("doc_subtitle_file_processed") and explicit_path:
+        return load_subtitle_content_for_documentary(
+            video_path,
+            material_source_video_path="",
+            explicit_path=explicit_path,
+            fallback_content=session_content,
+        )
+    return load_subtitle_content_for_documentary(
+        video_path,
+        material_source_video_path=_material_source_video_path(),
+        explicit_path=explicit_path,
+        fallback_content=session_content,
+    )
 
 
 def _normalize_progress_value(progress: float | int) -> int:
@@ -52,7 +69,7 @@ def generate_script_docu(params, *, compact: bool = False):
     适合场景: 纪录片、动物搞笑解说、荒野建造等。
     可选上传或转录 SRT，与抽帧分析结合（config: enable_subtitle_enrichment）。
 
-    compact=True 时为逐帧精剪：故事讲述型（30–100 字/段，35–50 段，原声 5–10 段）。
+    compact=True 时为逐帧精剪：先字幕×抽帧充分分析，再按高潮前置版规则生成 JSON。
     """
     progress_bar = st.progress(0)
     status_text = st.empty()
@@ -75,16 +92,27 @@ def generate_script_docu(params, *, compact: bool = False):
                 st.session_state.get("vision_llm_provider") or config.app.get("vision_llm_provider", "openai")
             ).lower()
             reuse_frame_analysis = bool(st.session_state.get("doc_reuse_frame_analysis", True))
-            resolved_analysis_path = DocumentaryFrameAnalysisService().resolve_reusable_analysis_path(
+            material_source = _material_source_video_path()
+            explicit_analysis = (
+                st.session_state.get("frame_analysis_json_path") or ""
+            ).strip() or None
+            resolved_analysis_path = resolve_frame_analysis_path_for_documentary(
                 params.video_origin_path,
-                explicit_path=(st.session_state.get("frame_analysis_json_path") or "").strip() or None,
+                material_source_video_path=material_source,
+                explicit_path=explicit_analysis,
                 reuse=reuse_frame_analysis,
             )
             if not resolved_analysis_path:
-                raise ValueError(
+                hint = (
                     "未找到可用的抽帧分析 JSON。请先在「抽帧分析」中点击「抽帧并分析」，"
                     "或上传/复用已有分析文件后再生成脚本。"
                 )
+                if material_source:
+                    hint += (
+                        f" 已配置素材来源视频「{os.path.basename(material_source)}」，"
+                        "请确认该视频已完成抽帧分析。"
+                    )
+                raise ValueError(hint)
             update_progress(10, "将复用已有抽帧分析，正在生成脚本...")
 
             doc_settings = get_documentary_compact_settings() if compact else get_documentary_settings()
@@ -111,7 +139,18 @@ def generate_script_docu(params, *, compact: bool = False):
             if doc_settings.get("enable_subtitle_enrichment", True):
                 subtitle_content = _resolve_subtitle_content(params.video_origin_path)
                 if subtitle_content:
-                    update_progress(12, "已加载字幕，将与抽帧分析结合...")
+                    update_progress(12, "已加载字幕，将先分析字幕×抽帧再生成脚本...")
+                elif compact and doc_settings.get("require_subtitle_for_script", True):
+                    hint = (
+                        "逐帧精剪需要字幕文件。请先上传/转录 SRT，"
+                        "或完成 OCR 字幕后将 *_ocr_refined.srt 与视频配对。"
+                    )
+                    if material_source:
+                        hint += (
+                            f" 可在「抽帧/字幕来源视频」指定有字幕素材"
+                            f"（当前：{os.path.basename(material_source)}）。"
+                        )
+                    raise ValueError(hint)
             default_interval = doc_settings.get("frame_interval_input") or config.frames.get(
                 "frame_interval_input", 3
             )
@@ -143,7 +182,8 @@ def generate_script_docu(params, *, compact: bool = False):
                     max_concurrency=vision_max_concurrency,
                     documentary_settings=doc_settings,
                     subtitle_content=subtitle_content,
-                    analysis_json_path=(st.session_state.get("frame_analysis_json_path") or "").strip() or None,
+                    analysis_json_path=resolved_analysis_path,
+                    material_source_video_path=material_source,
                     reuse_frame_analysis=reuse_frame_analysis,
                 )
             )

@@ -7,13 +7,12 @@ import streamlit as st
 from loguru import logger
 
 from app.services.documentary.documentary_settings import get_documentary_compact_settings, get_documentary_settings
-from app.services.documentary.frame_analysis_pairing import find_paired_frame_analysis_path
-from app.services.documentary.frame_analysis_service import DocumentaryFrameAnalysisService
-from app.services.documentary.hard_subtitle_ocr_service import (
-    calibrate_subtitle_with_hard_subtitle_ocr,
-    get_ocr_refined_subtitle_path,
+from app.services.documentary.hard_subtitle_ocr_service import calibrate_subtitle_with_hard_subtitle_ocr
+from app.services.subtitle_video_pairing import load_subtitle_content
+from webui.tools.subtitle_calibration_session import (
+    resolve_calibration_analysis_path,
+    resolve_calibration_subtitle_path,
 )
-from app.services.subtitle_video_pairing import find_paired_subtitle_path, load_subtitle_content
 
 
 def _normalize_progress_value(progress: float | int) -> int:
@@ -41,29 +40,16 @@ def ocr_calibrate_subtitle_docu(params, *, compact: bool = False):
 
     try:
         with st.spinner("正在 OCR 硬字幕并校准..."):
-            if not params.video_origin_path:
-                st.error("请先选择视频文件")
-                return
-
             doc_settings = get_documentary_compact_settings() if compact else get_documentary_settings()
 
-            subtitle_path = (st.session_state.get("subtitle_path") or "").strip()
+            subtitle_path = resolve_calibration_subtitle_path()
             if not subtitle_path or not os.path.isfile(subtitle_path):
-                subtitle_path = find_paired_subtitle_path(params.video_origin_path) or ""
-            if not subtitle_path or not os.path.isfile(subtitle_path):
-                st.error("请先转写或上传字幕，再执行 OCR 校准")
+                st.error("请先选用或导入字幕 SRT，再执行 OCR 校准")
                 return
 
-            reuse_frame_analysis = bool(st.session_state.get("doc_reuse_frame_analysis", True))
-            analysis_path = DocumentaryFrameAnalysisService().resolve_reusable_analysis_path(
-                params.video_origin_path,
-                explicit_path=(st.session_state.get("frame_analysis_json_path") or "").strip() or None,
-                reuse=reuse_frame_analysis,
-            )
-            if not analysis_path:
-                analysis_path = find_paired_frame_analysis_path(params.video_origin_path) or ""
+            analysis_path = resolve_calibration_analysis_path()
             if not analysis_path or not os.path.isfile(analysis_path):
-                st.error("未找到抽帧分析 JSON，请先执行「抽帧并分析」")
+                st.error("未找到抽帧分析 JSON，请先选用或导入分析文件")
                 return
 
             update_progress(10, "正在裁剪关键帧底部并 OCR 硬字幕...")

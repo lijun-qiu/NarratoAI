@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import os
 import re
 from typing import Any, Dict, List, Optional
 
@@ -12,6 +13,7 @@ from loguru import logger
 
 from app.services.documentary.documentary_settings import (
     FAZU2_FORBIDDEN_NARRATION_PHRASES,
+    FAZU2_WRONG_CHARACTER_NAMES,
     compute_compact_segment_bounds,
     compute_max_ost1_segments,
     compute_ost1_segment_bounds,
@@ -19,9 +21,24 @@ from app.services.documentary.documentary_settings import (
     get_documentary_settings,
     is_compact_documentary_settings,
     is_fazu2_compact_settings,
+    resolve_fazu2_opening_climax_hint,
 )
-from app.services.srt_utils import parse_timestamp_range
-from app.utils import utils
+from app.services.documentary.documentary_subtitle_enrichment import (
+    parse_timestamp_range_ms,
+    resolve_segment_subtitle_text,
+    resolve_segment_time_range,
+)
+from app.services.documentary.frame_analysis_compact import _collect_top_level_segments
+from app.services.documentary.frame_analysis_pairing import load_analysis_artifact
+from app.services.documentary.opening_climax_resolver import apply_opening_climax_fix
+from app.services.srt_utils import (
+    dialogue_match_key,
+    find_subtitle_span_for_line,
+    format_timestamp_ms,
+    normalize_script_timestamp_range,
+    parse_srt,
+    parse_timestamp_range,
+)
 
 
 def _segment_duration_sec(timestamp: str) -> float:
@@ -46,8 +63,35 @@ def _is_preservable_ost1_dialogue(narration: str) -> bool:
     return bool(text) and not text.startswith("播放原片")
 
 
+def _normalize_fazu2_ost1_fields(item: Dict[str, Any]) -> Dict[str, Any]:
+    """V2：OST=1 统一为 narration=播放原片 + original_line。"""
+    narration = str(item.get("narration") or "").strip()
+    original_line = str(item.get("original_line") or "").strip()
+
+    bold_match = re.search(r"\*\*「([^」]+)」\*\*", narration)
+    if bold_match:
+        extracted = f"「{bold_match.group(1)}」"
+        if not original_line:
+            original_line = extracted
+        narration = "播放原片"
+    elif narration.startswith("「") and narration.endswith("」") and len(narration) <= 40:
+        if not original_line:
+            original_line = narration
+        narration = "播放原片"
+    elif narration.startswith("播放原片"):
+        narration = "播放原片"
+
+    if original_line and not original_line.startswith("「"):
+        original_line = f"「{original_line.strip('「」')}」"
+
+    item["narration"] = narration or "播放原片"
+    if original_line:
+        item["original_line"] = original_line
+    return item
+
+
 def _ms_to_timestamp(ms: int) -> str:
-    return utils.seconds_to_time(max(0, ms) / 1000.0).replace(".", ",")
+    return format_timestamp_ms(ms)
 
 
 def _narration_char_count(text: str) -> int:
@@ -66,6 +110,9 @@ def _is_quote_only_narration(text: str) -> bool:
     narration = (text or "").strip()
     if not narration or narration.startswith("播放原片"):
         return False
+    bold_quote = re.match(r"^\*\*「[^」]+」\*\*\.?$", narration)
+    if bold_quote:
+        return True
     if len(narration) > 28:
         return False
     if "：" in narration or ":" in narration:
@@ -145,14 +192,27 @@ _GENERIC_CHARACTER_RE = re.compile(
 def _warn_fazu2_forbidden_phrases(item: Dict[str, Any]) -> None:
     narration = str(item.get("narration") or "")
     picture = str(item.get("picture") or "")
+    original_line = str(item.get("original_line") or "")
     if int(item.get("OST", 0)) != 0:
-        text = narration
+        text = f"{narration}\n{original_line}"
     else:
         text = f"{narration}\n{picture}"
     hits = [phrase for phrase in FAZU2_FORBIDDEN_NARRATION_PHRASES if phrase in text]
     if hits:
         logger.warning(
             f"片段 #{item.get('_id')} 含禁用表述 {hits}，建议改用具体人名后重新生成"
+        )
+    wrong_names = [wrong for wrong, _ in FAZU2_WRONG_CHARACTER_NAMES if wrong in text]
+    if wrong_names:
+        logger.warning(
+            f"片段 #{item.get('_id')} 含错误人名 {wrong_names}，请按字幕规范修正"
+        )
+    if any(name in text for name in ("胡小跃", "小跃")) and any(
+        term in text for term in ("女警", "女警察", "她")
+    ):
+        logger.warning(
+            f"片段 #{item.get('_id')} 胡小跃/小跃段落疑似性别与画面对不上，"
+            "请对照抽帧确认人称与职级"
         )
     generic = _GENERIC_CHARACTER_RE.findall(text)
     if generic:
@@ -172,6 +232,8 @@ def _adjust_fazu2_ost0_timestamps(items: List[Dict[str, Any]]) -> List[Dict[str,
         next_starts.append(start_ms)
     for index, item in enumerate(ordered):
         if int(item.get("OST", 0)) != 0:
+            continue
+        if item.get("_clip_aligned"):
             continue
         narration = str(item.get("narration") or "").strip()
         min_sec = _min_narration_duration_sec(narration)
@@ -196,11 +258,256 @@ def _adjust_fazu2_ost0_timestamps(items: List[Dict[str, Any]]) -> List[Dict[str,
     return ordered
 
 
+def _load_frame_segments(frame_analysis_path: str) -> List[Dict[str, Any]]:
+    path = (frame_analysis_path or "").strip()
+    if not path or not os.path.isfile(path):
+        return []
+    try:
+        artifact = load_analysis_artifact(path)
+        return _collect_top_level_segments(artifact)
+    except Exception as exc:
+        logger.warning(f"读取抽帧 JSON 用于片段 time_range 对位失败: {exc}")
+        return []
+
+
+def _range_overlap_ms(
+    start_a: int,
+    end_a: int,
+    start_b: int,
+    end_b: int,
+) -> int:
+    return max(0, min(end_a, end_b) - max(start_a, start_b))
+
+
+def _item_match_text(item: Dict[str, Any]) -> str:
+    ost = int(item.get("OST", 0))
+    if ost == 1:
+        return str(item.get("original_line") or item.get("narration") or "")
+    return " ".join(
+        str(item.get(key) or "")
+        for key in ("narration", "picture", "original_line")
+    )
+
+
+def _score_frame_segment_for_item(
+    item: Dict[str, Any],
+    segment: Dict[str, Any],
+    *,
+    item_start_ms: int,
+    item_end_ms: int,
+) -> float:
+    clip_range = resolve_segment_time_range(segment)
+    if not clip_range or "-" not in clip_range:
+        return -1.0
+    seg_start, seg_end = parse_timestamp_range_ms(clip_range)
+    overlap = _range_overlap_ms(item_start_ms, item_end_ms, seg_start, seg_end)
+    if overlap <= 0:
+        fallback = str(segment.get("timestamp") or "").strip()
+        if fallback and "-" in fallback:
+            ts_start, ts_end = parse_timestamp_range_ms(fallback)
+            overlap = _range_overlap_ms(item_start_ms, item_end_ms, ts_start, ts_end)
+    if overlap <= 0:
+        return -1.0
+
+    score = overlap / 1000.0
+    line_key = dialogue_match_key(_item_match_text(item))
+    subtitle_text = resolve_segment_subtitle_text(segment)
+    if line_key and subtitle_text:
+        sub_key = dialogue_match_key(subtitle_text)
+        if line_key in sub_key or sub_key in line_key:
+            score += 8.0
+        elif len(line_key) >= 4 and len(sub_key) >= 4 and line_key[:4] == sub_key[:4]:
+            score += 4.0
+
+    if int(item.get("OST", 0)) == 0:
+        blob = " ".join(
+            str(segment.get(key) or "")
+            for key in ("scene", "observation", "action", "key_visual")
+        )
+        picture = str(item.get("picture") or "").strip()
+        if picture:
+            for token in picture.replace("，", " ").replace("、", " ").split():
+                token = token.strip()
+                if len(token) >= 2 and token in blob:
+                    score += 1.5
+    return score
+
+
+def _find_frame_clip_range_for_item(
+    item: Dict[str, Any],
+    segments: List[Dict[str, Any]],
+    *,
+    item_start_ms: int,
+    item_end_ms: int,
+) -> str:
+    if not segments:
+        return ""
+    best_segment: Dict[str, Any] | None = None
+    best_score = -1.0
+    for segment in segments:
+        score = _score_frame_segment_for_item(
+            item,
+            segment,
+            item_start_ms=item_start_ms,
+            item_end_ms=item_end_ms,
+        )
+        if score > best_score:
+            best_score = score
+            best_segment = segment
+    if best_segment is None or best_score < 0:
+        return ""
+    return resolve_segment_time_range(best_segment)
+
+
+def _apply_clip_range_to_item(
+    item: Dict[str, Any],
+    clip_range: str,
+    *,
+    previous_end_ms: int | None = None,
+    ost1_hard_max_ms: int | None = None,
+) -> bool:
+    if not clip_range or "-" not in clip_range:
+        return False
+    clip_start, clip_end = parse_timestamp_range_ms(clip_range)
+    if clip_end <= clip_start:
+        return False
+    if ost1_hard_max_ms and clip_end - clip_start > ost1_hard_max_ms:
+        clip_end = clip_start + ost1_hard_max_ms
+    if previous_end_ms is not None and clip_start < previous_end_ms:
+        clip_start = previous_end_ms
+
+    old_start, old_end = parse_timestamp_range(str(item.get("timestamp") or ""))
+    if clip_start == old_start and clip_end == old_end:
+        item["_clip_aligned"] = "frame_time_range"
+        return True
+
+    item["timestamp"] = (
+        f"{format_timestamp_ms(clip_start)}-{format_timestamp_ms(clip_end)}"
+    )
+    item["_clip_aligned"] = "frame_time_range"
+    logger.info(
+        f"片段 #{item.get('_id')} 已对齐抽帧 time_range："
+        f"{(old_end - old_start) / 1000.0:.1f}s → {(clip_end - clip_start) / 1000.0:.1f}s"
+    )
+    return True
+
+
+def _align_items_to_frame_time_ranges(
+    items: List[Dict[str, Any]],
+    *,
+    subtitle_content: str = "",
+    frame_analysis_path: str = "",
+    ost1_hard_max: float = 0,
+    skip_opening_item_id: int = 1,
+) -> List[Dict[str, Any]]:
+    """将所有片段 timestamp 对齐到抽帧 JSON 的 time_range（字幕对位剪辑范围）。"""
+    segments = _load_frame_segments(frame_analysis_path)
+    if not segments:
+        return items
+
+    entries = parse_srt(subtitle_content or "")
+    max_ost1_span_ms = int(max(3.0, ost1_hard_max or 22) * 1000) if ost1_hard_max else None
+    ordered = sorted(items, key=lambda item: int(item.get("_id") or 0))
+    previous_end_ms: int | None = None
+
+    for item in ordered:
+        item_id = int(item.get("_id") or 0)
+        if item_id == skip_opening_item_id and int(item.get("OST", 0)) == 1:
+            try:
+                _, previous_end_ms = parse_timestamp_range(str(item.get("timestamp") or ""))
+            except Exception:
+                previous_end_ms = None
+            continue
+
+        try:
+            start_ms, end_ms = parse_timestamp_range(str(item.get("timestamp") or ""))
+        except Exception:
+            continue
+
+        clip_range = _find_frame_clip_range_for_item(
+            item,
+            segments,
+            item_start_ms=start_ms,
+            item_end_ms=end_ms,
+        )
+        ost1_cap = max_ost1_span_ms if int(item.get("OST", 0)) == 1 else None
+        if _apply_clip_range_to_item(
+            item,
+            clip_range,
+            previous_end_ms=previous_end_ms,
+            ost1_hard_max_ms=ost1_cap,
+        ):
+            try:
+                _, previous_end_ms = parse_timestamp_range(str(item.get("timestamp") or ""))
+            except Exception:
+                pass
+            continue
+
+        if int(item.get("OST", 0)) != 1 or not entries:
+            try:
+                _, previous_end_ms = parse_timestamp_range(str(item.get("timestamp") or ""))
+            except Exception:
+                pass
+            continue
+
+        line_text = str(item.get("original_line") or item.get("narration") or "")
+        span = find_subtitle_span_for_line(
+            entries,
+            line_text,
+            near_start_ms=start_ms,
+            near_end_ms=end_ms,
+            max_span_ms=max_ost1_span_ms or 22_000,
+        )
+        if not span:
+            continue
+        cue_start, cue_end = span
+        if cue_end <= cue_start:
+            continue
+        fallback_range = f"{format_timestamp_ms(cue_start)}-{format_timestamp_ms(cue_end)}"
+        if _apply_clip_range_to_item(
+            item,
+            fallback_range,
+            previous_end_ms=previous_end_ms,
+            ost1_hard_max_ms=ost1_cap,
+        ):
+            item["_clip_aligned"] = "subtitle_fallback"
+            logger.info(f"片段 #{item.get('_id')} 原声未命中抽帧段，回退字幕整句对位")
+        try:
+            _, previous_end_ms = parse_timestamp_range(str(item.get("timestamp") or ""))
+        except Exception:
+            pass
+
+    return items
+
+
+def _strip_internal_clip_flags(items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    for item in items:
+        item.pop("_clip_aligned", None)
+    return items
+
+
+def _align_ost1_to_complete_subtitle_cues(
+    items: List[Dict[str, Any]],
+    subtitle_content: str,
+    ost1_hard_max: float,
+    *,
+    frame_analysis_path: str = "",
+) -> List[Dict[str, Any]]:
+    """兼容旧调用：统一走全片 time_range 对位。"""
+    return _align_items_to_frame_time_ranges(
+        items,
+        subtitle_content=subtitle_content,
+        frame_analysis_path=frame_analysis_path,
+        ost1_hard_max=ost1_hard_max,
+    )
+
+
 def _adjust_fazu2_ost1_timestamps(
     items: List[Dict[str, Any]],
     ost1_min: float,
+    ost1_max: float = 0,
 ) -> List[Dict[str, Any]]:
-    """金句原声段过短时延长 time戳，避免被误判后回退为 OST=0。"""
+    """金句原声段过短时延长 time戳；在允许范围内尽量接近 ost1_max。"""
     if not items or ost1_min <= 0:
         return items
     ordered = sorted(items, key=_item_sort_key)
@@ -209,26 +516,114 @@ def _adjust_fazu2_ost1_timestamps(
         start_ms, _ = parse_timestamp_range(str(item.get("timestamp") or ""))
         next_starts.append(start_ms)
     min_ms = int(ost1_min * 1000)
+    prefer_ms = int((ost1_max or ost1_min) * 1000)
     for index, item in enumerate(ordered):
         if int(item.get("OST", 0)) != 1:
             continue
+        if item.get("_clip_aligned"):
+            continue
         start_ms, end_ms = parse_timestamp_range(str(item.get("timestamp") or ""))
         current_ms = end_ms - start_ms
-        if current_ms >= min_ms:
-            continue
-        needed_end_ms = start_ms + min_ms
+        target_end_ms = start_ms + max(min_ms, prefer_ms)
         if index + 1 < len(next_starts):
-            needed_end_ms = min(needed_end_ms, next_starts[index + 1] - 50)
-        if needed_end_ms <= start_ms:
+            target_end_ms = min(target_end_ms, next_starts[index + 1] - 50)
+        if target_end_ms <= end_ms:
+            continue
+        if target_end_ms <= start_ms:
             continue
         item["timestamp"] = (
-            f"{_ms_to_timestamp(start_ms)}-{_ms_to_timestamp(needed_end_ms)}"
+            f"{_ms_to_timestamp(start_ms)}-{_ms_to_timestamp(target_end_ms)}"
         )
         logger.info(
-            f"片段 #{item.get('_id')} 原声 OST=1 时长 {current_ms / 1000.0:.1f}s 短于 {ost1_min:.1f}s，"
-            f"已延长至 {(needed_end_ms - start_ms) / 1000.0:.1f}s"
+            f"片段 #{item.get('_id')} 原声 OST=1 时长 {current_ms / 1000.0:.1f}s，"
+            f"已延长至 {(target_end_ms - start_ms) / 1000.0:.1f}s"
         )
     return ordered
+
+
+def _enforce_narration_after_ost1_by_id(
+    items: List[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    """按 _id 播放顺序：解说不打断原声，夹在两个 OST=1 之间的解说移到后续原声播完之后。"""
+    result = [
+        dict(item)
+        for item in sorted(items, key=lambda item: int(item.get("_id") or 0))
+    ]
+    moved_count = 0
+    changed = True
+    while changed:
+        changed = False
+        i = 0
+        while i < len(result) - 2:
+            if (
+                int(result[i].get("OST", 0)) == 1
+                and int(result[i + 1].get("OST", 0)) == 0
+                and int(result[i + 2].get("OST", 0)) == 1
+            ):
+                ost0 = result.pop(i + 1)
+                j = i + 1
+                while j < len(result) and int(result[j].get("OST", 0)) == 1:
+                    j += 1
+                result.insert(j, ost0)
+                moved_count += 1
+                changed = True
+                logger.info(
+                    f"解说片段 #{ost0.get('_id')} 从原声段之间移至后续原声播完之后"
+                )
+            else:
+                i += 1
+
+    for index, item in enumerate(result, 1):
+        item["_id"] = index
+
+    if moved_count:
+        logger.info(f"原声/解说顺序修正：移动 {moved_count} 段解说到原声结束之后")
+    return result
+
+
+def _enforce_fazu2_playback_gaps(items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """按 _id 播放顺序：后一段开始不得早于前一段结束（解说须等原声播完）。"""
+    if len(items) < 2:
+        return items
+    ordered = sorted(items, key=lambda item: int(item.get("_id") or 0))
+    for index in range(1, len(ordered)):
+        prev = ordered[index - 1]
+        curr = ordered[index]
+        try:
+            _, prev_end = parse_timestamp_range(str(prev.get("timestamp") or ""))
+            curr_start, curr_end = parse_timestamp_range(str(curr.get("timestamp") or ""))
+        except Exception:
+            continue
+        if curr_start >= prev_end:
+            continue
+        if curr.get("_clip_aligned"):
+            continue
+        gap_ms = 50
+        new_start = prev_end + gap_ms
+        duration_ms = max(500, curr_end - curr_start)
+        new_end = new_start + duration_ms
+        curr["timestamp"] = (
+            f"{_ms_to_timestamp(new_start)}-{_ms_to_timestamp(new_end)}"
+        )
+        logger.info(
+            f"片段 #{curr.get('_id')} 开始早于前段结束，已顺延至原声整句/片段播完后"
+        )
+    return ordered
+
+
+def _warn_fazu2_ost_interleave(items: List[Dict[str, Any]]) -> None:
+    """检查解说是否夹在两个原声之间（后处理会重排）。"""
+    ordered = sorted(items, key=lambda item: int(item.get("_id") or 0))
+    for index in range(1, len(ordered) - 1):
+        if (
+            int(ordered[index - 1].get("OST", 0)) == 1
+            and int(ordered[index].get("OST", 0)) == 0
+            and int(ordered[index + 1].get("OST", 0)) == 1
+        ):
+            logger.warning(
+                f"片段 #{ordered[index].get('_id')} 解说夹在两段原声之间，"
+                "将移至原声播完之后"
+            )
 
 
 def _break_consecutive_ost1(
@@ -350,7 +745,7 @@ def apply_compact_opening_closing_hooks(
     work_name: str = "",
     settings: Optional[Dict[str, Any]] = None,
 ) -> List[Dict[str, Any]]:
-    """逐帧精剪：为首尾 OST=0 解说段写入宝子们开场/结尾。"""
+    """逐帧精剪 V2：为第 2 段补「宝子们」开场，为末段补道别。"""
     if not items:
         return items
     cfg = get_documentary_compact_settings(settings)
@@ -359,15 +754,14 @@ def apply_compact_opening_closing_hooks(
     if not cfg.get("enable_opening_closing_hook", True):
         return items
 
-    opening = _format_compact_hook_template(
-        str(cfg.get("opening_hook_template") or "宝子们，我们开始《{work_name}》啦！"),
-        work_name,
-    )
+    transition_tpl = str(
+        cfg.get("transition_hook_template") or "故事，得从头讲起。"
+    ).strip()
     closing = _format_compact_hook_template(
         str(cfg.get("closing_hook_template") or "宝子们，我们下期再见！"),
         work_name,
     )
-    if not opening and not closing:
+    if not transition_tpl and not closing:
         return items
 
     updated = [dict(item) for item in items]
@@ -378,17 +772,19 @@ def apply_compact_opening_closing_hooks(
         return items
 
     first_idx = ost0_indices[0]
-    last_idx = ost0_indices[-1]
+    last_idx = len(updated) - 1
 
-    if opening:
+    if transition_tpl and first_idx == 1:
         existing = str(updated[first_idx].get("narration") or "").strip()
-        hook = opening.rstrip("。！!")
-        if not _opening_hook_already_applied(existing, hook):
-            if existing:
-                updated[first_idx]["narration"] = f"{hook}。{existing.lstrip('。')}"
+        if not existing.startswith("宝子们"):
+            body = existing
+            if body.startswith(transition_tpl.rstrip("。")):
+                updated[first_idx]["narration"] = f"宝子们，{body}"
             else:
-                updated[first_idx]["narration"] = hook
-            logger.info(f"已应用精剪开场白: {updated[first_idx]['narration'][:50]}...")
+                updated[first_idx]["narration"] = f"宝子们，{transition_tpl}{body}"
+            logger.info(
+                f"已应用精剪正叙开场: {updated[first_idx]['narration'][:50]}..."
+            )
 
     if closing:
         existing = str(updated[last_idx].get("narration") or "").strip()
@@ -406,6 +802,10 @@ def finalize_documentary_script_items(
     items: List[Dict[str, Any]],
     settings: Optional[Dict[str, Any]] = None,
     work_name: str = "",
+    subtitle_content: str = "",
+    *,
+    subtitle_frame_analysis: str = "",
+    frame_analysis_path: str = "",
 ) -> List[Dict[str, Any]]:
     """归一化 LLM 输出的逐帧解说脚本 OST 字段。"""
     if not items:
@@ -415,6 +815,18 @@ def finalize_documentary_script_items(
         cfg = get_documentary_compact_settings(settings)
     else:
         cfg = get_documentary_settings(settings)
+
+    if (subtitle_content or "").strip() and is_compact_documentary_settings(cfg):
+        items = apply_opening_climax_fix(
+            items,
+            subtitle_content=subtitle_content,
+            subtitle_frame_analysis=subtitle_frame_analysis,
+            append_custom_prompt=str(cfg.get("append_custom_prompt") or ""),
+            opening_hint=resolve_fazu2_opening_climax_hint(cfg),
+            frame_analysis_path=frame_analysis_path,
+            settings=cfg,
+            enabled=bool(cfg.get("enable_original_audio_highlights", True)),
+        )
     default_ost = int(cfg.get("default_narration_ost", 2))
     if default_ost not in (0, 2):
         default_ost = 2
@@ -488,15 +900,11 @@ def finalize_documentary_script_items(
             ost1_counter += 1
             existing_narration = str(item.get("narration") or "").strip()
             if fazu2_mode:
-                if _is_preservable_ost1_dialogue(existing_narration):
-                    item["narration"] = existing_narration
-                elif existing_narration:
-                    item["narration"] = existing_narration
-                else:
+                item = _normalize_fazu2_ost1_fields(item)
+                if not str(item.get("original_line") or "").strip():
                     logger.warning(
-                        f"片段 #{item['_id']} OST=1 缺少台词原文，请按模板填写 narration"
+                        f"片段 #{item['_id']} OST=1 缺少 original_line，请按 V2 模板补充"
                     )
-                    item["narration"] = f"播放原片{ost1_counter}"
             elif _is_preservable_ost1_dialogue(existing_narration):
                 item["narration"] = existing_narration
             else:
@@ -515,11 +923,25 @@ def finalize_documentary_script_items(
 
     if fazu2_mode:
         result = _normalize_fazu2_script_items(result, cfg)
-        result = _break_consecutive_ost1(result, default_ost)
+        _warn_fazu2_ost_interleave(result)
         for item in result:
             _warn_fazu2_forbidden_phrases(item)
-        result = _adjust_fazu2_ost1_timestamps(result, ost1_min)
+        result = _enforce_narration_after_ost1_by_id(result)
+
+    if is_compact_documentary_settings(cfg) and (
+        (frame_analysis_path or "").strip() or (subtitle_content or "").strip()
+    ):
+        result = _align_items_to_frame_time_ranges(
+            result,
+            subtitle_content=subtitle_content,
+            frame_analysis_path=frame_analysis_path,
+            ost1_hard_max=ost1_hard_max,
+        )
+
+    if fazu2_mode:
+        result = _adjust_fazu2_ost1_timestamps(result, ost1_min, ost1_max)
         result = _adjust_fazu2_ost0_timestamps(result)
+        result = _enforce_fazu2_playback_gaps(result)
         ost0_count = sum(1 for item in result if int(item.get("OST", 0)) == 0)
         ost0_min = int(cfg.get("ost0_segment_min", 30) or 30)
         if ost0_count < ost0_min:
@@ -554,4 +976,13 @@ def finalize_documentary_script_items(
             result, work_name=theme_name, settings=cfg
         )
 
-    return result
+    for item in result:
+        raw_ts = str(item.get("timestamp") or "").strip()
+        fixed_ts = normalize_script_timestamp_range(raw_ts)
+        if fixed_ts != raw_ts:
+            logger.info(
+                f"片段 #{item.get('_id')} timestamp 已规范: {raw_ts!r} -> {fixed_ts!r}"
+            )
+        item["timestamp"] = fixed_ts
+
+    return _strip_internal_clip_flags(result)

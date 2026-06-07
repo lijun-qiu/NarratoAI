@@ -36,9 +36,15 @@
     #   - OpenAI: gpt-4o, gpt-4o-mini
     #   - Qwen: qwen/qwen2.5-vl-32b-instruct
     #   - SiliconFlow: siliconflow/Qwen/Qwen2.5-VL-32B-Instruct
-    vision_openai_model_name = "Qwen/Qwen3.5-122B-A10B"
-    vision_openai_api_key = ""  # 填入对应 provider 的 API key
-    vision_openai_base_url = "https://api.siliconflow.cn/v1"  # 可选：自定义 API base URL（官方 OpenAI 可留空）
+    vision_openai_model_name = "gemini-3.1-flash-lite"
+    vision_openai_api_key = ""  # 备用网关 Key（Gemini 等非 Qwen 模型）
+    vision_openai_base_url = "https://api.4022543.xyz/v1"
+
+    # 双网关自动分流：Qwen → 百炼，Gemini/DeepSeek/GPT-4o → 备用网关
+    llm_dashscope_api_key = ""  # 阿里百炼 Key（Qwen 系列）
+    llm_dashscope_base_url = "https://dashscope.aliyuncs.com/compatible-mode/v1"
+    llm_alt_api_key = ""  # 4022 等备用网关 Key
+    llm_alt_base_url = "https://api.4022543.xyz/v1"
 
     # ===== 文本模型配置 =====
     text_llm_provider = "openai"
@@ -51,9 +57,9 @@
     #   - Qwen: qwen/qwen-plus, qwen/qwen-turbo
     #   - SiliconFlow: siliconflow/deepseek-ai/DeepSeek-R1
     #   - Moonshot: moonshot/moonshot-v1-8k
-    text_openai_model_name = "Pro/zai-org/GLM-5"
-    text_openai_api_key = ""  # 填入对应 provider 的 API key
-    text_openai_base_url = "https://api.siliconflow.cn/v1"  # 可选：自定义 API base URL（官方 OpenAI 可留空）
+    text_openai_model_name = "deepseek-v4-flash"
+    text_openai_api_key = ""  # 填入对应 provider 的 API key（阿里百炼 DashScope）
+    text_openai_base_url = "https://dashscope.aliyuncs.com/compatible-mode/v1"
 
     # ===== API Keys 参考 =====
     # 主流 LLM Providers API Key 获取地址：
@@ -226,6 +232,27 @@ enable_opening_closing_hook = true
 opening_hook_template = "宝子们，今天咱们一起追《{work_name}》。"
 closing_hook_template = "本集的核心冲突、留下的悬念和下一集的火药桶，就先帮大家梳理到这儿。宝子们，觉得讲清楚了点个赞，咱们下期再见。"
 
+[short_drama]
+# 短剧解说：解说与原声约 3:7；脚本生成 temperature 建议 0.3–0.5
+narration_percent = 30
+original_audio_percent = 70
+narration_script_temperature = 0.4
+ost1_duration_min = 8
+ost1_duration_max = 18
+max_consecutive_ost1 = 4
+ost0_segment_min = 8
+ost0_segment_max = 14
+ost1_segment_max = 24
+narration_chars_min = 40
+narration_chars_max = 120
+# 原声段 picture 旁白烧录（双引号包裹，28 号黑色）
+enable_picture_narration = true
+picture_narration_font_size = 28
+picture_narration_color = "#000000"
+picture_narration_max_chars = 16
+picture_narration_duration = 2.0
+picture_wrap_double_quotes = true
+
 [frames]
     # 提取关键帧的间隔时间（秒）
     frame_interval_input = 3
@@ -235,6 +262,9 @@ closing_hook_template = "本集的核心冲突、留下的悬念和下一集的�
 
     # 视觉批处理最大并发批次数（OpenAI 兼容 provider）
     vision_max_concurrency = 2
+
+    # 主视觉模型额度用尽时的备用模型链（逗号分隔，按顺序尝试）
+    vision_fallback_model_names = "qwen-vl-plus,qwen2.5-vl-72b-instruct"
 
 [documentary]
     # 逐帧解说：在爆燃/恐怖/尖叫等关键场面自动插入 OST=1 纯原声段
@@ -270,7 +300,8 @@ closing_hook_template = "本集的核心冲突、留下的悬念和下一集的�
     subtitle_refinement_max_length_ratio_delta = 0.4
     # 硬字幕 OCR 校准（裁剪关键帧底部，输出 *_ocr_refined.srt，优先于 *_refined.srt）
     enable_hard_subtitle_ocr = true
-    auto_subtitle_calibration_on_frame_analysis = true
+    # 抽帧/上传 JSON 后是否自动 OCR+LLM 校正（默认关，请在 WebUI 手动校准）
+    auto_subtitle_calibration_on_frame_analysis = false
     subtitle_ocr_crop_ratio = 0.22
     subtitle_ocr_batch_size = 10
     subtitle_ocr_max_concurrency = 2
@@ -292,7 +323,7 @@ closing_hook_template = "本集的核心冲突、留下的悬念和下一集的�
     narration_script_temperature = 0.4
 
 [documentary_compact]
-    # 逐帧精剪：故事讲述型（35–50 段，原声 5–10 段，解说 30–100 字/段）
+    # 逐帧精剪：罚罪2 V2 高潮前置版；须先有抽帧分析 + 字幕，再字幕×抽帧对照分析后生成 JSON
     documentary_compact_mode = true
     documentary_compact_style = "fazu2"
     default_narration_ost = 0
@@ -300,26 +331,31 @@ closing_hook_template = "本集的核心冲突、留下的悬念和下一集的�
     target_output_minutes = 12
     target_output_ratio = 0.3
     frame_interval_input = 3
-    min_total_segments = 35
-    max_total_segments = 50
-    ost0_segment_min = 30
+    min_total_segments = 30
+    max_total_segments = 55
+    ost0_segment_min = 15
+    original_audio_ratio = 0.5
     enable_picture_narration = false
     enable_humor_narration = false
     enable_logic_roast = false
     context_window_sec = 45
     narration_chars_min = 30
     narration_chars_max = 100
-    ost1_duration_min = 1
-    ost1_duration_max = 8
-    ost1_duration_hard_max = 10
-    min_ost1_segments = 5
-    max_ost1_segments = 10
-    ost1_every_n_segments = 10
+    ost1_duration_min = 8
+    ost1_duration_max = 18
+    ost1_duration_hard_max = 22
+    min_ost1_segments = 15
+    max_ost1_segments = 28
+    ost1_every_n_segments = 2
     # 全片核心主题（可选，留空则用 WebUI「视频主题」或由模型自拟，如「为谁而战」）
     fazu2_core_theme = ""
-    # 首尾招呼：{work_name} 替换为 WebUI「视频主题」；也可在 WebUI「开场白/结尾」中修改
+    # 第 1 段开头高潮默认：胡小跃楼顶跳楼 +「天就快亮了。」（追加提示词可覆盖）
+    fazu2_opening_climax_hint = "胡小跃楼顶跳楼牺牲名场面（夜色楼顶纵身跃下），原声金句优先「天就快亮了。」（时间戳从字幕原样复制）。禁止用中段抓捕/争吵（如「你跟我说这是狗贩子」）顶替第 1 段；此类放正叙 OST=1。"
+    # V2：第1段纯原声；第2段「宝子们」+转场句；结尾可在 WebUI 修改
     enable_opening_closing_hook = true
-    opening_hook_template = "宝子们，我们开始《{work_name}》啦！"
+    opening_hook_template = ""
+    # 仅第 1 集开头高潮末尾使用；第 2 集起由模型按当集名场面自拟转场
+    transition_hook_template = "故事，得从头讲起。"
     closing_hook_template = "宝子们，我们下期再见！"
     narration_chunk_max_items_per_call = 15
     narration_script_max_tokens = 16000
@@ -329,6 +365,11 @@ closing_hook_template = "本集的核心冲突、留下的悬念和下一集的�
     default_video_theme = "罚罪2"
     # 本集/本片专属要求，由 WebUI「追加提示词」编辑，叠加在自定义提示词之后
     append_custom_prompt = ""
+    require_subtitle_for_script = true
+    subtitle_analysis_max_frame_chars = 20000
+    subtitle_analysis_max_subtitle_chars = 12000
+    subtitle_analysis_min_chars = 500
+    subtitle_analysis_max_tokens = 4096
 
 ##########################################
 # 完美字幕（影视解说：解说 + 原声双轨）

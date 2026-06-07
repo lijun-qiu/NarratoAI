@@ -168,6 +168,11 @@
     "Film Title": "影视作品名称",
     "Generate Film TV Script": "生成影视解说脚本",
     "Video Type": "视频类型",
-    "Select/Upload Script": "选择/上传脚本"
+    "Select/Upload Script": "选择/上传脚本",
+    "Material Preprocess": "素材预处理",
+    "Subtitle Transcription": "字幕转录",
+    "Frame Analysis Tool": "抽帧分析",
+    "Subtitle Calibration": "校准字幕",
+    "Material Preprocess Mode": "素材预处理（请在上方 Tab 中操作）"
   }
 }

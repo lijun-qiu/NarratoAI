@@ -9,6 +9,7 @@ from app.services.documentary.documentary_narration_chunker import reduce_markdo
 from app.services.documentary.documentary_coverage_fill import fill_timeline_coverage_gaps
 from app.services.documentary.documentary_script_optimizer import finalize_documentary_script_items
 from app.services.documentary.documentary_settings import (
+    build_append_requirements_section,
     build_compact_coverage_instructions,
     build_coverage_instructions,
     build_effective_documentary_prompt,
@@ -19,6 +20,10 @@ from app.services.documentary.documentary_settings import (
     get_documentary_settings,
     is_compact_documentary_settings,
     is_fazu2_compact_settings,
+    resolve_append_custom_prompt,
+)
+from app.services.documentary.documentary_material_resolver import (
+    resolve_frame_analysis_path_for_documentary,
 )
 from app.services.documentary.documentary_subtitle_enrichment import (
     analyze_subtitle_with_frames,
@@ -47,13 +52,15 @@ class DocumentaryFrameAnalysisService(DocumentaryFrameExtractionService):
         documentary_settings: dict | None = None,
         subtitle_content: str = "",
         analysis_json_path: str | None = None,
+        material_source_video_path: str = "",
         reuse_frame_analysis: bool = True,
     ) -> list[dict]:
         progress = progress_callback or (lambda _p, _m: None)
         doc_settings = documentary_settings or get_documentary_settings()
 
-        resolved_analysis_path = self.resolve_reusable_analysis_path(
+        resolved_analysis_path = resolve_frame_analysis_path_for_documentary(
             video_path,
+            material_source_video_path=material_source_video_path,
             explicit_path=analysis_json_path,
             reuse=reuse_frame_analysis,
         )
@@ -61,34 +68,80 @@ class DocumentaryFrameAnalysisService(DocumentaryFrameExtractionService):
             progress(70, "复用已有抽帧分析，跳过视觉模型...")
             logger.info(f"复用抽帧分析: {resolved_analysis_path}")
             analysis_json_path = resolved_analysis_path
+            source = (material_source_video_path or "").strip()
+            if source and source != (video_path or "").strip():
+                logger.info(
+                    f"成片视频与素材来源不同，抽帧分析来自: {source}"
+                )
         else:
             raise ValueError(
                 "未找到可用的抽帧分析 JSON。请先在「抽帧分析」中点击「抽帧并分析」，"
                 "或上传/复用已有分析文件后再生成脚本。"
+                "若成片为无字幕版本，请在 WebUI 指定「抽帧/字幕来源视频」。"
             )
 
         progress(78, "正在整理抽帧结果...")
+        analysis_markdown = self._prepare_frame_markdown(
+            analysis_json_path,
+            documentary_settings=doc_settings,
+            force_compact=True,
+        )
         markdown_output = self._prepare_frame_markdown(
             analysis_json_path,
             documentary_settings=doc_settings,
         )
+        if not (markdown_output or "").strip():
+            raise ValueError(
+                "抽帧分析结果为空。请重新执行「抽帧并分析」，确保视觉模型正常输出。"
+            )
         source_duration_sec = self._get_video_duration_sec(video_path)
+
+        if (
+            is_fazu2_compact_settings(doc_settings)
+            and doc_settings.get("require_subtitle_for_script", True)
+            and not (subtitle_content or "").strip()
+        ):
+            raise ValueError(
+                "逐帧精剪生成脚本需要字幕文件。请先上传/转录 SRT，"
+                "建议使用 OCR 校准后的 *_ocr_refined.srt 或 *_refined.srt。"
+            )
 
         subtitle_analysis = ""
         if (
             doc_settings.get("enable_subtitle_enrichment", True)
             and (subtitle_content or "").strip()
         ):
-            progress(79, "正在分析字幕并对照抽帧...")
+            progress(79, "正在充分分析字幕并对照抽帧（脚本蓝图）...")
+            append_for_analysis = resolve_append_custom_prompt(
+                append_custom_prompt, doc_settings
+            )
+            if append_for_analysis:
+                logger.info("追加提示词已置于字幕×抽帧蓝图 prompt 首位")
             subtitle_analysis = analyze_subtitle_with_frames(
                 subtitle_content=subtitle_content,
-                frame_markdown=markdown_output,
+                frame_markdown=analysis_markdown,
                 video_theme=video_theme,
+                append_custom_prompt=append_custom_prompt,
                 progress_callback=lambda msg: progress(79, msg),
                 documentary_settings=doc_settings,
             )
+            min_analysis_chars = max(
+                200,
+                int(doc_settings.get("subtitle_analysis_min_chars", 500) or 500),
+            )
+            if (
+                is_fazu2_compact_settings(doc_settings)
+                and doc_settings.get("require_subtitle_for_script", True)
+                and len(subtitle_analysis.strip()) < min_analysis_chars
+            ):
+                raise ValueError(
+                    f"字幕×抽帧对照分析过短（{len(subtitle_analysis.strip())} 字），"
+                    f"至少需要 {min_analysis_chars} 字。"
+                    "请确认已「确认使用」完整 SRT（非空文件），并检查文本模型 API；"
+                    "若字幕/抽帧摘要输入过短，请重新上传素材后重试。"
+                )
 
-        progress(80, "正在生成解说文案...")
+        progress(80, "正在依据分析结果生成 JSON 脚本...")
         text_provider = config.app.get("text_llm_provider", "openai").lower()
         text_api_key = config.app.get(f"text_{text_provider}_api_key")
         text_model = config.app.get(f"text_{text_provider}_model_name")
@@ -114,7 +167,12 @@ class DocumentaryFrameAnalysisService(DocumentaryFrameExtractionService):
             progress_callback=progress,
         )
         final_script = finalize_documentary_script_items(
-            narration_items, doc_settings, work_name=video_theme
+            narration_items,
+            doc_settings,
+            work_name=video_theme,
+            subtitle_content=subtitle_content,
+            subtitle_frame_analysis=subtitle_analysis,
+            frame_analysis_path=analysis_json_path,
         )
         progress(100, "脚本生成完成")
         return final_script
@@ -317,7 +375,7 @@ class DocumentaryFrameAnalysisService(DocumentaryFrameExtractionService):
             snippet = raw_text[:800].replace("\n", "\\n")
             logger.error(f"解说 JSON 解析失败，模型返回开头: {snippet}")
             raise ValueError(
-                "解说文案格式错误，无法解析 JSON 或缺少 items 字段。"
+                "解说文案格式错误，无法解析 JSON 数组或 items 字段。"
                 f"请检查文本模型是否支持 JSON 输出。返回开头: {raw_text[:200]!r}"
             )
 
@@ -354,8 +412,8 @@ class DocumentaryFrameAnalysisService(DocumentaryFrameExtractionService):
                 current_input = (
                     current_input
                     + "\n\n## 重试要求\n"
-                    "上次输出无法解析。请严格只输出 JSON 对象，格式为 "
-                    '{"items":[{"_id":1,"timestamp":"...","picture":"...","narration":"...","OST":0}]}，'
+                    "上次输出无法解析。请严格只输出 JSON 数组，"
+                    'OST=1: {"narration":"播放原片","original_line":"「台词」","OST":1}；'
                     "不要任何其他文字。"
                 )
                 current_raw = generate_narration(
@@ -423,14 +481,14 @@ class DocumentaryFrameAnalysisService(DocumentaryFrameExtractionService):
                 if ost1_count < min_ost1:
                     ost1_fix = (
                         f"上次仅 {ost1_count} 段 OST=1，无效。"
-                        f"必须从字幕中挑选 **{min_ost1}–{max_ost1} 段** 金句标为 OST=1，"
-                        f"`narration` 只写该句台词（引号），前后用 OST=0 铺垫。"
+                        f"须 **{min_ost1}–{max_ost1} 段** OST=1（约 50%）；"
+                        f"每段原声 **8–18 秒**，须覆盖字幕整句；说完/播完再接 OST=0 解说，禁止半句截断。"
                     )
                 else:
                     ost1_fix = (
                         f"上次有 {ost1_count} 段 OST=1，超过上限 {max_ost1}。"
-                        f"请保留最精彩的 **{min_ost1}–{max_ost1} 段** 金句为 OST=1，"
-                        f"其余对白写入 OST=0 解说正文。"
+                        f"请保留 **{min_ost1}–{max_ost1} 段** 原声，其余改为 OST=0 解说；"
+                        f"禁止解说夹在两个原声之间，须等原声播完再接解说。"
                     )
                 current_input = (
                     narration_input
@@ -503,7 +561,20 @@ class DocumentaryFrameAnalysisService(DocumentaryFrameExtractionService):
         coverage_override: str = "",
     ) -> str:
         cfg = documentary_settings or get_documentary_settings()
-        sections = [f"## 抽帧画面分析\n{markdown_output.rstrip()}"]
+        sections: list[str] = []
+        append_block = build_append_requirements_section(append_custom_prompt, cfg).strip()
+        if append_block:
+            logger.info("追加提示词已置于脚本生成 prompt 首位")
+            sections.append(append_block)
+
+        if is_fazu2_compact_settings(cfg):
+            from app.services.documentary.documentary_settings import (
+                build_compact_pre_script_workflow_instructions,
+            )
+
+            workflow = build_compact_pre_script_workflow_instructions(cfg).strip()
+            if workflow:
+                sections.append(workflow)
 
         subtitle_sections = build_subtitle_narration_sections(
             subtitle_content=subtitle_content,
@@ -512,16 +583,20 @@ class DocumentaryFrameAnalysisService(DocumentaryFrameExtractionService):
         )
         sections.extend(subtitle_sections)
 
+        sections.append(
+            "## 抽帧画面分析（画面参考 · 截取时间对齐参考；timestamp 仍以字幕为准）\n"
+            f"{markdown_output.rstrip()}"
+        )
+
         context_lines: list[str] = []
         if (video_theme or "").strip():
             context_lines.append(f"视频主题：{video_theme.strip()}")
         merged_prompt = build_effective_documentary_prompt(
             custom_prompt,
-            append_custom_prompt,
-            cfg,
+            settings=cfg,
         )
         if merged_prompt:
-            context_lines.append(f"补充创作要求：{merged_prompt}")
+            context_lines.append(f"补充创作要求（规则模板）：{merged_prompt}")
         if context_lines:
             context_block = "\n".join(f"- {line}" for line in context_lines)
             sections.append(f"## 创作上下文\n{context_block}")
@@ -553,14 +628,31 @@ class DocumentaryFrameAnalysisService(DocumentaryFrameExtractionService):
 
         final_lines = [
             "## 最终输出要求",
-            "只输出合法 JSON（含 `items` 数组），不要 markdown 代码块、不要解释文字。",
+            "只输出合法 JSON 数组 `[...]`，不要 markdown 代码块、不要解释文字、不要输出策划蓝图。",
             "每个 item 必须包含 `_id`、`timestamp`、`picture`、`narration`、`OST`。",
         ]
         if is_fazu2_compact_settings(cfg):
+            from app.services.documentary.documentary_settings import (
+                resolve_fazu2_opening_climax_hint,
+            )
+
+            opening_default = resolve_fazu2_opening_climax_hint(cfg)
+            opening_hint = (
+                f"第 1 段 OST=1 纯原声（跳楼 sacrifice，{opening_default}）；"
+                "第 2 段以「宝子们」开头转场正叙；性别/职级须与抽帧画面对照，勿写错；"
+            )
+            if append_block:
+                opening_hint = (
+                    "第 1 段 OST=1 必须落实「本集追加要求」指定的开头高潮，"
+                    "纯原声（narration=播放原片+original_line），禁止旁白；"
+                )
             final_lines.append(
-                "故事讲述型精剪：严格仿照「输出 JSON 参考模板」与「故事讲述型脚本规则」；"
-                "narration/picture 必须用具体人名，禁止警员1/说话人1；"
-                "OST=0 讲故事并嵌入对白（30–100 字/段）；OST=1 仅 3–6 个金句原声（每段 3–10 秒，narration 只写台词原文）。"
+                "你必须已阅读「原始字幕」「字幕×抽帧 对照分析」「抽帧画面分析」后再写 JSON；"
+                "以字幕为主：timestamp、narration、original_line、人名均取自字幕；"
+                "抽帧仅用于 picture 与截取时间对齐参考。"
+                f"罚罪2 V2：仿照参考模板；{opening_hint}"
+                "对照分析中的 OST=1 清单须全部落实；人名用胡小跃/秦枫/伟业/罗博等；"
+                "picture 环境描写须与抽帧一致，但不得覆盖字幕剧情。"
             )
         sections.append("\n".join(final_lines))
 

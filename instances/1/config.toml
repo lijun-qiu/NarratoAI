@@ -13,8 +13,13 @@ text_llm_provider = "openai"
 text_openai_model_name = "deepseek-v4-flash"
 text_openai_api_key = "sk-hp3uSiaWUqTf00aUJVREZ8PNz9cC8Ql2HGSoF7k3c817sZVd"
 text_openai_base_url = "https://api.4022543.xyz/v1"
+llm_dashscope_api_key = "sk-6a206a58793046b1bd1fe3ba40668f59"
+llm_dashscope_base_url = "https://dashscope.aliyuncs.com/compatible-mode/v1"
+llm_alt_api_key = "sk-hp3uSiaWUqTf00aUJVREZ8PNz9cC8Ql2HGSoF7k3c817sZVd"
+llm_alt_base_url = "https://api.4022543.xyz/v1"
 hide_config = true
-video_clip_json_path = "C:\\my\\NarratoAI\\resource\\scripts\\2026-0605-151220.json"
+video_clip_json_path = "D:\\我的\\视频剪辑\\NarratoAI\\resource\\scripts\\2026-0607-231519.json"
+llm_qwen_use_alt_gateway = false
 
 [azure]
 speech_key = ""
@@ -89,6 +94,7 @@ enabled = false
 frame_interval_input = 3
 vision_batch_size = 10
 vision_max_concurrency = 2
+vision_fallback_model_names = "qwen-vl-max,qwen-vl-plus,qwen2.5-vl-72b-instruct"
 
 [documentary]
 narration_compact_markdown_chars = 400000
@@ -107,7 +113,7 @@ enable_subtitle_refinement = true
 subtitle_refinement_max_entries_per_call = 25
 subtitle_refinement_temperature = 0.3
 enable_hard_subtitle_ocr = true
-auto_subtitle_calibration_on_frame_analysis = true
+auto_subtitle_calibration_on_frame_analysis = false
 subtitle_ocr_crop_ratio = 0.22
 subtitle_ocr_batch_size = 10
 subtitle_ocr_max_concurrency = 2
@@ -131,16 +137,20 @@ enable_humor_narration = false
 enable_logic_roast = false
 narration_chars_min = 30
 narration_chars_max = 100
-ost1_duration_min = 1
-ost1_duration_max = 8
-ost1_duration_hard_max = 10
+ost1_duration_min = 8
+ost1_duration_max = 18
+ost1_duration_hard_max = 22
 min_ost1_segments = 5
-max_ost1_segments = 10
+max_ost1_segments = 20
 ost1_every_n_segments = 10
 fazu2_core_theme = ""
 narration_chunk_max_items_per_call = 15
 narration_script_max_tokens = 16000
 narration_script_temperature = 0.4
+subtitle_analysis_max_frame_chars = 20000
+subtitle_analysis_max_subtitle_chars = 12000
+subtitle_analysis_min_chars = 500
+subtitle_analysis_max_tokens = 4096
 
 [gemini_asr]
 api_key = "sk-hp3uSiaWUqTf00aUJVREZ8PNz9cC8Ql2HGSoF7k3c817sZVd"

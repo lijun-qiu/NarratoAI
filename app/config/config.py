@@ -97,6 +97,7 @@ def save_config():
         _cfg["transcription"] = transcription
         _cfg["perfect_subtitle"] = perfect_subtitle
         _cfg["video_output"] = video_output
+        _cfg["frames"] = frames
         f.write(toml.dumps(_cfg))
 
 

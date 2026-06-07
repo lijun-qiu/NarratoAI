@@ -303,10 +303,11 @@ class DocumentaryFrameAnalysisServiceScriptGenerationTests(unittest.IsolatedAsyn
             service,
             "_build_video_clip_json",
             return_value=[],
-        ), patch(
-            "app.services.documentary.frame_extraction_service.create_vision_analyzer",
-            return_value=object(),
-        ) as mocked_create_analyzer:
+        ), patch.object(
+            service,
+            "_build_vision_model_rotation",
+            return_value=type("RotationStub", (), {"models_used": set()})(),
+        ) as mocked_build_rotation:
             await service.analyze_video(
                 video_path="/tmp/demo.mp4",
                 vision_api_key="explicit-key",
@@ -314,11 +315,11 @@ class DocumentaryFrameAnalysisServiceScriptGenerationTests(unittest.IsolatedAsyn
                 vision_base_url="",
             )
 
-        called_kwargs = mocked_create_analyzer.call_args.kwargs
+        called_kwargs = mocked_build_rotation.call_args.kwargs
         self.assertEqual("openai", called_kwargs["provider"])
         self.assertEqual("explicit-key", called_kwargs["api_key"])
-        self.assertEqual("explicit-model", called_kwargs["model"])
         self.assertEqual("", called_kwargs["base_url"])
+        self.assertEqual("explicit-model", called_kwargs["model_names"][0])
 
 
 if __name__ == "__main__":

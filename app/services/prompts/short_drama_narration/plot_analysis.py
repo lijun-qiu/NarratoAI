@@ -24,7 +24,7 @@ class PlotAnalysisPrompt(TextPrompt):
             model_type=ModelType.TEXT,
             output_format=OutputFormat.TEXT,
             tags=["短剧", "剧情分析", "字幕解析", "分段分析"],
-            parameters=["subtitle_content"]
+            parameters=["subtitle_content", "frame_summary"]
         )
         super().__init__(metadata)
         
@@ -35,7 +35,7 @@ class PlotAnalysisPrompt(TextPrompt):
 你是一位专业的剧本分析师和剧情概括助手。
 
 # 任务
-我将为你提供一部短剧的完整字幕文本。请你基于这些字幕，完成以下任务：
+我将为你提供一部短剧的完整字幕文本，以及可选的抽帧画面观察。请你基于这些素材，完成以下任务：
 1.  **整体剧情分析**：简要概括整个短剧的核心剧情脉络、主要冲突和结局（如果有的话）。
 2.  **分段剧情解析与时间戳定位**：
     *   将整个短剧划分为若干个关键的剧情段落（例如：开端、发展、转折、高潮、结局，或根据具体情节自然划分）。
@@ -82,9 +82,21 @@ class PlotAnalysisPrompt(TextPrompt):
 *   剧情段落的划分应合乎逻辑，能够反映剧情的起承转合。
 *   语言表达应简洁、准确、客观。
 
+# 字幕 × 画面 分析原则（有抽帧观察时须遵守）
+- 台词内容、时间戳 → **以字幕为准**
+- 人物表情、肢体动作、场景氛围、镜头张力 → **以抽帧观察补充或修正**
+- 标注「字幕与画面可形成反差/双关」的时刻（适合保留原声或重点解说）
+- 原声保留建议须**同时**考虑台词力度与画面张力
+
 # 限制
 1. 严禁输出与分析结果无关的内容
 2. 时间戳必须严格按照字幕中的实际时间
+3. 严禁虚构字幕或画面中不存在的情节
+
+# 抽帧画面观察（约每 3 秒一帧，请与字幕交叉验证）
+<frame_summary>
+${frame_summary}
+</frame_summary>
 
 # 请处理以下字幕：
 ${subtitle_content}"""

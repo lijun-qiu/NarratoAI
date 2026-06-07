@@ -38,6 +38,8 @@ def normalize_video_path(video_path: str) -> str:
 def is_valid_analysis_artifact(payload: Any) -> bool:
     if not isinstance(payload, dict):
         return False
+    if payload.get("scene_segments"):
+        return True
     if payload.get("batches"):
         return True
     if payload.get("frame_observations"):
@@ -91,12 +93,17 @@ def resolve_reusable_analysis_path(
     explicit_path: str | None = None,
     reuse: bool = True,
 ) -> str | None:
+    if explicit_path and os.path.isfile(explicit_path):
+        try:
+            load_analysis_artifact(explicit_path)
+            return explicit_path
+        except (OSError, ValueError, json.JSONDecodeError):
+            pass
+
     if not reuse:
         return None
 
     candidates: list[str] = []
-    if explicit_path and os.path.isfile(explicit_path):
-        candidates.append(explicit_path)
 
     default_path = default_analysis_path_for_video(video_path)
     if default_path not in candidates and os.path.isfile(default_path):

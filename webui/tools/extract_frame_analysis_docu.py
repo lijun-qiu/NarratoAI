@@ -19,14 +19,9 @@ from app.services.documentary.frame_analysis_pairing import (
 )
 from app.services.documentary.frame_extraction_service import DocumentaryFrameExtractionService
 from app.services.documentary.subtitle_calibration_pipeline import (
-    calibrate_subtitles_after_frame_analysis,
     requires_subtitle_before_frame_analysis,
 )
 from app.services.subtitle_video_pairing import find_paired_subtitle_path, load_subtitle_content, resolve_subtitle_path_for_video
-from webui.tools.subtitle_calibration_session import (
-    apply_subtitle_calibration_to_session,
-    format_subtitle_calibration_summary,
-)
 
 
 def _normalize_progress_value(progress: float | int) -> int:
@@ -62,8 +57,11 @@ def extract_frame_analysis_docu(params, *, compact: bool = False):
         else:
             status_text.text(f"📊 进度: {normalized_progress}%")
 
+    analysis_path = ""
+    keyframe_count = 0
+    part_paths: list[str] = []
+
     try:
-        calibration_summary = ""
         with st.spinner("正在抽帧并分析..."):
             if not params.video_origin_path:
                 st.error("请先选择视频文件")
@@ -104,8 +102,7 @@ def extract_frame_analysis_docu(params, *, compact: bool = False):
             )
             if requires_subtitle_before_frame_analysis(doc_settings) and not subtitle_path:
                 st.error(
-                    "请先在上方完成字幕转写或上传，再执行抽帧并分析。"
-                    "抽帧完成后将自动 OCR + LLM 校正字幕。"
+                    "请先在「素材预处理 → 字幕转录」中完成转写或上传，再执行抽帧并分析。"
                 )
                 return
 
@@ -145,37 +142,31 @@ def extract_frame_analysis_docu(params, *, compact: bool = False):
 
             analysis_path = result["analysis_json_path"]
             st.session_state["frame_analysis_json_path"] = analysis_path
+            st.session_state["doc_frame_analysis_upload_explicit"] = False
+            st.session_state["doc_frame_analysis_file_processed"] = True
             st.session_state["_frame_analysis_synced_video_path"] = params.video_origin_path
             keyframe_count = len(result.get("keyframe_files") or [])
             logger.info(f"抽帧分析完成: {analysis_path}，共 {keyframe_count} 帧")
 
-            calibration_summary = ""
-            if subtitle_path and os.path.isfile(subtitle_path):
-                update_progress(78, "抽帧完成，正在自动校准字幕...")
-
-                def on_calibration_progress(message: str):
-                    update_progress(88, message)
-
-                calibration = calibrate_subtitles_after_frame_analysis(
-                    analysis_json_path=analysis_path,
-                    video_path=params.video_origin_path,
-                    subtitle_path=subtitle_path,
-                    video_theme=st.session_state.get("video_theme", ""),
-                    documentary_settings=doc_settings,
-                    progress_callback=on_calibration_progress,
-                    allow_vision_ocr_fallback=False,
-                )
-                apply_subtitle_calibration_to_session(calibration)
-                calibration_summary = format_subtitle_calibration_summary(calibration)
+            split_parts = int(st.session_state.get("doc_output_split_parts") or 1)
+            split_result = DocumentaryFrameExtractionService.save_split_analysis_artifacts(
+                analysis_path,
+                split_parts,
+                artifact=result.get("analysis_artifact"),
+            )
+            part_paths = split_result.get("part_paths") or []
 
         time.sleep(0.1)
         progress_bar.progress(100)
         status_text.text("🎉 抽帧分析完成！")
-        st.success(
+        success_msg = (
             f"✅ 抽帧分析已保存: `{os.path.basename(analysis_path)}`（{keyframe_count} 帧）"
         )
-        if calibration_summary:
-            st.info(calibration_summary)
+        if part_paths:
+            success_msg += f"\n\n另存 **{len(part_paths)}** 份切割文件："
+            success_msg += "\n".join(f"- `{os.path.basename(path)}`" for path in part_paths)
+            success_msg += "\n\n当前仍使用完整 JSON。"
+        st.success(success_msg)
 
     except Exception as err:
         st.error(f"❌ 抽帧分析失败: {str(err)}")

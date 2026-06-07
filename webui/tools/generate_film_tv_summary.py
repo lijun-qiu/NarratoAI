@@ -15,6 +15,7 @@ import streamlit as st
 from loguru import logger
 
 from app.config import config
+from app.config.llm_gateway_router import resolve_role_credentials
 from app.services.SDE.short_drama_explanation import analyze_subtitle, generate_narration_script, research_film_work
 from app.services.film_tv_settings import get_film_tv_settings, get_film_tv_script_prompt_params
 from app.services.subtitle_text import read_subtitle_text
@@ -142,10 +143,8 @@ def generate_script_film_tv_summary(params, subtitle_path, video_theme, temperat
                 st.error("字幕文件不存在，请先上传或通过 Fun-ASR 转写字幕")
                 return
 
-            text_provider = config.app.get("text_llm_provider", "gemini").lower()
-            text_api_key = config.app.get(f"text_{text_provider}_api_key")
-            text_model = config.app.get(f"text_{text_provider}_model_name")
-            text_base_url = config.app.get(f"text_{text_provider}_base_url")
+            text_provider = config.app.get("text_llm_provider", "openai").lower()
+            text_model, text_api_key, text_base_url = resolve_role_credentials("text")
 
             subtitle_content = read_subtitle_text(subtitle_path).text
             if not subtitle_content:

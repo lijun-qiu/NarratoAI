@@ -36,6 +36,12 @@ def _ms_to_hhmmss(ms: int) -> str:
 
 
 def _sorted_batches(artifact: dict[str, Any]) -> list[dict[str, Any]]:
+    from app.services.documentary.frame_analysis_compact import rebuild_batches_from_artifact
+
+    rebuilt = rebuild_batches_from_artifact(artifact)
+    if rebuilt:
+        return rebuilt
+
     batches = artifact.get("batches")
     if not isinstance(batches, list):
         return []
@@ -64,6 +70,21 @@ def _build_batch_frame_context(batch: dict[str, Any]) -> str:
         lines.append(f"片段摘要：{summary}")
 
     observations = batch.get("frame_observations") or batch.get("observations") or []
+    batch_segments = batch.get("scene_segments") or []
+    if batch_segments:
+        lines.append("场景片段（结构化）：")
+        for segment in batch_segments[:12]:
+            if not isinstance(segment, dict):
+                continue
+            timestamp = str(segment.get("timestamp") or "").strip()
+            scene = str(segment.get("scene") or "").strip()
+            action = str(segment.get("action") or "").strip()
+            key_visual = str(segment.get("key_visual") or "").strip()
+            importance = str(segment.get("importance") or "").strip()
+            summary_parts = [part for part in (scene, action, key_visual, importance) if part]
+            if timestamp or summary_parts:
+                lines.append(f"- {timestamp}: {' | '.join(summary_parts)}")
+
     if observations:
         burned_lines: list[str] = []
         observation_lines: list[str] = []

@@ -12,18 +12,31 @@ from app.models.schema import VideoClipParams
 from app.services.subtitle_text import decode_subtitle_bytes
 from app.services.subtitle_video_pairing import (
     find_paired_subtitle_path,
-    get_transcription_subtitle_path,
     load_subtitle_content,
-    resolve_transcription_media_path,
 )
 from app.utils import utils, check_script
 from webui.tools.generate_script_docu import generate_script_docu
 from webui.tools.generate_script_short import generate_script_short
 from webui.tools.generate_short_summary import generate_script_short_sunmmary
 from webui.tools.generate_film_tv_summary import generate_script_film_tv_summary
-from webui.components.frame_analysis_settings import render_frame_analysis_panel
+from webui.components.documentary_material_pickers import render_documentary_material_pickers
+from webui.components.documentary_preprocess_panel import render_documentary_preprocess_panel
+from webui.components.frame_analysis_settings import (
+    render_documentary_frame_analysis_file_picker,
+    sync_frame_analysis_with_video,
+)
+from webui.components.subtitle_transcription_settings import (
+    render_documentary_subtitle_file_picker,
+    render_fun_asr_transcription,
+)
+from webui.utils.documentary_file_picker import consume_pending_reuse_frame_analysis
 from webui.utils.script_stats import render_script_ost_summary
-from app.services.documentary.documentary_settings import get_documentary_compact_settings, compute_ost1_segment_bounds
+from app.services.documentary.documentary_settings import (
+    get_documentary_compact_settings,
+    get_documentary_settings,
+    compute_ost1_segment_bounds,
+)
+from app.services.short_drama_settings import get_short_drama_settings
 from app.services.film_tv_settings import (
     FILM_TV_DEFAULTS,
     get_film_tv_settings,
@@ -68,6 +81,9 @@ def render_script_panel(tr):
         elif script_path == "film_tv":
             # 影视解说
             film_tv_narration(tr)
+        elif script_path == "preprocess":
+            # 素材预处理（字幕转录 / 抽帧分析 / 校准字幕）
+            render_documentary_preprocess_panel(tr, params)
         else:
             # 默认为空
             pass
@@ -85,6 +101,7 @@ def render_script_file(tr, params):
     MODE_SHORT = "short"
     MODE_SUMMARY = "summary"
     MODE_FILM_TV = "film_tv"
+    MODE_PREPROCESS = "preprocess"
 
     # 处理保存脚本后的模式切换（必须在 widget 实例化之前）
     if st.session_state.get('_switch_to_file_mode'):
@@ -95,6 +112,7 @@ def render_script_file(tr, params):
     mode_options = {
         tr("Compact Frame Narration"): MODE_AUTO_COMPACT,
         tr("Auto Generate"): MODE_AUTO,
+        tr("Material Preprocess"): MODE_PREPROCESS,
         tr("Film TV Narration"): MODE_FILM_TV,
         tr("Short Generate"): MODE_SHORT,
         tr("Short Drama Summary"): MODE_SUMMARY,
@@ -118,6 +136,8 @@ def render_script_file(tr, params):
         default_index = mode_keys.index(tr("Short Drama Summary"))
     elif current_path == "film_tv":
         default_index = mode_keys.index(tr("Film TV Narration"))
+    elif current_path == "preprocess":
+        default_index = mode_keys.index(tr("Material Preprocess"))
     elif not current_path:
         default_index = mode_keys.index(tr("Compact Frame Narration"))
     else:
@@ -198,7 +218,7 @@ def render_script_file(tr, params):
         # 找到保存的脚本文件在列表中的索引
         # 如果当前path是特殊值(auto/short/summary)，则重置为空
         saved_script_path = current_path if current_path not in [
-            MODE_AUTO, MODE_AUTO_COMPACT, MODE_SHORT, MODE_SUMMARY, MODE_FILM_TV
+            MODE_AUTO, MODE_AUTO_COMPACT, MODE_SHORT, MODE_SUMMARY, MODE_FILM_TV, MODE_PREPROCESS
         ] else ""
         
         selected_index = 0
@@ -276,17 +296,36 @@ def render_script_file(tr, params):
 
 
 def _sync_subtitle_with_video(video_path: str) -> None:
-    """所选视频变更时，自动关联同名/已转录字幕。"""
+    """所选视频变更时，自动关联字幕（含素材来源视频回退）。"""
+    from app.services.documentary.documentary_material_resolver import (
+        resolve_subtitle_path_for_documentary,
+    )
+
     video_path = (video_path or "").strip()
     if not video_path or not os.path.isfile(video_path):
         return
 
     last_video = st.session_state.get("_subtitle_synced_video_path")
-    if last_video == video_path and st.session_state.get("subtitle_path"):
+    material_source = (st.session_state.get("doc_material_source_video_path") or "").strip()
+    explicit = (st.session_state.get("subtitle_path") or "").strip()
+
+    if last_video == video_path and explicit and os.path.isfile(explicit):
         return
 
+    if explicit and os.path.isfile(explicit) and os.path.getsize(explicit) > 0:
+        content = load_subtitle_content(explicit).strip()
+        if content:
+            st.session_state["_subtitle_synced_video_path"] = video_path
+            st.session_state["subtitle_content"] = content
+            st.session_state["subtitle_file_processed"] = True
+            return
+
     st.session_state["_subtitle_synced_video_path"] = video_path
-    paired = find_paired_subtitle_path(video_path)
+    paired = resolve_subtitle_path_for_documentary(
+        video_path,
+        material_source_video_path=material_source,
+        explicit_path=explicit or None,
+    )
     if paired:
         content = load_subtitle_content(paired)
         if content.strip():
@@ -295,27 +334,35 @@ def _sync_subtitle_with_video(video_path: str) -> None:
             st.session_state["subtitle_file_processed"] = True
             return
 
-    if last_video and last_video != video_path:
+    if last_video and last_video != video_path and not st.session_state.get("doc_subtitle_file_processed"):
+        st.session_state.pop("doc_subtitle_path_input", None)
+        st.session_state.pop("doc_subtitle_saved_pick", None)
+    if (
+        last_video
+        and last_video != video_path
+        and not material_source
+        and not st.session_state.get("doc_subtitle_file_processed")
+    ):
         st.session_state["subtitle_path"] = None
         st.session_state["subtitle_content"] = None
         st.session_state["subtitle_file_processed"] = False
 
 
 def _resolve_active_subtitle_path() -> str:
-    """当前生效的字幕路径（session 或视频配对字幕）。"""
-    subtitle_path = (st.session_state.get("subtitle_path") or "").strip()
-    if subtitle_path and os.path.isfile(subtitle_path):
-        return subtitle_path
+    """当前生效的字幕路径（session、成片或素材来源视频配对）。"""
+    from app.services.documentary.documentary_material_resolver import (
+        resolve_subtitle_path_for_documentary,
+    )
+
     video_path = (st.session_state.get("video_origin_path") or "").strip()
     if video_path:
         _sync_subtitle_with_video(video_path)
-        subtitle_path = (st.session_state.get("subtitle_path") or "").strip()
-        if subtitle_path:
-            return subtitle_path
-        paired = find_paired_subtitle_path(video_path)
-        if paired:
-            return paired
-    return ""
+    material_source = (st.session_state.get("doc_material_source_video_path") or "").strip()
+    return resolve_subtitle_path_for_documentary(
+        video_path,
+        material_source_video_path=material_source,
+        explicit_path=st.session_state.get("subtitle_path"),
+    )
 
 
 def render_video_file(tr, params):
@@ -407,6 +454,7 @@ def _apply_compact_hook_session_overrides(doc_settings: dict) -> dict:
     for key in (
         "enable_opening_closing_hook",
         "opening_hook_template",
+        "transition_hook_template",
         "closing_hook_template",
         "append_custom_prompt",
     ):
@@ -441,27 +489,28 @@ def render_video_details(tr, params, *, compact: bool = False):
             st.session_state[prompt_key] = get_compact_custom_prompt_display(doc_settings)
         default_prompt = st.session_state[prompt_key]
         st.caption(
-            "默认「逐帧精剪」：下方为完整规则（可改）；首尾招呼按模板自动生成。"
+            "默认「逐帧精剪」：在下方选用或导入字幕与抽帧分析 JSON（也可在「素材预处理」完成）"
+            "→ 生成脚本时自动做字幕×抽帧对照分析 → 再按罚罪2 V2 规则生成 JSON。"
             "视频主题填剧名集数（如《罚罪2》第1集）。"
         )
-        with st.expander("开场白 / 结尾（可配置）", expanded=False):
+        with st.expander("转场句 / 结尾（可配置）", expanded=False):
             enable_hook = st.checkbox(
-                "启用固定开场白与结尾",
+                "启用固定结尾道别",
                 value=bool(doc_settings.get("enable_opening_closing_hook", True)),
                 key="doc_compact_enable_opening_closing_hook",
-                help="关闭后不在首尾段自动插入模板；规则区也会标注为已关闭",
+                help="关闭后不在末段自动插入道别模板；开头高潮由模型按规则生成",
             )
-            opening_tpl = st.text_input(
-                "开场白模板（{work_name} 替换为视频主题）",
+            transition_tpl = st.text_input(
+                "转场句模板（第 2 段「宝子们」之后）",
                 value=str(
-                    doc_settings.get("opening_hook_template")
-                    or "宝子们，我们开始《{work_name}》啦！"
+                    doc_settings.get("transition_hook_template")
+                    or "故事，得从头讲起。"
                 ),
-                key="doc_compact_opening_hook_template",
-                disabled=not enable_hook,
+                key="doc_compact_transition_hook_template",
+                help="第 2 段 OST=0 以「宝子们」开头后接此句，再进入正叙。",
             )
             closing_tpl = st.text_input(
-                "结尾模板",
+                "结尾道别模板",
                 value=str(
                     doc_settings.get("closing_hook_template") or "宝子们，我们下期再见！"
                 ),
@@ -469,7 +518,8 @@ def render_video_details(tr, params, *, compact: bool = False):
                 disabled=not enable_hook,
             )
             st.session_state["enable_opening_closing_hook"] = enable_hook
-            st.session_state["opening_hook_template"] = opening_tpl.strip()
+            st.session_state["transition_hook_template"] = transition_tpl.strip()
+            st.session_state["opening_hook_template"] = ""
             st.session_state["closing_hook_template"] = closing_tpl.strip()
             save_cols = st.columns([1, 3])
             with save_cols[0]:
@@ -482,7 +532,7 @@ def render_video_details(tr, params, *, compact: bool = False):
                     else:
                         st.error("保存失败，请查看日志")
         prompt_height = 260
-        prompt_help = "故事讲述型完整规则，修改后参与脚本生成"
+        prompt_help = "罚罪2 V2 完整规则，修改后参与脚本生成"
     else:
         default_prompt = str(doc_settings.get("default_custom_prompt") or "")
         if prompt_key not in st.session_state:
@@ -490,8 +540,13 @@ def render_video_details(tr, params, *, compact: bool = False):
         prompt_height = 120
         prompt_help = tr("Custom prompt for LLM, leave empty to use default prompt")
 
-    render_documentary_subtitle_options(tr, doc_settings, params=params, compact=compact)
-    render_frame_analysis_panel(tr, params, compact=compact)
+    render_documentary_subtitle_options(tr, doc_settings, compact=compact)
+    _render_documentary_material_status(tr)
+    render_documentary_material_pickers(
+        tr,
+        expanded=compact,
+        key_prefix="doc_compact" if compact else "doc_full",
+    )
 
     _ensure_doc_video_theme_default(doc_settings, compact=compact)
     theme_key = "doc_video_theme_compact" if compact else "doc_video_theme_full"
@@ -520,8 +575,8 @@ def render_video_details(tr, params, *, compact: bool = False):
     append_prompt = st.text_area(
         "追加提示词",
         help=(
-            "叠加在上方自定义提示词之后，仅参与脚本生成（不参与抽帧视觉分析）。"
-            "适合写本集固定要求，如必讲情节、人物关系、留白段落等。"
+            "置于脚本生成 prompt **首位**（最高优先级），不参与抽帧视觉分析。"
+            "适合写本集固定要求，如开头高潮名场面、必讲情节等。"
         ),
         height=72,
         key=append_key,
@@ -532,140 +587,132 @@ def render_video_details(tr, params, *, compact: bool = False):
     return video_theme, custom_prompt
 
 
-def render_documentary_subtitle_options(tr, doc_settings, *, params=None, compact: bool = False):
-    """逐帧解说 / 精剪：可选字幕与抽帧结合。"""
-    default_enabled = bool(doc_settings.get("enable_subtitle_enrichment", True))
-    st.checkbox(
-        "结合字幕分析（有 SRT 时与抽帧交叉验证）",
-        value=st.session_state.get("doc_enable_subtitle_enrichment", default_enabled),
-        key="doc_enable_subtitle_enrichment",
-        help="上传/转录字幕后，抽帧分析会对照对白；并生成字幕×画面对照分析再写脚本",
+def _render_documentary_material_status(tr) -> None:
+    """逐帧解说/精剪：展示字幕与抽帧分析就绪状态，引导至素材预处理。"""
+    from app.services.documentary.documentary_material_resolver import (
+        resolve_frame_analysis_path_for_documentary,
+        resolve_subtitle_path_for_documentary,
     )
-    if not st.session_state.get("doc_enable_subtitle_enrichment", default_enabled):
-        return
-
-    st.caption("请先完成字幕转写/上传，再执行下方「抽帧并分析」，以便一次完成硬字幕校准与脚本生成。")
-
-    render_fun_asr_transcription(tr)
-
-    if "doc_subtitle_file_processed" not in st.session_state:
-        st.session_state["doc_subtitle_file_processed"] = False
-
-    subtitle_file = st.file_uploader(
-        tr("上传字幕文件"),
-        type=["srt"],
-        accept_multiple_files=False,
-        key="docu_subtitle_uploader",
-    )
-
-    if st.session_state.get("subtitle_path"):
-        st.info(f"已关联字幕: {os.path.basename(st.session_state['subtitle_path'])}")
-        if st.button(tr("清除已上传字幕"), key="doc_clear_subtitle"):
-            st.session_state["subtitle_path"] = None
-            st.session_state["subtitle_content"] = None
-            st.session_state["doc_subtitle_file_processed"] = False
-            st.rerun()
-
-    if subtitle_file is not None and not st.session_state.get("doc_subtitle_file_processed"):
-        try:
-            safe_filename = os.path.basename(subtitle_file.name)
-            decoded = decode_subtitle_bytes(subtitle_file.getvalue())
-            script_content = decoded.text
-            if not script_content:
-                st.error(tr("无法读取字幕文件，请检查文件编码（支持 UTF-8、UTF-16、GBK、GB2312）"))
-                st.stop()
-
-            script_dir = utils.script_dir()
-            os.makedirs(script_dir, exist_ok=True)
-            script_file_path = os.path.join(script_dir, safe_filename)
-            if os.path.exists(script_file_path):
-                timestamp = time.strftime("%Y%m%d%H%M%S")
-                name, ext = os.path.splitext(safe_filename)
-                script_file_path = os.path.join(script_dir, f"{name}_{timestamp}{ext}")
-
-            with open(script_file_path, "w", encoding="utf-8") as f:
-                f.write(script_content)
-
-            st.session_state["subtitle_path"] = script_file_path
-            st.session_state["subtitle_content"] = script_content
-            st.session_state["doc_subtitle_file_processed"] = True
-            st.success(f"字幕已保存: {safe_filename}")
-            st.rerun()
-        except Exception as e:
-            st.error(f"{tr('Upload failed')}: {str(e)}")
-
-    if doc_settings.get("enable_subtitle_refinement", True):
-        _render_subtitle_refinement_panel(tr, params=params, compact=compact)
-
-
-def _render_subtitle_refinement_panel(tr, *, params=None, compact: bool = False):
-    """对照抽帧分析校正 ASR 字幕（产出 *_refined.srt / *_ocr_refined.srt）。"""
-    from app.services.documentary.documentary_settings import get_documentary_compact_settings, get_documentary_settings
-    from app.services.documentary.frame_analysis_pairing import find_paired_frame_analysis_path
-    from app.services.documentary.hard_subtitle_ocr_service import get_ocr_refined_subtitle_path
-    from app.services.documentary.subtitle_refinement_service import get_refined_subtitle_path
-    from webui.tools.ocr_calibrate_subtitle_docu import ocr_calibrate_subtitle_docu
-    from webui.tools.refine_subtitle_docu import refine_subtitle_docu
 
     video_path = (st.session_state.get("video_origin_path") or "").strip()
     if not video_path:
         return
 
-    doc_settings = get_documentary_compact_settings() if compact else get_documentary_settings()
+    material_source = (st.session_state.get("doc_material_source_video_path") or "").strip()
+    subtitle_path = resolve_subtitle_path_for_documentary(
+        video_path,
+        material_source_video_path=material_source,
+        explicit_path=st.session_state.get("subtitle_path"),
+    )
+    analysis_path = resolve_frame_analysis_path_for_documentary(
+        video_path,
+        material_source_video_path=material_source,
+        explicit_path=st.session_state.get("frame_analysis_json_path"),
+        reuse=True,
+    )
 
-    with st.expander("对照抽帧校正字幕（手动重跑）", expanded=False):
-        st.caption(
-            "抽帧/上传分析 JSON 时会**自动**完成硬字幕 OCR + LLM 校正（与抽帧同一次视觉调用，不重复计费）。"
-            "此处按钮仅用于手动重跑。优先使用 `*_ocr_refined.srt` / `*_refined.srt`。"
-        )
-
-        ocr_path = get_ocr_refined_subtitle_path(video_path)
-        refined_path = get_refined_subtitle_path(video_path)
-        if ocr_path and os.path.isfile(ocr_path):
-            st.success(f"已有 OCR 校准字幕: **{os.path.basename(ocr_path)}**")
-        elif refined_path and os.path.isfile(refined_path):
-            st.success(f"已有 LLM 校正字幕: **{os.path.basename(refined_path)}**")
+    cols = st.columns(2)
+    with cols[0]:
+        if subtitle_path and os.path.isfile(subtitle_path):
+            st.success(f"字幕: {os.path.basename(subtitle_path)}")
         else:
-            st.caption("尚未生成校正字幕")
-
-        analysis_path = (st.session_state.get("frame_analysis_json_path") or "").strip()
-        if not analysis_path or not os.path.isfile(analysis_path):
-            analysis_path = find_paired_frame_analysis_path(video_path) or ""
-        if analysis_path:
-            st.caption(f"将对照: `{os.path.basename(analysis_path)}`")
+            st.warning("字幕: 未就绪")
+    with cols[1]:
+        if analysis_path and os.path.isfile(analysis_path):
+            st.success(f"抽帧分析: {os.path.basename(analysis_path)}")
         else:
-            st.warning("请先完成抽帧分析，再校正字幕")
+            st.warning("抽帧分析: 未就绪")
 
-        subtitle_ready = bool(
-            (st.session_state.get("subtitle_path") or find_paired_subtitle_path(video_path))
-        )
-        can_refine = bool(analysis_path and subtitle_ready and params is not None)
+    st.caption(
+        f"可在下方从默认目录选用字幕与抽帧分析；转录、抽帧、校准也可在「{tr('Material Preprocess')}」中完成。"
+    )
 
-        if doc_settings.get("enable_hard_subtitle_ocr", True):
-            st.caption(
-                "手动重跑 OCR：旧版 JSON 无 burned_in_subtitle 时会二次调用视觉模型裁剪 OCR。"
-            )
-            if st.button(
-                "手动重跑硬字幕 OCR",
-                key="doc_ocr_calibrate_subtitle_btn",
-                use_container_width=True,
-                disabled=not can_refine,
-            ):
-                ocr_calibrate_subtitle_docu(params, compact=compact)
 
-        if doc_settings.get("enable_subtitle_refinement", True):
-            if st.button(
-                "手动重跑 LLM 校正",
-                key="doc_refine_subtitle_btn",
-                use_container_width=True,
-                disabled=not can_refine,
-            ):
-                refine_subtitle_docu(params, compact=compact)
+def render_documentary_subtitle_options(tr, doc_settings, *, compact: bool = False):
+    """逐帧解说 / 精剪：字幕分析开关（素材准备在预处理模式中完成）。"""
+    default_enabled = bool(doc_settings.get("enable_subtitle_enrichment", True))
+    st.checkbox(
+        "结合字幕分析（有 SRT 时与抽帧交叉验证）",
+        value=st.session_state.get("doc_enable_subtitle_enrichment", default_enabled),
+        key="doc_enable_subtitle_enrichment",
+        help="上传/转录字幕后，生成脚本时会对照抽帧画面；并做字幕×画面对照分析",
+    )
+
+
+def _render_short_drama_frame_analysis_block(tr) -> None:
+    """短剧解说：抽帧分析 JSON 选用/导入（独立于折叠面板，始终可见）。"""
+    from app.services.documentary.documentary_material_resolver import (
+        resolve_frame_analysis_path_for_documentary,
+    )
+
+    consume_pending_reuse_frame_analysis()
+    video_path = (st.session_state.get("video_origin_path") or "").strip()
+    if video_path:
+        sync_frame_analysis_with_video(video_path)
+
+    material_source = (st.session_state.get("doc_material_source_video_path") or "").strip()
+    explicit_path = (st.session_state.get("frame_analysis_json_path") or "").strip() or None
+    resolved_path = resolve_frame_analysis_path_for_documentary(
+        video_path,
+        material_source_video_path=material_source,
+        explicit_path=explicit_path,
+        reuse=True,
+    )
+
+    st.markdown("**抽帧分析 JSON**")
+    if resolved_path and os.path.isfile(resolved_path):
+        source = "已确认选用" if explicit_path else "自动配对"
+        st.success(f"{source}: `{os.path.basename(resolved_path)}`")
+    elif explicit_path:
+        st.warning(f"抽帧分析路径无效或文件不存在: `{explicit_path}`")
+    else:
+        st.info("请从下方列表选用、填写完整路径，或导入 JSON 文件后点「确认使用」。")
+
+    render_documentary_frame_analysis_file_picker(
+        tr,
+        video_path,
+        path_input_key="sd_summary_frame_analysis_path_input",
+        pick_key="sd_summary_frame_analysis_saved_pick",
+        confirm_button_key="sd_summary_confirm_frame_analysis_path",
+        clear_button_key="sd_summary_clear_frame_analysis",
+        import_key="sd_summary_frame_analysis_uploader",
+    )
 
 
 def short_drama_summary(tr):
-    """短剧解说 渲染视频主题和提示词"""
-    return render_subtitle_narration_panel(tr, work_name_label="短剧名称", uploader_key="subtitle_file_uploader")
+    """短剧解说 渲染视频主题和提示词（支持抽帧分析，工作流参照逐帧精剪）"""
+    st.caption(
+        "推荐流程：完成字幕转录与抽帧分析 → 下方选用抽帧 JSON 与字幕 → "
+        "生成时自动做字幕×抽帧对照分析 → 再按短剧解说规则输出 JSON 脚本。"
+    )
+    _render_short_drama_frame_analysis_block(tr)
+    st.divider()
+    _render_documentary_material_status(tr)
+    with st.expander("字幕（从默认目录选择）", expanded=False):
+        render_documentary_subtitle_file_picker(
+            tr,
+            path_input_key="sd_summary_subtitle_path_input",
+            pick_key="sd_summary_subtitle_saved_pick",
+            confirm_button_key="sd_summary_confirm_subtitle_path",
+            clear_button_key="sd_summary_clear_subtitle",
+            import_key="sd_summary_subtitle_uploader",
+        )
+    doc_settings = get_documentary_settings()
+    default_enabled = bool(doc_settings.get("enable_subtitle_enrichment", True))
+    st.checkbox(
+        "结合抽帧分析（有 JSON 时与字幕交叉验证，参照逐帧精剪）",
+        value=st.session_state.get("sd_enable_frame_analysis", default_enabled),
+        key="sd_enable_frame_analysis",
+        help="勾选后须先确认选用抽帧分析 JSON；取消勾选则仅用字幕生成（兼容旧流程）",
+    )
+    return render_subtitle_narration_panel(
+        tr,
+        work_name_label="短剧名称",
+        uploader_key="subtitle_file_uploader",
+        temperature_default=float(
+            get_short_drama_settings().get("narration_script_temperature", 0.4)
+        ),
+    )
 
 
 def film_tv_narration(tr):
@@ -996,13 +1043,15 @@ def render_subtitle_narration_panel(
     *,
     show_work_name: bool = True,
     show_temperature: bool = True,
+    temperature_default: float = 0.7,
 ):
     """字幕解说类模式共用面板（短剧解说 / 影视解说）"""
     # 检查是否已经处理过字幕文件
     if 'subtitle_file_processed' not in st.session_state:
         st.session_state['subtitle_file_processed'] = False
 
-    render_fun_asr_transcription(tr)
+    with st.expander("字幕转录（三种方式 + 自动回退）", expanded=False):
+        render_fun_asr_transcription(tr)
     
     subtitle_file = st.file_uploader(
         tr("上传字幕文件"),
@@ -1074,191 +1123,14 @@ def render_subtitle_narration_panel(
         video_theme = st.text_input(tr(work_name_label))
         st.session_state['video_theme'] = video_theme
     if show_temperature:
-        temperature = st.slider("temperature", 0.0, 2.0, 0.7)
+        temperature = st.slider(
+            "temperature",
+            0.0,
+            2.0,
+            float(st.session_state.get("temperature", temperature_default)),
+        )
         st.session_state['temperature'] = temperature
     return video_theme
-
-
-def render_fun_asr_transcription(tr):
-    """音视频字幕转录：Fun-ASR / Whisper API / Gemini 兼容 API，失败自动切换。"""
-    def clear_subtitle_state():
-        st.session_state['subtitle_path'] = None
-        st.session_state['subtitle_content'] = None
-        st.session_state['subtitle_file_processed'] = False
-
-    def _apply_subtitle_result(generated_path: str, provider_label: str):
-        if not generated_path or not os.path.exists(generated_path):
-            clear_subtitle_state()
-            st.error(f"{provider_label} 转写失败：未生成字幕文件")
-            return False
-        with open(generated_path, "r", encoding="utf-8") as f:
-            subtitle_content = f.read()
-        st.session_state['subtitle_path'] = generated_path
-        st.session_state['subtitle_content'] = subtitle_content
-        st.session_state['subtitle_file_processed'] = True
-        st.success(f"字幕转写成功（{provider_label}）: {os.path.basename(generated_path)}")
-        return True
-
-    with st.expander("字幕转录（三种方式 + 自动回退）", expanded=False):
-        st.caption(
-            "上传本地音频/视频生成 SRT。大文件会自动提取并压缩音频后再转写。"
-            "若使用 api.4022543.xyz 等 LLM 网关，Whisper/Gemini 转写可能不可用，请优先选 Fun-ASR。"
-        )
-
-        from app.services.media_transcription import (
-            PROVIDER_FUN_ASR,
-            PROVIDER_GEMINI,
-            PROVIDER_WHISPER,
-            PROVIDER_LABELS,
-        )
-
-        col1, col2 = st.columns(2)
-        with col1:
-            fun_key = st.text_input(
-                "阿里百炼 API Key（Fun-ASR）",
-                value=config.fun_asr.get("api_key", ""),
-                type="password",
-                key="fun_asr_api_key",
-            )
-        with col2:
-            whisper_key = st.text_input(
-                "Whisper / 网关 API Key",
-                value=config.whisper_asr.get("api_key", ""),
-                type="password",
-                key="whisper_asr_api_key",
-            )
-
-        gemini_key = st.text_input(
-            "Gemini 兼容 API Key",
-            value=config.gemini_asr.get("api_key", "") if hasattr(config, "gemini_asr") else "",
-            type="password",
-            key="gemini_asr_api_key",
-        )
-
-        enable_fallback = st.checkbox(
-            "失败时自动尝试其他转录方式",
-            value=config.transcription.get("enable_fallback", True) if hasattr(config, "transcription") else True,
-            key="transcription_enable_fallback",
-        )
-
-        video_origin_path = (st.session_state.get("video_origin_path") or "").strip()
-        use_selected_video = st.checkbox(
-            "未单独上传时，默认使用上方已选视频转写",
-            value=st.session_state.get("transcription_use_selected_video", True),
-            key="transcription_use_selected_video",
-        )
-        if use_selected_video and video_origin_path and os.path.isfile(video_origin_path):
-            st.caption(
-                f"默认转录: {os.path.basename(video_origin_path)} → "
-                f"{os.path.basename(get_transcription_subtitle_path(video_origin_path))}"
-            )
-        elif use_selected_video:
-            st.warning("请先在上方选择或上传视频文件（也可在下方单独上传转录）")
-
-        uploaded_media = st.file_uploader(
-            tr("上传需要转录的音频/视频（可选，上传后将优先于默认视频）"),
-            type=[
-                "aac", "amr", "avi", "flac", "flv", "m4a", "mkv", "mov",
-                "mp3", "mp4", "mpeg", "ogg", "opus", "wav", "webm", "wma", "wmv",
-            ],
-            accept_multiple_files=False,
-            key="media_transcription_uploader",
-        )
-        if uploaded_media is not None:
-            st.info(f"将优先转录上传文件: {uploaded_media.name}")
-
-        provider_choice = st.radio(
-            "转录方式",
-            options=["auto", PROVIDER_FUN_ASR, PROVIDER_WHISPER, PROVIDER_GEMINI],
-            format_func=lambda x: {
-                "auto": "自动（按顺序尝试已配置的 API）",
-                PROVIDER_FUN_ASR: PROVIDER_LABELS[PROVIDER_FUN_ASR],
-                PROVIDER_WHISPER: PROVIDER_LABELS[PROVIDER_WHISPER],
-                PROVIDER_GEMINI: PROVIDER_LABELS[PROVIDER_GEMINI],
-            }.get(x, x),
-            horizontal=True,
-            key="transcription_provider_choice",
-        )
-
-        st.markdown(
-            "API Key 说明：Fun-ASR → "
-            "[阿里百炼](https://bailian.console.aliyun.com/?tab=model#/api-key)；"
-            "Whisper / Gemini → OpenAI 兼容网关（如 api.openai.com 或自建代理）"
-        )
-
-        if st.button("转写生成字幕", key="media_transcribe_btn", use_container_width=True):
-            uploaded_temp_path = ""
-            if uploaded_media is not None:
-                temp_dir = utils.temp_dir("transcription")
-                safe_filename = os.path.basename(uploaded_media.name)
-                uploaded_temp_path = os.path.join(temp_dir, safe_filename)
-                file_name, file_extension = os.path.splitext(safe_filename)
-                if os.path.exists(uploaded_temp_path):
-                    timestamp = time.strftime("%Y%m%d%H%M%S")
-                    uploaded_temp_path = os.path.join(
-                        temp_dir, f"{file_name}_{timestamp}{file_extension}"
-                    )
-                with open(uploaded_temp_path, "wb") as f:
-                    f.write(uploaded_media.getbuffer())
-
-            media_path = resolve_transcription_media_path(
-                video_origin_path,
-                uploaded_temp_path,
-                prefer_video=use_selected_video,
-                uploaded_first=True,
-            )
-            if not media_path:
-                clear_subtitle_state()
-                st.error("请先上传转录文件，或在上方选择视频并勾选默认使用视频转写")
-                return
-
-            if provider_choice == PROVIDER_FUN_ASR and not fun_key.strip():
-                st.error("请先填写 Fun-ASR API Key")
-                return
-            if provider_choice == PROVIDER_WHISPER and not whisper_key.strip():
-                st.error("请先填写 Whisper API Key")
-                return
-            if provider_choice == PROVIDER_GEMINI and not gemini_key.strip():
-                st.error("请先填写 Gemini API Key")
-                return
-            if provider_choice == "auto" and not any([
-                fun_key.strip(), whisper_key.strip(), gemini_key.strip()
-            ]):
-                st.error("请至少填写一种转录 API Key")
-                return
-
-            try:
-                clear_subtitle_state()
-                from app.services import media_transcription
-
-                if fun_key.strip():
-                    config.fun_asr["api_key"] = fun_key.strip()
-                if whisper_key.strip():
-                    config.whisper_asr["api_key"] = whisper_key.strip()
-                if gemini_key.strip():
-                    config.gemini_asr["api_key"] = gemini_key.strip()
-                if hasattr(config, "transcription"):
-                    config.transcription["enable_fallback"] = enable_fallback
-                config.save_config()
-
-                subtitle_path = get_transcription_subtitle_path(media_path)
-                os.makedirs(os.path.dirname(subtitle_path) or utils.subtitle_dir(), exist_ok=True)
-
-                with st.spinner("正在转写字幕，失败时将自动切换其他方式..."):
-                    generated_path, used_provider = media_transcription.transcribe_media_to_srt(
-                        media_path,
-                        subtitle_path,
-                        provider=provider_choice,
-                        enable_fallback=enable_fallback,
-                    )
-
-                label = PROVIDER_LABELS.get(used_provider, used_provider)
-                if _apply_subtitle_result(generated_path, label):
-                    st.session_state["_subtitle_synced_video_path"] = video_origin_path or media_path
-            except Exception as e:
-                clear_subtitle_state()
-                logger.error(f"字幕转写失败: {traceback.format_exc()}")
-                st.error(f"字幕转写失败（已尝试所有可用方式）: {str(e)}")
 
 
 def render_script_buttons(tr, params):
@@ -1277,12 +1149,19 @@ def render_script_buttons(tr, params):
         button_name = tr("生成短剧解说脚本")
     elif script_path == "film_tv":
         button_name = tr("Generate Film TV Script")
+    elif script_path == "preprocess":
+        button_name = tr("Material Preprocess Mode")
     elif script_path.endswith("json"):
         button_name = tr("Load Video Script")
     else:
         button_name = tr("Please Select Script File")
 
-    if st.button(button_name, key="script_action", disabled=not script_path):
+    is_preprocess = script_path == "preprocess"
+    if st.button(
+        button_name,
+        key="script_action",
+        disabled=not script_path or is_preprocess,
+    ):
         if script_path == "auto":
             # 执行纪录片视频脚本生成（视频无字幕无配音）
             generate_script_docu(params)
@@ -1309,6 +1188,9 @@ def render_script_buttons(tr, params):
             )
         else:
             load_script(tr, script_path)
+
+    if is_preprocess:
+        return
 
     # 视频脚本编辑区
     script_items = st.session_state.get("video_clip_json") or []
@@ -1348,11 +1230,40 @@ def load_script(tr, script_path):
         st.error(f"{tr('Failed to load script')}: {str(e)}")
 
 
+def _normalize_script_timestamp_fields(script_content: str) -> tuple[str, bool]:
+    """保存前规范 timestamp 为 HH:MM:SS,mmm-HH:MM:SS,mmm。"""
+    from app.services.srt_utils import normalize_script_timestamp_range
+
+    payload = json.loads(script_content)
+    if not isinstance(payload, list):
+        return script_content, False
+    changed = False
+    for item in payload:
+        if not isinstance(item, dict):
+            continue
+        raw_ts = str(item.get("timestamp") or "").strip()
+        fixed_ts = normalize_script_timestamp_range(raw_ts)
+        if fixed_ts != raw_ts:
+            item["timestamp"] = fixed_ts
+            changed = True
+    if not changed:
+        return script_content, False
+    return json.dumps(payload, ensure_ascii=False, indent=2), True
+
+
 def save_script_with_validation(tr, video_clip_json_details):
     """保存视频脚本（包含格式验证）"""
     if not video_clip_json_details:
         st.error(tr("请输入视频脚本"))
         st.stop()
+
+    normalized_content, timestamps_fixed = _normalize_script_timestamp_fields(
+        video_clip_json_details
+    )
+    if timestamps_fixed:
+        st.session_state["video_clip_json"] = json.loads(normalized_content)
+        video_clip_json_details = normalized_content
+        st.info("已自动规范部分 timestamp 格式，正在重新验证…")
 
     # 第一步：格式验证
     with st.spinner("正在验证脚本格式..."):

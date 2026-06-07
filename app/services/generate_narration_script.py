@@ -67,6 +67,46 @@ def parse_frame_analysis_to_markdown(json_file_path, *, detail_level: str = "ful
 
         compact = (detail_level or "full").lower() == "compact"
 
+        def format_scene_segment(segment: dict, index: int) -> str:
+            timestamp = segment.get("timestamp", "")
+            scene = segment.get("scene", "")
+            characters = segment.get("characters") or []
+            if isinstance(characters, list):
+                characters_text = "、".join(str(name) for name in characters if str(name).strip())
+            else:
+                characters_text = str(characters)
+            lines = [f"## 场景 {index}", f"- 时间：{timestamp}"]
+            if scene:
+                lines.append(f"- 场景：{scene}")
+            if characters_text:
+                lines.append(f"- 人物：{characters_text}")
+            observation = str(segment.get("observation") or "").strip()
+            if observation:
+                lines.append(f"- 观察：{observation}")
+            for label, key in (
+                ("动作", "action"),
+                ("情绪", "emotion"),
+                ("关键视觉", "key_visual"),
+                ("音效/原声", "audio_cue"),
+                ("重要度", "importance"),
+                ("字幕", "subtitle"),
+            ):
+                value = str(segment.get(key) or "").strip()
+                if value:
+                    lines.append(f"- {label}：{value}")
+            entries = segment.get("subtitle_entries")
+            if isinstance(entries, list) and entries:
+                lines.append("- 字幕明细：")
+                for entry in entries:
+                    if not isinstance(entry, dict):
+                        continue
+                    start = str(entry.get("start") or "").strip()
+                    end = str(entry.get("end") or "").strip()
+                    text = str(entry.get("text") or "").strip()
+                    if start and end and text:
+                        lines.append(f"  - [{start}-{end}] {text}")
+            return "\n".join(lines) + "\n\n"
+
         def format_sample_frames(observations: list) -> str:
             if not observations:
                 return ""
@@ -78,16 +118,45 @@ def parse_frame_analysis_to_markdown(json_file_path, *, detail_level: str = "ful
             for frame in selected:
                 timestamp = frame.get("timestamp", "")
                 observation = frame.get("observation", "")
-                lines += f"  - {timestamp}: {observation}\n" if observation else f"  - {timestamp}: \n"
+                subtitle = str(frame.get("subtitle") or "").strip()
+                subtitle_start = str(frame.get("subtitle_start") or "").strip()
+                subtitle_end = str(frame.get("subtitle_end") or "").strip()
+                subtitle_time = ""
+                if subtitle_start and subtitle_end:
+                    subtitle_time = f"[{subtitle_start}-{subtitle_end}] "
+                elif subtitle_start:
+                    subtitle_time = f"[{subtitle_start}] "
+                if observation and subtitle:
+                    lines += f"  - {timestamp}: {observation}｜字幕：{subtitle_time}{subtitle}\n"
+                elif observation:
+                    lines += f"  - {timestamp}: {observation}\n"
+                elif subtitle:
+                    lines += f"  - {timestamp}: 字幕：{subtitle}\n"
+                else:
+                    lines += f"  - {timestamp}: \n"
             return lines
 
         markdown = ""
+
+        top_level_segments = data.get("scene_segments")
+        if isinstance(top_level_segments, list) and top_level_segments:
+            for index, segment in enumerate(top_level_segments, 1):
+                if isinstance(segment, dict):
+                    markdown += format_scene_segment(segment, index)
+            return markdown
 
         # 新结构：按批次保存完整分析产物
         if isinstance(data.get("batches"), list):
             ordered_batches = sorted(data.get("batches", []), key=batch_sort_key)
 
             for i, batch in enumerate(ordered_batches, 1):
+                batch_segments = batch.get("scene_segments") or []
+                if batch_segments:
+                    for segment in batch_segments:
+                        if isinstance(segment, dict):
+                            markdown += format_scene_segment(segment, i)
+                    continue
+
                 time_range = batch.get("time_range", "")
                 summary = (
                     batch.get("overall_activity_summary")
@@ -108,7 +177,22 @@ def parse_frame_analysis_to_markdown(json_file_path, *, detail_level: str = "ful
                     for frame in observations:
                         timestamp = frame.get("timestamp", "")
                         observation = frame.get("observation", "")
-                        markdown += f"  - {timestamp}: {observation}\n" if observation else f"  - {timestamp}: \n"
+                        subtitle = str(frame.get("subtitle") or "").strip()
+                        subtitle_start = str(frame.get("subtitle_start") or "").strip()
+                        subtitle_end = str(frame.get("subtitle_end") or "").strip()
+                        subtitle_time = ""
+                        if subtitle_start and subtitle_end:
+                            subtitle_time = f"[{subtitle_start}-{subtitle_end}] "
+                        elif subtitle_start:
+                            subtitle_time = f"[{subtitle_start}] "
+                        if observation and subtitle:
+                            markdown += f"  - {timestamp}: {observation}｜字幕：{subtitle_time}{subtitle}\n"
+                        elif observation:
+                            markdown += f"  - {timestamp}: {observation}\n"
+                        elif subtitle:
+                            markdown += f"  - {timestamp}: 字幕：{subtitle}\n"
+                        else:
+                            markdown += f"  - {timestamp}: \n"
 
                 markdown += "\n"
 

@@ -106,6 +106,10 @@ def _build_merge_video_options(
     )
 
     video_output = get_video_output_settings()
+    from app.services.short_drama_settings import resolve_video_output_for_script_mode
+
+    script_mode = str(getattr(params, "video_clip_json_path", "") or "").strip().lower()
+    video_output = resolve_video_output_for_script_mode(video_output, script_path=script_mode)
     if hasattr(params, 'watermark_text') and params.watermark_text is not None:
         video_output["watermark_text"] = params.watermark_text
     if hasattr(params, 'enable_picture_narration') and params.enable_picture_narration is not None:

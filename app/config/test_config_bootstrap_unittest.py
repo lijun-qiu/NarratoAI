@@ -9,6 +9,7 @@ except ModuleNotFoundError:  # Python < 3.11
 
 from app.config import config as cfg
 from app.config.defaults import (
+    DEFAULT_ALT_BASE_URL,
     get_openai_compatible_ui_values,
     normalize_openai_compatible_model_name,
 )
@@ -51,34 +52,34 @@ hide_config = true
                 cfg.config_file = original_config_file
 
         self.assertEqual("openai", config_data["app"]["vision_llm_provider"])
-        self.assertEqual("Qwen/Qwen3.5-122B-A10B", config_data["app"]["vision_openai_model_name"])
-        self.assertEqual("https://api.siliconflow.cn/v1", config_data["app"]["vision_openai_base_url"])
+        self.assertEqual("gemini-3.1-flash-lite", config_data["app"]["vision_openai_model_name"])
+        self.assertEqual(DEFAULT_ALT_BASE_URL, config_data["app"]["vision_openai_base_url"])
         self.assertEqual("openai", config_data["app"]["text_llm_provider"])
-        self.assertEqual("Pro/zai-org/GLM-5", config_data["app"]["text_openai_model_name"])
-        self.assertEqual("https://api.siliconflow.cn/v1", config_data["app"]["text_openai_base_url"])
-        self.assertEqual("Qwen/Qwen3.5-122B-A10B", saved_config["app"]["vision_openai_model_name"])
-        self.assertEqual("Pro/zai-org/GLM-5", saved_config["app"]["text_openai_model_name"])
+        self.assertEqual("deepseek-v4-flash", config_data["app"]["text_openai_model_name"])
+        self.assertEqual(DEFAULT_ALT_BASE_URL, config_data["app"]["text_openai_base_url"])
+        self.assertEqual("gemini-3.1-flash-lite", saved_config["app"]["vision_openai_model_name"])
+        self.assertEqual("deepseek-v4-flash", saved_config["app"]["text_openai_model_name"])
         self.assertTrue(saved_config["app"]["hide_config"])
 
 
 class OpenAICompatibleModelDefaultsTests(unittest.TestCase):
     def test_ui_keeps_full_model_name_and_openai_provider(self):
         provider, model_name = get_openai_compatible_ui_values(
-            "Qwen/Qwen3.5-122B-A10B",
+            "qwen-vl-max",
             "fallback-model",
         )
 
         self.assertEqual("openai", provider)
-        self.assertEqual("Qwen/Qwen3.5-122B-A10B", model_name)
+        self.assertEqual("qwen-vl-max", model_name)
 
     def test_normalize_only_strips_openai_prefix(self):
         self.assertEqual(
-            "Qwen/Qwen3.5-122B-A10B",
-            normalize_openai_compatible_model_name("openai/Qwen/Qwen3.5-122B-A10B"),
+            "qwen-max",
+            normalize_openai_compatible_model_name("openai/qwen-max"),
         )
         self.assertEqual(
-            "Qwen/Qwen3.5-122B-A10B",
-            normalize_openai_compatible_model_name("Qwen/Qwen3.5-122B-A10B"),
+            "qwen-max",
+            normalize_openai_compatible_model_name("qwen-max"),
         )
 
 

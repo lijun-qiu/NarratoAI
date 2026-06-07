@@ -147,16 +147,17 @@ def build_chunk_coverage_override(
         total_min, _, total_max = compute_compact_segment_bounds(cfg)
         theme = resolve_fazu2_core_theme(core_theme, cfg)
         rules_block = build_fazu2_narration_copy_hard_requirements(theme, settings=cfg)
-        anti_block = build_fazu2_generation_anti_patterns()
+        anti_block = build_fazu2_generation_anti_patterns(cfg)
         seg_target = max(2, (segment_min + segment_max) // 2)
         return (
             f"{rules_block}\n"
             f"{anti_block}\n"
-            f"## 本分块精剪（故事讲述型）\n"
+            f"## 本分块精剪（罚罪2 V2）\n"
             f"- 全片第 **{chunk_index}/{chunk_total}** 块；本段剧情在 **{time_range}** 附近\n"
             f"- 本块约 **{seg_target}** 个情节点；**严禁超过 {segment_max} 段**（全片 **{total_min}–{total_max} 段**）\n"
-            f"- **讲故事**：对白写入 OST=0 解说；仅金句用 OST=1（≤6 段/全片）\n"
-            f"- `timestamp` 从字幕**原样复制**；禁止整分等间隔编造\n"
+            f"- **第 1 块**须含开头高潮（1 段 OST=1 纯原声：播放原片+original_line）；**最后 1 块**须含收尾+道别\n"
+            f"- OST=1 须覆盖字幕整句/整段，说完再切 OST=0；可铺垫引出原声；禁止半句截断、禁止解说夹在两段原声之间\n"
+            f"- 以字幕为主写 narration/timestamp；抽帧仅补 picture；`timestamp` 从字幕**原样复制**\n"
             f"- 解说 OST=0：每段 **{chars_min}–{chars_max} 字**；**必须写人名**，禁止警员1/说话人1\n"
             f"{format_ost1_segment_hint(cfg, estimated_items=segment_max)}"
             f"- 本块 `_id` 从 1 起编；合并后按剧情重排；**禁止 OST=2**\n"

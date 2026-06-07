@@ -267,13 +267,14 @@ async def _ocr_frame_batches_async(
     if not frames:
         return []
 
+    from app.config.llm_gateway_router import resolve_llm_credentials
+
     provider = config.app.get("vision_llm_provider", "openai").lower()
-    api_key = config.app.get(f"vision_{provider}_api_key")
     model_name = config.app.get(f"vision_{provider}_model_name")
-    base_url = config.app.get(f"vision_{provider}_base_url", "")
+    api_key, base_url = resolve_llm_credentials(model_name, role="vision")
     if not api_key or not model_name:
         raise ValueError(
-            f"未配置视觉模型，无法 OCR 硬字幕。请配置 vision_{provider}_api_key / model_name"
+            f"未配置视觉模型，无法 OCR 硬字幕。请配置 vision_{provider}_model_name 及对应网关 Key"
         )
 
     analyzer = create_vision_analyzer(

@@ -9,6 +9,9 @@ from pathlib import Path
 import PIL.Image
 from loguru import logger
 
+from app.config import config
+from app.config.llm_gateway_router import resolve_llm_credentials
+
 from .manager import LLMServiceManager
 from .validators import OutputValidator
 from .exceptions import LLMServiceError
@@ -43,8 +46,15 @@ class UnifiedLLMService:
             LLMServiceError: 服务调用失败时抛出
         """
         try:
+            provider_name = (provider or config.app.get("vision_llm_provider", "openai")).lower()
+            model_name = kwargs.get("model") or config.app.get(f"vision_{provider_name}_model_name")
+            api_key, base_url = resolve_llm_credentials(model_name, role="vision")
+            kwargs["api_key"] = api_key
+            kwargs["api_base"] = base_url
+            kwargs.setdefault("model", model_name)
+
             # 获取视觉模型提供商
-            vision_provider = LLMServiceManager.get_vision_provider(provider)
+            vision_provider = LLMServiceManager.get_vision_provider(provider_name)
             
             # 执行图片分析
             results = await vision_provider.analyze_images(
@@ -88,8 +98,15 @@ class UnifiedLLMService:
             LLMServiceError: 服务调用失败时抛出
         """
         try:
+            provider_name = (provider or config.app.get("text_llm_provider", "openai")).lower()
+            model_name = kwargs.get("model") or config.app.get(f"text_{provider_name}_model_name")
+            api_key, base_url = resolve_llm_credentials(model_name, role="text")
+            kwargs["api_key"] = api_key
+            kwargs["api_base"] = base_url
+            kwargs.setdefault("model", model_name)
+
             # 获取文本模型提供商
-            text_provider = LLMServiceManager.get_text_provider(provider)
+            text_provider = LLMServiceManager.get_text_provider(provider_name)
             
             # 执行文本生成
             result = await text_provider.generate_text(

@@ -173,6 +173,23 @@ class PromptOutputValidator:
             raise PromptValidationError(
                 f"第 {index + 1} 个片段的时间戳格式错误，应为 'HH:MM:SS,mmm-HH:MM:SS,mmm'"
             )
+
+        from app.services.srt_utils import parse_timestamp_range
+
+        try:
+            start_ms, end_ms = parse_timestamp_range(timestamp)
+        except Exception as exc:
+            raise PromptValidationError(
+                f"第 {index + 1} 个片段的时间戳无法解析: {timestamp}"
+            ) from exc
+        if end_ms <= start_ms:
+            raise PromptValidationError(
+                f"第 {index + 1} 个片段 timestamp 起止相同或无效（零时长）: {timestamp}"
+            )
+        if end_ms - start_ms < 200:
+            raise PromptValidationError(
+                f"第 {index + 1} 个片段 timestamp 过短: {timestamp}"
+            )
             
         # 验证文本字段不为空
         for field in ["picture", "narration"]:

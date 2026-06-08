@@ -37,7 +37,7 @@ from app.services.srt_utils import (
     write_srt_file,
 )
 from app.utils import utils
-from app.services.update_script import probe_media_duration
+from app.services.update_script import is_valid_video_file, probe_media_duration
 
 
 PERFECT_SUBTITLE_DEFAULTS: dict[str, Any] = {
@@ -306,6 +306,8 @@ def build_picture_narration_subtitle_path(
     picture_groups: list[list[SrtEntry]] = []
     for segment in sorted_segments:
         if int(segment.get("OST", 0) or 0) != 1:
+            continue
+        if not is_valid_video_file(segment.get("video") or ""):
             continue
         entries = _build_ost1_picture_narration_entries(segment, video_output=cfg)
         if entries:

@@ -5,7 +5,9 @@
 
 from __future__ import annotations
 
+import os
 import re
+import json
 from typing import Any, Callable, Optional
 
 from loguru import logger
@@ -13,17 +15,201 @@ from loguru import logger
 from app.config import config
 from app.services.documentary.documentary_settings import (
     compute_ost1_segment_bounds,
+    get_documentary_compact_settings,
     get_documentary_settings,
     is_compact_documentary_settings,
     is_fazu2_compact_settings,
     resolve_append_custom_prompt,
 )
+from app.services.documentary.frame_timeline_sampling import (
+    build_frame_subtitle_lexicon_markdown,
+    collect_scene_segments_from_analysis,
+)
 from app.services.llm.migration_adapter import _run_async_safely
 from app.services.llm.unified_service import UnifiedLLMService
-from app.services.srt_utils import SrtEntry, parse_srt
+from app.services.short_drama_plot_analysis_validator import (
+    estimate_min_ost1_entries_for_plot,
+    emit_plot_analysis_full_text,
+    format_plot_analysis_validation_report,
+    validate_short_drama_plot_analysis,
+)
+from app.services.documentary.documentary_plot_blueprint_validator import (
+    emit_plot_blueprint_validation_report,
+    validate_plot_blueprint,
+)
+from app.services.short_drama_drama_knowledge import (
+    build_plot_blueprint_name_unification_section,
+    build_short_drama_drama_knowledge_section,
+    find_name_mistakes_in_text,
+)
+from app.services.short_drama_settings import get_short_drama_settings
+from app.services.srt_utils import SrtEntry, entries_to_srt, parse_srt, _time_str_to_ms
 from app.utils import utils
 
 _TRAILING_CLAUSE_PUNCT = re.compile(r"[，。！？、；]+$")
+_PHANTOM_SUBTITLE_FRAGMENT_RE = re.compile(
+    r"^[的了啊哦呢吧吗呀嘛哈嗯呐哇么之个]$|^[的了啊哦呢吧吗呀嘛哈嗯呐哇么之个][。，！？、；]$"
+)
+
+
+def is_phantom_subtitle_fragment(text: str) -> bool:
+    """过滤 ASR/SRT 窗口误挂的碎片（如「了。」「啊，」），非画面硬字幕。"""
+    cleaned = clean_subtitle_punctuation(str(text or "").strip())
+    if not cleaned:
+        return True
+    if _PHANTOM_SUBTITLE_FRAGMENT_RE.match(cleaned):
+        return True
+    if len(cleaned) <= 3 and cleaned[-1] in "。，！？、；":
+        core = cleaned[:-1].strip()
+        if len(core) <= 1:
+            return True
+    return False
+
+
+def _normalize_subtitle_dedupe_key(text: str) -> str:
+    return re.sub(r"\s+", "", clean_subtitle_punctuation(str(text or "").strip()))
+
+
+def observation_burned_in_text(observation: dict[str, Any]) -> str:
+    """逐帧硬字幕原文（视觉模型/OCR）；无硬字幕则返回空。"""
+    if not isinstance(observation, dict):
+        return ""
+    if not observation.get("has_burned_in_subtitle"):
+        return ""
+    return str(observation.get("burned_in_subtitle") or "").strip()
+
+
+def collect_burned_in_texts_for_segment(
+    segment: dict[str, Any],
+    observations: list[dict[str, Any]],
+    *,
+    pad_ms: int = 200,
+) -> list[str]:
+    """收集 segment 时间窗内画面硬字幕（去重、去碎片）。"""
+    if not isinstance(segment, dict):
+        return []
+    time_range = str(segment.get("timestamp") or "").strip()
+    if not time_range or "-" not in time_range:
+        return []
+    try:
+        seg_start, seg_end = parse_timestamp_range_ms(time_range)
+    except Exception:
+        return []
+    window_start = max(0, seg_start - pad_ms)
+    window_end = seg_end + pad_ms
+
+    seen: set[str] = set()
+    collected: list[tuple[int, str]] = []
+    for observation in observations:
+        if not isinstance(observation, dict):
+            continue
+        ts = str(observation.get("timestamp") or "").strip()
+        if not ts:
+            continue
+        try:
+            ts_ms = _timestamp_to_ms(ts)
+        except Exception:
+            continue
+        if ts_ms < window_start or ts_ms > window_end:
+            continue
+        text = observation_burned_in_text(observation)
+        if not text or is_phantom_subtitle_fragment(text):
+            continue
+        key = _normalize_subtitle_dedupe_key(text)
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        collected.append((ts_ms, text))
+    collected.sort(key=lambda item: item[0])
+    return [text for _, text in collected]
+
+
+def strip_subtitle_entries_from_artifact(artifact: dict[str, Any]) -> None:
+    """移除 scene/batch 上的 subtitle_entries，仅保留 subtitle 文本字段。"""
+    if not isinstance(artifact, dict):
+        return
+    for segment in artifact.get("scene_segments") or []:
+        if isinstance(segment, dict):
+            segment.pop("subtitle_entries", None)
+            segment.pop("time_range", None)
+    for batch in artifact.get("batches") or []:
+        if not isinstance(batch, dict):
+            continue
+        batch.pop("subtitle_entries", None)
+        batch.pop("subtitle_excerpt", None)
+        for segment in batch.get("scene_segments") or []:
+            if isinstance(segment, dict):
+                segment.pop("subtitle_entries", None)
+                segment.pop("time_range", None)
+
+
+def attach_burned_in_subtitles_to_artifact(
+    artifact: dict[str, Any],
+    *,
+    settings: Optional[dict[str, Any]] = None,
+) -> dict[str, Any]:
+    """从逐帧 burned_in_subtitle 汇总 scene 字幕，仅写入 subtitle 文本（无 subtitle_entries）。"""
+    if not isinstance(artifact, dict):
+        return artifact
+
+    observations_by_batch: dict[int, list[dict[str, Any]]] = {}
+    for observation in artifact.get("frame_observations") or []:
+        if isinstance(observation, dict):
+            batch_index = int(observation.get("batch_index", 0))
+            observations_by_batch.setdefault(batch_index, []).append(observation)
+    for batch in artifact.get("batches") or []:
+        if not isinstance(batch, dict):
+            continue
+        batch_index = int(batch.get("batch_index", 0))
+        batch_observations = list(batch.get("frame_observations") or batch.get("observations") or [])
+        if batch_observations:
+            observations_by_batch.setdefault(batch_index, batch_observations)
+
+    unique_segments = _collect_unique_scene_segments(artifact)
+    for segment in unique_segments:
+        batch_index = int(segment.get("batch_index", 0))
+        texts = collect_burned_in_texts_for_segment(
+            segment,
+            observations_by_batch.get(batch_index, []),
+        )
+        segment.pop("subtitle_entries", None)
+        segment.pop("time_range", None)
+        if texts:
+            segment["subtitle"] = join_subtitle_texts(texts)
+        else:
+            segment.pop("subtitle", None)
+
+    batch_subtitles: dict[int, list[str]] = {}
+    for segment in artifact.get("scene_segments") or []:
+        if not isinstance(segment, dict):
+            continue
+        subtitle = resolve_segment_subtitle_text(segment)
+        if not subtitle:
+            continue
+        batch_index = int(segment.get("batch_index", 0))
+        key = _normalize_subtitle_dedupe_key(subtitle)
+        existing = batch_subtitles.setdefault(batch_index, [])
+        if key and key not in {_normalize_subtitle_dedupe_key(t) for t in existing}:
+            existing.append(subtitle)
+
+    for batch in artifact.get("batches") or []:
+        if not isinstance(batch, dict):
+            continue
+        batch_index = int(batch.get("batch_index", 0))
+        parts = batch_subtitles.get(batch_index) or []
+        batch.pop("subtitle_entries", None)
+        batch.pop("subtitle_excerpt", None)
+        if parts:
+            batch["subtitle"] = join_subtitle_texts(parts)
+        else:
+            batch.pop("subtitle", None)
+
+    strip_subtitle_entries_from_artifact(artifact)
+    artifact["subtitle_attached"] = True
+    artifact["subtitle_source"] = "burned_in_only"
+    return artifact
+
+
 def clean_subtitle_punctuation(text: str) -> str:
     """合并多句字幕后去掉「，；」「。；」等重复标点。"""
     cleaned = (text or "").strip()
@@ -49,9 +235,12 @@ def join_subtitle_texts(parts: list[str] | tuple[str, ...]) -> str:
 
 
 def resolve_segment_subtitle_text(segment: dict[str, Any]) -> str:
-    """从 segment 的 subtitle_entries（优先）或 subtitle 得到清洗后的合并字幕。"""
+    """从 segment 的 subtitle 或（兼容旧 JSON）subtitle_entries 得到清洗后的合并字幕。"""
     if not isinstance(segment, dict):
         return ""
+    direct = clean_subtitle_punctuation(str(segment.get("subtitle") or "").strip())
+    if direct:
+        return direct
     entries = segment.get("subtitle_entries")
     if isinstance(entries, list) and entries:
         merged = join_subtitle_texts(
@@ -59,13 +248,13 @@ def resolve_segment_subtitle_text(segment: dict[str, Any]) -> str:
         )
         if merged:
             return merged
-    return clean_subtitle_punctuation(str(segment.get("subtitle") or "").strip())
+    return ""
 
 
 def resolve_segment_time_range(segment: dict[str, Any]) -> str:
     """
-    剪辑用时间范围：优先按 subtitle_entries 首尾对位，便于按字幕切分成片。
-    无字幕条目时回退 segment.time_range，再回退 timestamp。
+    剪辑用时间范围：subtitle_entries 首条 start 至末条 end（一小段完整对白）；
+    无条目时回退 timestamp。
     """
     if not isinstance(segment, dict):
         return ""
@@ -83,12 +272,16 @@ def resolve_segment_time_range(segment: dict[str, Any]) -> str:
                 starts.append(start)
             if end:
                 ends.append(end)
-        if starts and ends:
-            return f"{starts[0]}-{ends[-1]}"
+        if ends:
+            end = ends[-1]
+            if starts:
+                start = starts[0]
+            else:
+                base = str(segment.get("timestamp") or "").strip()
+                start = base.split("-", 1)[0].strip() if "-" in base else base
+            if start and end:
+                return f"{start}-{end}"
 
-    explicit = str(segment.get("time_range") or "").strip()
-    if explicit:
-        return explicit
     return str(segment.get("timestamp") or "").strip()
 
 
@@ -132,6 +325,331 @@ def truncate_subtitle_content(subtitle_content: str, max_chars: int) -> str:
     if not text or len(text) <= max_chars:
         return text
     return text[: max_chars - 20].rstrip() + "\n…（字幕已截断）"
+
+
+def _iter_frame_observation_dicts(data: dict[str, Any]) -> list[dict[str, Any]]:
+    """合并 batches 与顶层 frame_observations，按时间排序。"""
+    merged: list[dict[str, Any]] = []
+    seen_ts: set[str] = set()
+
+    def add_obs(obs: dict[str, Any]) -> None:
+        if not isinstance(obs, dict):
+            return
+        ts = str(obs.get("timestamp") or "").strip()
+        key = ts or str(id(obs))
+        if key in seen_ts:
+            return
+        seen_ts.add(key)
+        merged.append(obs)
+
+    for batch in data.get("batches") or []:
+        if not isinstance(batch, dict):
+            continue
+        for obs in batch.get("frame_observations") or batch.get("observations") or []:
+            add_obs(obs)
+    for obs in data.get("frame_observations") or []:
+        add_obs(obs)
+
+    def sort_key(item: dict[str, Any]) -> int:
+        ts = str(item.get("timestamp") or "").strip()
+        if not ts:
+            return 0
+        try:
+            return _time_str_to_ms(ts)
+        except Exception:
+            return 0
+
+    return sorted(merged, key=sort_key)
+
+
+def extract_subtitle_entries_from_frame_analysis(data: dict[str, Any]) -> list[SrtEntry]:
+    """
+    从抽帧 JSON 还原字幕条目（原样保留 text）：
+    scene/batch 的 subtitle_entries → 硬字幕 burned_in_subtitle。
+    """
+    if not isinstance(data, dict):
+        return []
+
+    collected: list[SrtEntry] = []
+    seen: set[tuple[int, str]] = set()
+    default_duration_ms = 2500
+
+    def append_entry(
+        start_label: str,
+        end_label: str,
+        text: str,
+        *,
+        verbatim: bool = False,
+    ) -> None:
+        body = str(text or "").strip()
+        if not verbatim:
+            body = clean_subtitle_punctuation(body)
+        if not body or not start_label:
+            return
+        try:
+            start_ms = _time_str_to_ms(start_label.strip())
+            end_ms = _time_str_to_ms(end_label.strip()) if end_label else start_ms + default_duration_ms
+        except Exception:
+            return
+        if end_ms <= start_ms:
+            end_ms = start_ms + default_duration_ms
+        key = (start_ms, body)
+        if key in seen:
+            return
+        seen.add(key)
+        collected.append(SrtEntry(start_ms=start_ms, end_ms=end_ms, text=body))
+
+    def append_subtitle_entry_dict(item: dict[str, Any]) -> None:
+        if not isinstance(item, dict):
+            return
+        append_entry(
+            str(item.get("start") or ""),
+            str(item.get("end") or ""),
+            str(item.get("text") or ""),
+            verbatim=True,
+        )
+
+    for batch in data.get("batches") or []:
+        if not isinstance(batch, dict):
+            continue
+        for item in batch.get("subtitle_entries") or []:
+            append_subtitle_entry_dict(item)
+
+    for segment in collect_scene_segments_from_analysis(data):
+        entries = segment.get("subtitle_entries")
+        has_entry_list = isinstance(entries, list) and bool(entries)
+        if has_entry_list:
+            for item in entries:
+                append_subtitle_entry_dict(item)
+        elif resolve_segment_subtitle_text(segment):
+            ts_range = resolve_segment_time_range(segment)
+            if "-" in ts_range:
+                start_label, end_label = ts_range.split("-", 1)
+                append_entry(
+                    start_label,
+                    end_label,
+                    resolve_segment_subtitle_text(segment),
+                    verbatim=True,
+                )
+
+    prev_ms: int | None = None
+    for obs in _iter_frame_observation_dicts(data):
+        burned = str(obs.get("burned_in_subtitle") or "").strip()
+        has_burned = bool(obs.get("has_burned_in_subtitle")) and bool(burned)
+        attached = str(obs.get("subtitle") or "").strip()
+        text = burned if has_burned else attached
+        if not text:
+            continue
+        start_label = str(obs.get("subtitle_start") or obs.get("timestamp") or "").strip()
+        end_label = str(obs.get("subtitle_end") or "").strip()
+        if not end_label and start_label:
+            try:
+                start_ms = _time_str_to_ms(start_label)
+                end_ms = (
+                    (prev_ms + start_ms) // 2
+                    if prev_ms is not None and start_ms > prev_ms
+                    else start_ms + default_duration_ms
+                )
+                end_label = utils.seconds_to_time(end_ms / 1000.0).replace(".", ",")
+                prev_ms = start_ms
+            except Exception:
+                end_label = ""
+        append_entry(start_label, end_label, text, verbatim=True)
+
+    collected.sort(key=lambda item: (item.start_ms, item.end_ms, item.text))
+    return collected
+
+
+def extract_subtitle_srt_from_frame_analysis(frame_json_path: str) -> str:
+    """将抽帧 JSON 内字幕/硬字幕还原为 SRT 文本（供构思蓝图对照）。"""
+    path = (frame_json_path or "").strip()
+    if not path or not os.path.isfile(path):
+        return ""
+    try:
+        with open(path, encoding="utf-8") as fp:
+            data = json.load(fp)
+    except OSError as exc:
+        logger.warning(f"读取抽帧 JSON 字幕失败 {path}: {exc}")
+        return ""
+
+    entries = extract_subtitle_entries_from_frame_analysis(data)
+    if not entries:
+        return ""
+    return entries_to_srt(entries).strip()
+
+
+def resolve_subtitle_content_for_plot_analysis(
+    *,
+    subtitle_content: str = "",
+    frame_json_path: str | None = None,
+) -> tuple[str, str]:
+    """
+    脚本生成用字幕源：有 SRT 文件内容则优先；否则从抽帧 JSON 提取。
+    构思蓝图请用 resolve_subtitles_for_plot_blueprint（SRT 与抽帧内字幕分别提取）。
+    返回 (字幕正文, 来源标签 srt_file | frame_analysis)。
+    """
+    srt_text = (subtitle_content or "").strip()
+    if srt_text:
+        return srt_text, "srt_file"
+
+    extracted = extract_subtitle_srt_from_frame_analysis(frame_json_path or "")
+    if extracted.strip():
+        logger.info(
+            f"未提供 SRT，已改用抽帧 JSON 内字幕（约 {len(extracted)} 字）"
+        )
+        return extracted.strip(), "frame_analysis"
+    return "", ""
+
+
+def resolve_frame_subtitle_for_plot_blueprint(
+    frame_json_path: str | None,
+) -> str:
+    """构思蓝图：从抽帧 JSON 提取 subtitle_entries / 硬字幕。"""
+    extracted = extract_subtitle_srt_from_frame_analysis(frame_json_path or "")
+    text = extracted.strip()
+    if text:
+        logger.info(f"构思蓝图：已取抽帧内字幕（约 {len(text)} 字）")
+    return text
+
+
+def resolve_subtitles_for_plot_blueprint(
+    *,
+    subtitle_content: str = "",
+    frame_json_path: str | None = None,
+) -> tuple[str, str, str]:
+    """构思蓝图：分别提取 SRT 与抽帧内字幕。返回 (srt_text, frame_text, primary_source)。"""
+    srt_text = (subtitle_content or "").strip()
+    frame_text = resolve_frame_subtitle_for_plot_blueprint(frame_json_path)
+    if srt_text:
+        return srt_text, frame_text, "srt_file"
+    if frame_text:
+        return "", frame_text, "frame_analysis"
+    return "", "", ""
+
+
+def collect_frame_analysis_time_bounds(
+    frame_json_path: str | None,
+) -> dict[str, Any]:
+    """从抽帧 JSON 汇总可用时间范围与场景锚点。"""
+    from app.services.documentary.frame_analysis_pairing import load_analysis_artifact
+
+    empty: dict[str, Any] = {
+        "min_ms": 0,
+        "max_ms": 0,
+        "anchors": [],
+    }
+    path = (frame_json_path or "").strip()
+    if not path:
+        return empty
+    try:
+        artifact = load_analysis_artifact(path)
+    except Exception as exc:
+        logger.warning(f"读取抽帧 JSON 时间边界失败: {exc}")
+        return empty
+
+    segments = collect_scene_segments_from_analysis(artifact)
+    if not segments:
+        return empty
+
+    min_ms = 0
+    max_ms = 0
+    anchors: list[dict[str, str]] = []
+    for segment in segments:
+        clip_range = resolve_segment_time_range(segment)
+        if not clip_range or "-" not in clip_range:
+            clip_range = str(segment.get("timestamp") or "")
+        if not clip_range or "-" not in clip_range:
+            continue
+        try:
+            start_ms, end_ms = parse_timestamp_range_ms(clip_range)
+        except Exception:
+            continue
+        if not max_ms or end_ms > max_ms:
+            max_ms = end_ms
+        if not min_ms or start_ms < min_ms:
+            min_ms = start_ms
+        scene = str(segment.get("scene") or "").strip()
+        if "切换至" in scene:
+            scene = scene.split("切换至")[-1].strip()
+        while scene.startswith("从"):
+            scene = scene[1:].strip()
+        observation = str(segment.get("observation") or segment.get("action") or "").strip()
+        if observation:
+            observation = observation.split("；")[0][:72]
+        anchors.append(
+            {
+                "time_range": clip_range,
+                "scene": scene[:48],
+                "observation": observation,
+            }
+        )
+
+    return {
+        "min_ms": min_ms,
+        "max_ms": max_ms,
+        "anchors": anchors,
+    }
+
+
+def build_frame_analysis_time_bounds_section(
+    frame_json_path: str | None,
+    *,
+    source_duration_sec: float | None = None,
+    max_anchor_rows: int = 28,
+) -> str:
+    """注入蓝图 prompt：原片/抽帧可用时间上限与场景锚点索引。"""
+    from app.services.srt_utils import format_timestamp_ms
+
+    bounds = collect_frame_analysis_time_bounds(frame_json_path)
+    max_ms = int(bounds.get("max_ms") or 0)
+    min_ms = int(bounds.get("min_ms") or 0)
+    if max_ms <= 0:
+        return (
+            "## 抽帧时间边界（硬性）\n"
+            "- 未能从抽帧 JSON 解析时间范围；所有 timestamp 须来自下方抽帧摘要中的真实时间，禁止编造\n"
+        )
+
+    frame_max_label = format_timestamp_ms(max_ms)
+    frame_min_label = format_timestamp_ms(min_ms)
+    cap_ms = max_ms
+    cap_note = f"抽帧覆盖至 **{frame_max_label}**"
+    if source_duration_sec and source_duration_sec > 0:
+        video_ms = int(source_duration_sec * 1000)
+        cap_ms = min(video_ms, max_ms) if max_ms > 0 else video_ms
+        video_label = format_timestamp_ms(video_ms)
+        cap_label = format_timestamp_ms(cap_ms)
+        cap_note = (
+            f"原片时长 **{video_label}**；抽帧覆盖 **{frame_min_label}–{frame_max_label}**；"
+            f"**所有 timestamp 结束时间不得超过 {cap_label}**"
+        )
+
+    anchors = bounds.get("anchors") or []
+    if len(anchors) > max_anchor_rows:
+        step = max(1, len(anchors) // max_anchor_rows)
+        sampled = [anchors[index] for index in range(0, len(anchors), step)]
+    else:
+        sampled = anchors
+
+    rows: list[str] = []
+    for item in sampled[:max_anchor_rows]:
+        scene = str(item.get("scene") or "—")
+        obs = str(item.get("observation") or "—")
+        rows.append(
+            f"| {item.get('time_range', '—')} | {scene} | {obs} |"
+        )
+    table = "\n".join(rows) if rows else "| — | — | — |"
+
+    lead_sec = 10
+    return f"""## 抽帧时间边界与场景锚点（硬性 · 第二依据）
+- {cap_note}
+- **禁止**写出超过上限的时间戳；禁止仅用 `00:02:51` 单点而无结束时间（OST=1 须写完整区间）
+- **画面描述**须与下表同时间段抽帧 observation/action 一致，禁止臆造表中未出现的地点/动作/昼夜
+- OST=0 铺垫下一段 OST=1：取画起点 = 下一段原声开始 **− 约 {lead_sec} 秒**（仍须落在上表覆盖范围内）
+
+| 抽帧时间段 | 场景 | 画面要点（摘自抽帧） |
+|------------|------|----------------------|
+{table}
+"""
 
 
 def subtitle_excerpt_for_time_range(
@@ -307,6 +825,7 @@ def apply_subtitle_fields_to_observation(
     subtitle_content: str,
     *,
     pad_ms: int = 800,
+    parsed_entries: list[SrtEntry] | None = None,
 ) -> None:
     """为单帧写入 subtitle / subtitle_start / subtitle_end（抽帧阶段调用）。"""
     if not isinstance(observation, dict):
@@ -314,7 +833,7 @@ def apply_subtitle_fields_to_observation(
 
     timestamp = str(observation.get("timestamp") or "").strip()
     burned = str(observation.get("burned_in_subtitle") or "").strip()
-    entries = parse_srt(subtitle_content or "")
+    entries = parsed_entries if parsed_entries is not None else parse_srt(subtitle_content or "")
 
     entry = find_srt_entry_at_timestamp(entries, timestamp, pad_ms=pad_ms) if timestamp else None
     if entry is not None:
@@ -346,7 +865,7 @@ def apply_subtitle_fields_to_segment(
     if not isinstance(segment, dict):
         return
 
-    time_range = str(segment.get("timestamp") or segment.get("time_range") or "").strip()
+    time_range = str(segment.get("timestamp") or "").strip()
     if not time_range:
         return
 
@@ -372,6 +891,258 @@ def apply_subtitle_fields_to_segment(
 
     segment["subtitle_entries"] = entries
     segment["subtitle"] = join_subtitle_texts(str(item.get("text") or "") for item in entries)
+    segment.pop("time_range", None)
+
+
+def _subtitle_entry_start_ms(entry: dict[str, Any]) -> int:
+    return _timestamp_to_ms(str(entry.get("start") or ""))
+
+
+def _subtitle_entry_end_ms(entry: dict[str, Any]) -> int:
+    return _timestamp_to_ms(str(entry.get("end") or ""))
+
+
+def _segment_timestamp_bounds_ms(segment: dict[str, Any]) -> tuple[int, int]:
+    return parse_timestamp_range_ms(str(segment.get("timestamp") or ""))
+
+
+def _score_subtitle_entry_for_segment(entry: dict[str, Any], segment: dict[str, Any]) -> float:
+    """条目与 scene 时间窗重叠越多、中心越近，得分越高。"""
+    entry_start = _subtitle_entry_start_ms(entry)
+    entry_end = _subtitle_entry_end_ms(entry)
+    if entry_end <= entry_start:
+        return -1.0
+    seg_start, seg_end = _segment_timestamp_bounds_ms(segment)
+    if seg_end <= seg_start:
+        return -1.0
+    overlap = min(entry_end, seg_end) - max(entry_start, seg_start)
+    if overlap <= 0:
+        return -1.0
+    entry_mid = (entry_start + entry_end) / 2.0
+    seg_mid = (seg_start + seg_end) / 2.0
+    overlap_ratio = overlap / max(entry_end - entry_start, 1)
+    distance_sec = abs(entry_mid - seg_mid) / 1000.0
+    return overlap_ratio * 10.0 - distance_sec
+
+
+def _build_parsed_subtitle_payload(
+    entry: SrtEntry,
+    *,
+    text_override: str = "",
+) -> dict[str, str] | None:
+    srt_text = (entry.text or "").strip().replace("\n", " ")
+    text, text_source = merge_subtitle_text_with_burned_in(srt_text, text_override)
+    if not text and not text_override:
+        return None
+    payload: dict[str, str] = {
+        "start": _ms_to_hhmmss(entry.start_ms),
+        "end": _ms_to_hhmmss(entry.end_ms),
+        "text": text,
+    }
+    if text_source == "burned_in_corrected":
+        payload["text_source"] = text_source
+    return payload
+
+
+def assign_subtitle_entries_to_segments(
+    segments: list[dict[str, Any]],
+    parsed_entries: list[SrtEntry],
+    *,
+    observations_by_batch: dict[int, list[dict[str, Any]]] | None = None,
+) -> None:
+    """每条 SRT 字幕只分配给最匹配的一个 scene_segment（全局唯一，不重复挂载）。"""
+    cleaned = [segment for segment in segments if isinstance(segment, dict)]
+    if not cleaned or not parsed_entries:
+        return
+
+    obs_by_batch = observations_by_batch or {}
+    overrides_by_batch: dict[int, dict[int, str]] = {}
+    for batch_index, observations in obs_by_batch.items():
+        overrides_by_batch[batch_index] = build_burned_in_overrides_for_entries(
+            observations,
+            parsed_entries,
+        )
+
+    assignments: dict[int, list[dict[str, str]]] = {
+        index: [] for index in range(len(cleaned))
+    }
+
+    for entry in parsed_entries:
+        best_index = -1
+        best_score = -1.0
+        best_payload: dict[str, str] | None = None
+        for index, segment in enumerate(cleaned):
+            batch_index = int(segment.get("batch_index", 0))
+            override = overrides_by_batch.get(batch_index, {}).get(entry.start_ms, "")
+            payload = _build_parsed_subtitle_payload(entry, text_override=override)
+            if payload is None:
+                continue
+            score = _score_subtitle_entry_for_segment(payload, segment)
+            if score > best_score:
+                best_score = score
+                best_index = index
+                best_payload = payload
+        if best_index >= 0 and best_payload is not None and best_score > 0:
+            assignments[best_index].append(best_payload)
+
+    for index, segment in enumerate(cleaned):
+        entries = sorted(assignments[index], key=_subtitle_entry_start_ms)
+        if entries:
+            segment["subtitle_entries"] = entries
+            segment["subtitle"] = join_subtitle_texts(
+                str(item.get("text") or "") for item in entries
+            )
+        else:
+            segment.pop("subtitle_entries", None)
+            segment.pop("subtitle", None)
+        segment.pop("time_range", None)
+
+
+def _collect_unique_scene_segments(artifact: dict[str, Any]) -> list[dict[str, Any]]:
+    unique: list[dict[str, Any]] = []
+    seen: set[int] = set()
+    for segment in artifact.get("scene_segments") or []:
+        if isinstance(segment, dict) and id(segment) not in seen:
+            seen.add(id(segment))
+            unique.append(segment)
+    for batch in artifact.get("batches") or []:
+        if not isinstance(batch, dict):
+            continue
+        for segment in batch.get("scene_segments") or []:
+            if isinstance(segment, dict) and id(segment) not in seen:
+                seen.add(id(segment))
+                unique.append(segment)
+    return unique
+
+
+def _sync_batch_subtitles_from_segments(
+    artifact: dict[str, Any],
+    *,
+    subtitle_content: str = "",
+    pad_ms: int = 0,
+) -> None:
+    """从 scene_segment 汇总各 batch 的字幕字段，避免对同一 SRT 重复拉取。"""
+    segments_by_batch: dict[int, list[dict[str, Any]]] = {}
+    for segment in artifact.get("scene_segments") or []:
+        if not isinstance(segment, dict):
+            continue
+        batch_index = int(segment.get("batch_index", 0))
+        segments_by_batch.setdefault(batch_index, []).append(segment)
+
+    text = (subtitle_content or "").strip()
+    for batch in artifact.get("batches") or []:
+        if not isinstance(batch, dict):
+            continue
+        batch_index = int(batch.get("batch_index", 0))
+        batch_segments = segments_by_batch.get(batch_index) or []
+
+        merged_entries: list[dict[str, str]] = []
+        seen_starts: set[int] = set()
+        for segment in batch_segments:
+            if not isinstance(segment, dict):
+                continue
+            for item in segment.get("subtitle_entries") or []:
+                if not isinstance(item, dict):
+                    continue
+                start_ms = _subtitle_entry_start_ms(item)
+                if start_ms <= 0 or start_ms in seen_starts:
+                    continue
+                seen_starts.add(start_ms)
+                merged_entries.append(item)
+        merged_entries.sort(key=_subtitle_entry_start_ms)
+
+        if merged_entries:
+            batch["subtitle_entries"] = merged_entries
+            batch["subtitle"] = join_subtitle_texts(
+                str(item.get("text") or "") for item in merged_entries
+            )
+        else:
+            batch.pop("subtitle_entries", None)
+            batch.pop("subtitle", None)
+
+        time_range = str(batch.get("time_range") or "").strip()
+        if time_range and text:
+            batch["subtitle_excerpt"] = subtitle_excerpt_for_time_range(
+                text,
+                time_range,
+                pad_ms=pad_ms,
+            )
+        else:
+            batch.pop("subtitle_excerpt", None)
+
+
+def partition_subtitle_entries_across_segments(segments: list[dict[str, Any]]) -> None:
+    """
+    每条 SRT 字幕（按 start 唯一）只归属一个 scene_segment。
+
+    视觉模型常输出 timestamp 重叠的多场景；按窗口独立挂载会导致 subtitle_entries 重复。
+    """
+    cleaned = [segment for segment in segments if isinstance(segment, dict)]
+    if len(cleaned) <= 1:
+        return
+
+    entry_by_start: dict[int, dict[str, Any]] = {}
+    for segment in cleaned:
+        for entry in segment.get("subtitle_entries") or []:
+            if not isinstance(entry, dict):
+                continue
+            start_ms = _subtitle_entry_start_ms(entry)
+            if start_ms <= 0:
+                continue
+            entry_by_start.setdefault(start_ms, entry)
+
+    if not entry_by_start:
+        return
+
+    owner_by_start: dict[int, int] = {}
+    for start_ms, entry in entry_by_start.items():
+        best_index = -1
+        best_score = -1.0
+        for index, segment in enumerate(cleaned):
+            score = _score_subtitle_entry_for_segment(entry, segment)
+            if score > best_score:
+                best_score = score
+                best_index = index
+        if best_index >= 0:
+            owner_by_start[start_ms] = best_index
+
+    for index, segment in enumerate(cleaned):
+        entries = segment.get("subtitle_entries")
+        if not isinstance(entries, list):
+            continue
+        kept = [
+            entry
+            for entry in entries
+            if isinstance(entry, dict)
+            and owner_by_start.get(_subtitle_entry_start_ms(entry)) == index
+        ]
+        kept.sort(key=_subtitle_entry_start_ms)
+        if kept:
+            segment["subtitle_entries"] = kept
+            segment["subtitle"] = join_subtitle_texts(
+                str(item.get("text") or "") for item in kept
+            )
+        else:
+            segment.pop("subtitle_entries", None)
+            segment.pop("subtitle", None)
+            segment.pop("time_range", None)
+
+
+def _partition_subtitle_entries_in_artifact(artifact: dict[str, Any]) -> None:
+    unique: list[dict[str, Any]] = []
+    seen: set[int] = set()
+    for batch in artifact.get("batches") or []:
+        if not isinstance(batch, dict):
+            continue
+        for segment in batch.get("scene_segments") or []:
+            if isinstance(segment, dict) and id(segment) not in seen:
+                seen.add(id(segment))
+                unique.append(segment)
+    for segment in artifact.get("scene_segments") or []:
+        if isinstance(segment, dict) and id(segment) not in seen:
+            seen.add(id(segment))
+            unique.append(segment)
+    partition_subtitle_entries_across_segments(unique)
 
 
 def attach_subtitles_to_frame_analysis_artifact(
@@ -380,74 +1151,12 @@ def attach_subtitles_to_frame_analysis_artifact(
     *,
     settings: Optional[dict[str, Any]] = None,
 ) -> dict[str, Any]:
-    """抽帧完成后：按 SRT 时间区间补全字幕字段；文字冲突以画面硬字幕为准。"""
-    text = (subtitle_content or "").strip()
-    if not text or not isinstance(artifact, dict):
+    """抽帧完成后：仅从画面硬字幕写入 segment.subtitle（不挂 SRT subtitle_entries）。"""
+    if not isinstance(artifact, dict):
         return artifact
-
-    cfg = settings or get_documentary_settings()
-    pad_sec = int(cfg.get("subtitle_batch_pad_sec", 5))
-    pad_ms = max(0, pad_sec * 1000)
-    frame_pad_ms = max(800, int((cfg.get("frame_interval_input") or 1) * 1000))
-
-    observations_by_batch: dict[int, list[dict[str, Any]]] = {}
-    for observation in artifact.get("frame_observations") or []:
-        if isinstance(observation, dict):
-            batch_index = int(observation.get("batch_index", 0))
-            observations_by_batch.setdefault(batch_index, []).append(observation)
-
-    for batch in artifact.get("batches") or []:
-        if not isinstance(batch, dict):
-            continue
-        batch_index = int(batch.get("batch_index", 0))
-        batch_observations = list(batch.get("frame_observations") or batch.get("observations") or [])
-        if not batch_observations:
-            batch_observations = observations_by_batch.get(batch_index, [])
-
-        time_range = str(batch.get("time_range") or "").strip()
-        if time_range:
-            batch["subtitle_entries"] = subtitle_entries_for_time_range(
-                text,
-                time_range,
-                pad_ms=pad_ms,
-                max_entries=30,
-                text_overrides_by_start_ms=build_burned_in_overrides_for_entries(
-                    batch_observations,
-                    parse_srt(text),
-                ),
-            )
-            batch["subtitle_excerpt"] = subtitle_excerpt_for_time_range(text, time_range, pad_ms=pad_ms)
-            if batch["subtitle_entries"]:
-                batch["subtitle"] = join_subtitle_texts(
-                    str(item.get("text") or "") for item in batch["subtitle_entries"]
-                )
-
-        for segment in batch.get("scene_segments") or []:
-            apply_subtitle_fields_to_segment(
-                segment,
-                text,
-                observations=batch_observations,
-                pad_ms=500,
-            )
-        for observation in batch_observations:
-            apply_subtitle_fields_to_observation(observation, text, pad_ms=frame_pad_ms)
-
-    for segment in artifact.get("scene_segments") or []:
-        if not isinstance(segment, dict):
-            continue
-        batch_index = int(segment.get("batch_index", 0))
-        apply_subtitle_fields_to_segment(
-            segment,
-            text,
-            observations=observations_by_batch.get(batch_index, []),
-            pad_ms=500,
-        )
-
-    for observation in artifact.get("frame_observations") or []:
-        apply_subtitle_fields_to_observation(observation, text, pad_ms=frame_pad_ms)
-
-    artifact["subtitle_attached"] = True
-    return artifact
+    if (subtitle_content or "").strip():
+        logger.debug("attach_subtitles：已忽略 SRT，scene 字幕仅取自 burned_in_subtitle")
+    return attach_burned_in_subtitles_to_artifact(artifact, settings=settings)
 
 
 def build_subtitle_cross_validation_instructions(
@@ -499,13 +1208,168 @@ def build_subtitle_cross_validation_instructions(
     return "\n".join(lines)
 
 
-def summarize_frame_markdown(frame_markdown: str, max_chars: int) -> str:
+def summarize_frame_markdown(
+    frame_markdown: str,
+    max_chars: int,
+    *,
+    sampling: str = "head",
+    frame_json_path: str | None = None,
+) -> str:
     text = (frame_markdown or "").strip()
+    if not text and not frame_json_path:
+        return "（无抽帧描述）"
+
+    strategy = (sampling or "head").strip().lower()
+    if strategy == "timeline_uniform":
+        json_path = (frame_json_path or "").strip()
+        if json_path and os.path.isfile(json_path):
+            from app.services.documentary.frame_timeline_sampling import (
+                frame_analysis_to_timeline_sampled_markdown,
+            )
+
+            sampled = frame_analysis_to_timeline_sampled_markdown(json_path, max_chars)
+            if sampled and not sampled.startswith("错误:"):
+                return sampled
+        logger.warning("时间轴均匀采样失败，回退为 Markdown 顺序截断")
+
     if not text:
         return "（无抽帧描述）"
     if len(text) <= max_chars:
         return text
     return text[: max_chars - 20].rstrip() + "\n…（抽帧摘要已截断）"
+
+
+def _frame_summary_usable(frame_summary: str) -> bool:
+    text = (frame_summary or "").strip()
+    return bool(text) and text not in {"（无抽帧描述）", "（无）"}
+
+
+def build_plot_blueprint_material_principles(
+    *,
+    has_srt_subtitle: bool = False,
+    has_frame_subtitle: bool = False,
+    theme: str = "",
+    settings: dict[str, Any] | None = None,
+) -> str:
+    """构思蓝图：抽帧为主（画面/场景），SRT 为辅（对白/时间戳）；无 SRT 时回退抽帧内字幕。"""
+    if has_srt_subtitle:
+        srt_line = (
+            "- **SRT 字幕（对白/时间戳主）**：下方 `<subtitles>` 为原始 SRT；"
+            "剧情主线、台词原文、OST=1 时间戳**以 SRT 为准**"
+        )
+    else:
+        srt_line = ""
+
+    if has_frame_subtitle:
+        if has_srt_subtitle:
+            frame_sub_line = (
+                "- **抽帧内字幕（辅）**：`<frame_subtitles>` 与「抽帧字幕人物索引」用于声画对位；"
+                "与 SRT 冲突时**台词/时间戳以 SRT 为准**，画面以抽帧为准"
+            )
+        else:
+            frame_sub_line = (
+                "- **对白字幕（取自抽帧）**：使用下方 `<subtitles>` 与「抽帧字幕人物索引」中的 "
+                "subtitle_entries.text / burned_in_subtitle"
+            )
+    elif has_srt_subtitle:
+        frame_sub_line = ""
+    else:
+        frame_sub_line = (
+            "- **对白字幕（暂无）**：未提供 SRT，且抽帧 JSON 中未提取到 subtitle_entries / 硬字幕；"
+            "时间戳与对白须从抽帧 scene_segments 时间段与 observation 推断，禁止编造"
+        )
+
+    subtitle_lines = "\n".join(
+        line for line in (srt_line, frame_sub_line) if line
+    )
+    name_unification = build_plot_blueprint_name_unification_section(
+        theme=theme,
+        settings=settings,
+    )
+    cfg = settings or get_documentary_compact_settings()
+    lead_sec = int(cfg.get("ost0_lead_before_ost1_sec", 10) or 10)
+    return f"""## 素材优先级（构思蓝图 · 硬性）
+- **抽帧（主·画面/场景）**：时间线、action/observation、场景/昼夜/人物动作 — **画面须与抽帧一致**
+- **剧集人物关系对照（辅）**：理解剧情、校正人名/关系/阵营；**不得覆盖或否定抽帧中已出现的画面**
+{subtitle_lines}
+- 情节点须能在抽帧与字幕中找到依据；禁止编造未支持的场景、台词或时间戳
+
+## OST=0 取画时间（声画对位 · 硬性）
+- **`_id` 播放顺序 ≠ 原片时间顺序**；但 OST=0 的 `timestamp` 必须对准**本段解说所描述/引出的画面**
+- **铺垫引出下一段 OST=1**：OST=0 的 `timestamp` **起点** = 下一段 OST=1 开始时间 **− 约 {lead_sec} 秒**（从抽帧取该时段画面）；禁止全片 OST=0 堆在片头同一区间
+- **原声播完后的 OST=0 点评**：`timestamp` 取**上一段 OST=1** 同场景区间
+- 规划「成片叙事顺序」时每条 OST=0 须写清：**对应原片 HH:MM:SS,mmm 起点（相对下一段/上一段 OST=1）**
+
+{name_unification}
+"""
+
+
+def _append_plot_blueprint_material_sections(
+    prompt: str,
+    *,
+    frame_summary: str,
+    subtitle_excerpt: str,
+    has_subtitle: bool,
+    source_note: str,
+    for_plot_blueprint: bool,
+    frame_subtitle_excerpt: str = "",
+    has_srt_subtitle: bool = False,
+    has_frame_subtitle: bool = False,
+) -> str:
+    if for_plot_blueprint:
+        if has_srt_subtitle:
+            subtitle_block = (
+                f"<subtitles>\n"
+                f"<!-- 来源：SRT 字幕文件（对白/时间戳第一依据） -->\n"
+                f"{subtitle_excerpt}\n"
+                f"</subtitles>"
+            )
+            if has_frame_subtitle and (frame_subtitle_excerpt or "").strip():
+                subtitle_block += (
+                    f"\n\n<frame_subtitles>\n"
+                    f"<!-- 来源：抽帧 JSON subtitle_entries / 硬字幕（声画对位参照） -->\n"
+                    f"{frame_subtitle_excerpt}\n"
+                    f"</frame_subtitles>"
+                )
+        elif has_subtitle:
+            subtitle_block = (
+                f"<subtitles>\n"
+                f"<!-- 来源：抽帧 JSON 内 subtitle_entries / 硬字幕 -->\n"
+                f"{subtitle_excerpt}\n"
+                f"</subtitles>"
+            )
+        else:
+            subtitle_block = (
+                "<subtitles>\n"
+                "<!-- 暂无 SRT 与抽帧内字幕；对白见抽帧摘要与字幕人物索引 -->\n"
+                "</subtitles>"
+            )
+        return (
+            prompt
+            + f"""
+
+<video_frame_summary>
+<!-- 构思蓝图 · 画面/场景第一依据 · 须逐项对照 -->
+{frame_summary}
+</video_frame_summary>
+
+{subtitle_block}
+"""
+        )
+    return (
+        prompt
+        + f"""
+
+<video_frame_summary>
+{frame_summary}
+</video_frame_summary>
+
+<subtitles>
+<!-- 来源：{source_note} -->
+{subtitle_excerpt}
+</subtitles>
+"""
+    )
 
 
 def analyze_subtitle_with_frames(
@@ -517,36 +1381,163 @@ def analyze_subtitle_with_frames(
     progress_callback: Optional[Callable[[str], None]] = None,
     documentary_settings: Optional[dict[str, Any]] = None,
     analysis_style: str = "documentary",
+    frame_json_path: str | None = None,
+    for_plot_blueprint: bool = False,
+    source_duration_sec: float | None = None,
 ) -> str:
-    """文本模型：结合字幕与抽帧摘要做对照分析。"""
-    if not (subtitle_content or "").strip():
-        return ""
+    """文本模型：结合字幕与抽帧摘要做对照分析。
 
+    for_plot_blueprint=True 时以抽帧画面为主；有 SRT 时对白/时间戳以 SRT 为准，抽帧内字幕作辅。
+    """
     cfg = documentary_settings or get_documentary_settings()
-    subtitle_excerpt = truncate_subtitle_content(
-        subtitle_content,
-        int(cfg.get("subtitle_analysis_max_subtitle_chars", 12000) or 12000),
-    )
+    is_short_drama = (analysis_style or "").strip().lower() == "short_drama"
+
+    has_subtitle = False
+    has_srt_subtitle = False
+    has_frame_subtitle = False
+    subtitle_excerpt = ""
+    frame_subtitle_excerpt = ""
+    subtitle_source = ""
+    if for_plot_blueprint:
+        srt_text, frame_text, subtitle_source = resolve_subtitles_for_plot_blueprint(
+            subtitle_content=subtitle_content,
+            frame_json_path=frame_json_path,
+        )
+        has_srt_subtitle = bool(srt_text)
+        has_frame_subtitle = bool(frame_text)
+        has_subtitle = has_srt_subtitle or has_frame_subtitle
+        max_sub_chars = int(cfg.get("subtitle_analysis_max_subtitle_chars", 12000) or 12000)
+        if has_srt_subtitle:
+            subtitle_excerpt = truncate_subtitle_content(srt_text, max_sub_chars)
+        if has_frame_subtitle:
+            frame_subtitle_excerpt = truncate_subtitle_content(frame_text, max_sub_chars)
+            if not has_srt_subtitle:
+                subtitle_excerpt = frame_subtitle_excerpt
+    else:
+        resolved_content, subtitle_source = resolve_subtitle_content_for_plot_analysis(
+            subtitle_content=subtitle_content,
+            frame_json_path=frame_json_path,
+        )
+        has_subtitle = bool((resolved_content or "").strip())
+        if has_subtitle:
+            subtitle_excerpt = truncate_subtitle_content(
+                resolved_content,
+                int(cfg.get("subtitle_analysis_max_subtitle_chars", 12000) or 12000),
+            )
+
+    frame_max_chars = int(cfg.get("subtitle_analysis_max_frame_chars", 8000))
+    frame_sampling = "head"
+    if for_plot_blueprint or is_short_drama:
+        frame_sampling = str(
+            cfg.get("subtitle_analysis_frame_sampling", "timeline_uniform")
+            or "timeline_uniform"
+        ).strip().lower()
+    if for_plot_blueprint:
+        frame_max_chars = max(
+            frame_max_chars,
+            int(cfg.get("subtitle_analysis_max_frame_chars", 20000) or 20000),
+        )
     frame_summary = summarize_frame_markdown(
         frame_markdown,
-        int(cfg.get("subtitle_analysis_max_frame_chars", 8000)),
+        frame_max_chars,
+        sampling=frame_sampling,
+        frame_json_path=frame_json_path,
     )
+    if for_plot_blueprint:
+        if not _frame_summary_usable(frame_summary):
+            logger.warning("构思蓝图：抽帧摘要为空，无法生成")
+            return ""
+    elif not has_subtitle:
+        return ""
     theme = (video_theme or "").strip() or "本视频"
     min_chars = max(200, int(cfg.get("subtitle_analysis_min_chars", 500) or 500))
+    if for_plot_blueprint and is_fazu2_compact_settings(cfg):
+        min_chars = max(min_chars, 1800)
     max_tokens = max(1024, int(cfg.get("subtitle_analysis_max_tokens", 4096) or 4096))
+    frame_lexicon_block = ""
+    frame_lexicon_data: dict = {}
+    drama_knowledge_block = ""
+    drama_known_names: set[str] = set()
+    sd_settings = get_short_drama_settings()
 
-    logger.info(
-        f"字幕×抽帧对照分析输入：字幕 {len(subtitle_excerpt)} 字，"
-        f"抽帧摘要 {len(frame_summary)} 字，要求输出 ≥{min_chars} 字"
-    )
-    if len(subtitle_excerpt) < 100:
-        logger.warning(
-            f"字幕内容过短（{len(subtitle_excerpt)} 字），"
-            "请确认已在页面「确认使用」完整 SRT 文件"
+    if is_short_drama or (for_plot_blueprint and is_fazu2_compact_settings(cfg)):
+        if is_short_drama:
+            min_chars = max(
+                min_chars,
+                int(cfg.get("subtitle_analysis_short_drama_min_chars", 2000) or 2000),
+            )
+            max_tokens = max(
+                max_tokens,
+                int(cfg.get("subtitle_analysis_short_drama_max_tokens", 8192) or 8192),
+            )
+        drama_knowledge_block, drama_known_names = build_short_drama_drama_knowledge_section(
+            theme,
+            cfg,
         )
 
+    json_path = (frame_json_path or "").strip()
+    if json_path and (is_short_drama or is_fazu2_compact_settings(cfg)):
+        lexicon_max = int(cfg.get("subtitle_analysis_frame_lexicon_chars", 4000) or 4000)
+        frame_lexicon_block, frame_lexicon_data = build_frame_subtitle_lexicon_markdown(
+            json_path,
+            max_chars=lexicon_max,
+        )
+
+    source_note = "SRT 字幕文件" if subtitle_source == "srt_file" else "抽帧 JSON 内硬字幕/对位字幕"
+    time_bounds_section = ""
+    frame_time_bounds: dict[str, Any] = {}
+    if for_plot_blueprint and json_path:
+        frame_time_bounds = collect_frame_analysis_time_bounds(json_path)
+        time_bounds_section = build_frame_analysis_time_bounds_section(
+            json_path,
+            source_duration_sec=source_duration_sec,
+        )
+    analysis_label = "字幕×抽帧×剧情构思" if for_plot_blueprint else "字幕×抽帧对照分析"
+    if for_plot_blueprint:
+        srt_info = (
+            f"SRT 字幕有（{len(subtitle_excerpt)} 字）"
+            if has_srt_subtitle
+            else "SRT 字幕无"
+        )
+        frame_info = (
+            f"抽帧内字幕有（{len(frame_subtitle_excerpt)} 字）"
+            if has_frame_subtitle
+            else "抽帧内字幕无"
+        )
+        logger.info(
+            f"{analysis_label}输入：抽帧摘要 {len(frame_summary)} 字（采样 {frame_sampling}），"
+            f"{srt_info}，{frame_info}，要求输出 ≥{min_chars} 字"
+            + (f"，抽帧字幕索引 {len(frame_lexicon_block)} 字" if frame_lexicon_block else "")
+            + (f"，剧集知识库 {len(drama_knowledge_block)} 字" if drama_knowledge_block else "")
+        )
+        if not has_subtitle:
+            logger.warning(
+                "构思蓝图：未提供 SRT 且抽帧 JSON 无 subtitle_entries / 硬字幕，"
+                "对白与时间戳只能从抽帧 observation 推断"
+            )
+    else:
+        logger.info(
+            f"{analysis_label}输入：抽帧摘要 {len(frame_summary)} 字（采样 {frame_sampling}），"
+            f"字幕 {'有' if has_subtitle else '无'}"
+            + (f"（{source_note}，{len(subtitle_excerpt)} 字）" if has_subtitle else "")
+            + f"，要求输出 ≥{min_chars} 字"
+            + (f"，抽帧字幕索引 {len(frame_lexicon_block)} 字" if frame_lexicon_block else "")
+            + (f"，剧集知识库 {len(drama_knowledge_block)} 字" if drama_knowledge_block else "")
+        )
+        if has_subtitle and len(subtitle_excerpt) < 100:
+            logger.warning(
+                f"字幕内容过短（{len(subtitle_excerpt)} 字，来源 {source_note}），"
+                "请确认 SRT 已选用或抽帧 JSON 含 subtitle_entries"
+            )
+
     if progress_callback:
-        progress_callback("正在分析字幕并对照抽帧画面...")
+        if for_plot_blueprint:
+            if has_srt_subtitle:
+                progress_callback("正在分析字幕并对照抽帧构思剧情方案...")
+            else:
+                progress_callback("正在以抽帧为主构思剧情方案...")
+        else:
+            progress_callback("正在分析字幕并对照抽帧画面...")
 
     compact = is_compact_documentary_settings(cfg)
     append_text = resolve_append_custom_prompt(append_custom_prompt, cfg)
@@ -560,7 +1551,113 @@ def analyze_subtitle_with_frames(
 
     if is_fazu2_compact_settings(cfg):
         min_ost1, max_ost1 = compute_ost1_segment_bounds(settings=cfg)
-        prompt = f"""{append_block}你是电视剧「高潮前置型」解说策划。请**以完整字幕为第一依据**，对照抽帧摘要补充画面信息，输出一份**脚本生成蓝图**（800–1200 字，结构化 Markdown，不要 JSON）。
+        ost1_dur_min = int(cfg.get("ost1_duration_min", 8) or 8)
+        ost1_dur_max = int(cfg.get("ost1_duration_max", 18) or 18)
+        lexicon_section = (
+            f"\n{frame_lexicon_block.strip()}\n\n"
+            if frame_lexicon_block.strip()
+            else ""
+        )
+        knowledge_section = (
+            f"\n{drama_knowledge_block.strip()}\n\n"
+            if drama_knowledge_block.strip()
+            else ""
+        )
+        if for_plot_blueprint:
+            principles = build_plot_blueprint_material_principles(
+                has_srt_subtitle=has_srt_subtitle,
+                has_frame_subtitle=has_frame_subtitle,
+                theme=theme,
+                settings=cfg,
+            )
+            blueprint_read_hint = (
+                "请**深读 SRT 字幕（对白/时间戳第一依据）**并**对照下方抽帧摘要（画面/场景第一依据）**"
+                if has_srt_subtitle
+                else "请**深读下方抽帧摘要（第一依据）**"
+            )
+            blueprint_analysis_rules = (
+                """- **先通读 SRT 字幕**：按时间线梳理剧情主线、对白与关键台词
+- **再对照抽帧**：场景、人物、动作、昼夜须与 scene_segments / 锚点表一致
+- **交叉验证**：抽帧 subtitle_entries / 硬字幕与 SRT 不一致时，**台词/时间戳以 SRT 为准**，画面以抽帧为准"""
+                if has_srt_subtitle
+                else """- **先通读抽帧**：按 scene_segments 时间线梳理场景、人物、动作、subtitle_entries / 硬字幕"""
+            )
+            timestamp_rule = (
+                "**优先来自 SRT**，且须落在上方「抽帧时间边界与场景锚点」上限内；禁止编造、禁止超出原片/抽帧上限"
+                if has_srt_subtitle
+                else "**仅**能使用上方「抽帧时间边界与场景锚点」表内或抽帧摘要中的真实时间；**禁止编造、禁止超出原片/抽帧上限**"
+            )
+            ost1_source = "SRT / 抽帧字幕索引" if has_srt_subtitle else "抽帧/字幕索引"
+            ost1_text_priority = (
+                "优先 SRT 原文，其次 subtitle_entries.text"
+                if has_srt_subtitle
+                else "优先 subtitle_entries.text"
+            )
+            prompt = f"""{append_block}{principles}
+{time_bounds_section}
+{knowledge_section}{lexicon_section}你是电视剧「高潮前置型」解说策划。{blueprint_read_hint}，结合剧集人物关系对照理解剧情，输出**脚本生成蓝图**（**1800–3500 字**，结构化 Markdown，不要 JSON）。
+
+作品/主题：{theme}
+
+## 分析原则（硬性）
+{blueprint_analysis_rules}
+- **再用剧集对照校正**：人名/关系/阵营与对照表对齐；**谐音/ASR 错字须归并为同一人**（见上方「人名谐音/ASR 归并」）
+- **时间戳**：{timestamp_rule}
+- **画面**：须与锚点表同段 observation 一致；性别/职级以**抽帧可见信息**为准（胡小跃=男刑警），勿凭错误 ASR 写成女性
+
+必须按以下标题逐项填写（缺一不可）：
+
+## 本集识别
+- 作品名；是否**全剧第 1 集**（决定转场句用固定句还是自拟）
+
+## 主要人物表
+- **每人只列一行**：用对照表**规范全名**；subtitle 中的谐音/简称（小月、秦峰、罗伯、老叶等）须归并到同一人，括号注明「又名/字幕常写：…」
+- 身份/关系 + **性别（据抽帧）**；须能在抽帧或对照表中找到依据
+- **禁止**因 ASR 谐音拆成两个角色（如「小月」与「胡小跃」不得各占一行）
+
+## 开头高潮方案（→ JSON 第 1 段 OST=1）
+- **默认优先**：胡小跃**楼顶跳楼牺牲**（夜色楼顶纵身跃下），金句优先「天就快亮了。」+ **精确时间戳**
+- **禁止**用中段台词顶替跳楼作第 1 段；须与抽帧中该场面时间段一致
+- 动作描述结合抽帧；昼夜/光线须与画面一致
+- **转场句建议**：第2段用「宝子们」+「故事，得从头讲起。」
+- 若用户追加要求已指定开头名场面，本节**只写该场面**
+
+## 正叙时间线（→ JSON 主体 OST=0，按片头时间顺序）
+- 至少 **8–12 个情节点**，每点含：**时间段**、人名、事件摘要
+- 标注哪些点适合加小钩子（「您猜怎么着？」等）
+
+## OST=1 金句清单（{min_ost1}–{max_ost1} 条，时间戳须来自{ost1_source}）
+- 每条：说话人 + 台词原文（{ost1_text_priority}）+ **精确时间戳** + 用途
+- **timestamp 须为连续对白块，时长 {ost1_dur_min}–{ost1_dur_max} 秒**；禁止 2–6 秒单句碎段
+- 若单句对白不足 {ost1_dur_min} 秒，须**合并前后相邻字幕**为一条连续 HH:MM:SS,mmm-HH:MM:SS,mmm
+
+## 高潮复现方案（→ JSON 正叙相应位置 · 硬性）
+- 正叙推进到**第 1 段开篇高潮**的原片时刻时，须规划 **1 个 OST=1 复现段**
+- 复现段与第 1 段 **timestamp / 台词 / 画面相同**（picture 可加「【复现】」）；不是另选中段台词
+- 收尾可再次呼应，但**不能替代**正叙中的这次复现
+
+## 高潮之后 + 下集钩子（→ JSON 末段）
+- 本集高潮之后的关键情节（2–3 点）
+- 下集悬念/预告（1–2 句）
+
+## 声画对位注意
+- 抽帧内部不一致处、易写错的昼夜/光线镜头
+- 正叙开场勿写「第几集」，用「宝子们，一起来看《作品名》。」即可
+
+禁忌：不要警员1/说话人1；不要镜头/导演分析；不要然后/接着；不要编造抽帧未出现的场景或时间戳
+"""
+            system_prompt = (
+                "你是影视解说策划，擅长以抽帧画面梳理高潮前置型短视频脚本。"
+                "输出结构化策划蓝图，时间戳与对白须有据于抽帧；"
+                "谐音/ASR 人名须归并为同一人，不要 JSON。"
+            )
+        else:
+            subtitle_source_hint = (
+                "原始 SRT 字幕文件"
+                if subtitle_source == "srt_file"
+                else "抽帧 JSON 内硬字幕（原样提取，无 SRT 时以此为准）"
+            )
+            prompt = f"""{append_block}{lexicon_section}你是电视剧「高潮前置型」解说策划。请**以完整字幕为第一依据**（当前来源：{subtitle_source_hint}），对照抽帧摘要补充画面信息，输出一份**脚本生成蓝图**（800–1200 字，结构化 Markdown，不要 JSON）。
 
 作品/主题：{theme}
 
@@ -570,8 +1667,8 @@ def analyze_subtitle_with_frames(
 - 作品名；是否**全剧第 1 集**（决定转场句用固定句还是自拟）
 
 ## 主要人物表
-- 姓名 + 身份/关系 + **性别（据字幕/抽帧）**（如胡小跃-刑警-男、伟业-局长-男）
-- 标注各角色性别，供后续 narration/picture 对照画面，避免张冠李戴
+- 姓名/昵称/关系称呼 + 身份/关系 + **性别（据字幕/抽帧）**（如胡小跃-刑警-男、老叶-局长-男、文妈-养母-女）
+- 字幕中的**小名、昵称、关系称呼**（老叶、小跃、师傅等）须原样使用，可对照人物关系表映射到全名，禁止擅自改名
 
 ## 开头高潮方案（→ JSON 第 1 段 OST=1）
 - **默认优先**：胡小跃**楼顶跳楼牺牲**（夜色楼顶纵身跃下），金句优先「天就快亮了。」+ 字幕精确时间戳
@@ -586,9 +1683,13 @@ def analyze_subtitle_with_frames(
 
 ## OST=1 金句清单（{min_ost1}–{max_ost1} 条，时间戳必须来自字幕）
 - 每条：说话人姓名 + 台词原文 + **精确时间戳** + 用途（开头/中段爆点/高潮复现）
+- **timestamp 须为连续对白块，时长 {ost1_dur_min}–{ost1_dur_max} 秒**；禁止 2–6 秒单句碎段
+- 若单句不足 {ost1_dur_min} 秒，须合并相邻字幕为一条连续区间
 
-## 高潮复现方案（→ JSON 中后段 1 个 OST=1）
-- 复用哪句金句、时间戳、加强情绪的方向
+## 高潮复现方案（→ JSON 正叙相应位置 · 硬性）
+- 正叙推进到**第 1 段开篇高潮**的原片时刻时，须规划 **1 个 OST=1 复现段**
+- 复现段与第 1 段 **timestamp / 台词 / 画面相同**（picture 可加「【复现】」）；不是另选中段台词
+- 收尾可再次呼应，但**不能替代**正叙中的这次复现
 
 ## 高潮之后 + 下集钩子（→ JSON 末段）
 - 本集高潮之后的关键情节（2–3 点）
@@ -601,39 +1702,197 @@ def analyze_subtitle_with_frames(
 
 禁忌：不要警员1/说话人1；不要镜头/导演分析；不要然后/接着；不要编造时间戳；不要臆造与抽帧不符的环境氛围
 """
-        system_prompt = (
-            "你是影视解说策划，擅长高潮前置型短视频脚本。"
-            "输出结构化策划蓝图，时间戳必须来自字幕原文，不要 JSON。"
-        )
+            system_prompt = (
+                "你是影视解说策划，擅长高潮前置型短视频脚本。"
+                "输出结构化策划蓝图，时间戳必须来自字幕原文，不要 JSON。"
+            )
     elif compact:
-        prompt = f"""请以**原始字幕为主**、抽帧画面摘要为辅，输出供精剪脚本使用的对照分析（350–550 字）。
+        if for_plot_blueprint:
+            principles = build_plot_blueprint_material_principles(
+                has_srt_subtitle=has_srt_subtitle,
+                has_frame_subtitle=has_frame_subtitle,
+                theme=theme,
+                settings=cfg,
+            )
+            compact_subtitle_hint = (
+                "SRT 字幕与抽帧画面摘要"
+                if has_srt_subtitle
+                else "抽帧画面摘要"
+            )
+            prompt = f"""{append_block}{principles}请以**{compact_subtitle_hint}**为主、剧集对照为辅，输出供精剪脚本使用的对照分析（350–550 字）。
+
+作品/主题：{theme}
+
+请包含：剧情主线（{"SRT + 抽帧时间线" if has_srt_subtitle else "抽帧时间线"}）、建议 OST=1 时刻（带时间戳）、写脚本注意点。
+"""
+            system_prompt = (
+                "你是资深影视解说分析师，擅长字幕与抽帧交叉验证，输出简洁可执行，不要 JSON。"
+                if has_srt_subtitle
+                else "你是资深影视解说分析师，擅长以抽帧梳理剧情，输出简洁可执行，不要 JSON。"
+            )
+        else:
+            prompt = f"""请以**原始字幕为主**、抽帧画面摘要为辅，输出供精剪脚本使用的对照分析（350–550 字）。
 
 作品/主题：{theme}
 
 请包含剧情主线、建议 OST=1 时刻（带时间戳）、写脚本注意点。
 """
-        system_prompt = (
-            "你是资深影视解说分析师，输出简洁可执行，不要 JSON。"
+            system_prompt = (
+                "你是资深影视解说分析师，输出简洁可执行，不要 JSON。"
+            )
+    elif is_short_drama:
+        min_ost1_plot = estimate_min_ost1_entries_for_plot(sd_settings)
+        min_minutes = int(sd_settings.get("target_output_minutes_min", 8) or 8)
+        max_minutes = int(sd_settings.get("target_output_minutes_max", 13) or 13)
+        ost1_dur_min = int(sd_settings.get("ost1_duration_min", 8) or 8)
+        ost1_dur_max = int(sd_settings.get("ost1_duration_max", 18) or 18)
+        lexicon_section = (
+            f"\n{frame_lexicon_block.strip()}\n\n"
+            if frame_lexicon_block.strip()
+            else ""
         )
-    elif (analysis_style or "").strip().lower() == "short_drama":
-        prompt = f"""你是短剧解说策划。请以**原始字幕为主**、抽帧画面摘要为辅，输出供写 JSON 脚本使用的对照分析（600–900 字，结构化 Markdown，不要 JSON）。
+        knowledge_section = (
+            f"\n{drama_knowledge_block.strip()}\n\n"
+            if drama_knowledge_block.strip()
+            else ""
+        )
+        if for_plot_blueprint:
+            principles = build_plot_blueprint_material_principles(
+                has_srt_subtitle=has_srt_subtitle,
+                has_frame_subtitle=has_frame_subtitle,
+                theme=theme,
+                settings=cfg,
+            )
+            sd_blueprint_read_hint = (
+                "请**深读 SRT 字幕（对白/时间戳第一依据）**并**对照下方抽帧摘要（画面/场景第一依据）**"
+                if has_srt_subtitle
+                else "请**深读下方抽帧摘要（第一依据）**"
+            )
+            sd_analysis_rules = (
+                """- **先通读 SRT 字幕**：梳理剧情主线、对白与关键台词
+- **再对照抽帧**：场景、人物、动作、昼夜须与锚点表一致
+- **交叉验证**：抽帧 subtitle_entries 与 SRT 不一致时，**台词/时间戳以 SRT 为准**，画面以抽帧为准"""
+                if has_srt_subtitle
+                else """- **先通读抽帧**：按时间线梳理场景、人物、动作、subtitle_entries / 硬字幕"""
+            )
+            sd_timestamp_rule = (
+                "**优先来自 SRT**，格式 **HH:MM:SS,mmm-HH:MM:SS,mmm**（禁止 `-->`）；须落在抽帧时间边界上限内"
+                if has_srt_subtitle
+                else "**仅**能使用上方「抽帧时间边界与场景锚点」与 subtitle_entries；格式 **HH:MM:SS,mmm-HH:MM:SS,mmm**（禁止 `-->`）；**禁止超出原片/抽帧上限**"
+            )
+            sd_timeline_label = "SRT + 抽帧 chronology" if has_srt_subtitle else "抽帧 chronology"
+            prompt = f"""{append_block}{principles}
+{time_bounds_section}
+{knowledge_section}{lexicon_section}你是顶级短剧解说策划。{sd_blueprint_read_hint}，用剧集人物关系对照理解并校正人名/关系，输出供写 JSON 脚本的**完美剧情构思方案**（**2000–3500 字**，结构化 Markdown，不要 JSON）。
 
 作品/主题：{theme}
 
-必须包含（缺一不可）：
-1. **主要人物表**（姓名、关系、性别须与画面对照）
-2. **开头高潮方案**（→ JSON 第 1 段 OST=1，含精确时间戳）
-3. **正叙时间线**：至少 **10–15 个情节点**，每点含时间段 + 事件摘要（这是后续切段的骨架，禁止只写 3–5 个大段概括）
-4. **建议保留原声 OST=1**：至少 **8–12 条**，每条含台词原文 + 精确时间戳 + 用途
-5. **声画对位注意**（昼夜/光线/表情以抽帧为准，台词以字幕为准；各情节点 time_range 以 subtitle_entries 结束时间定界）
+## 分析原则（硬性）
+{sd_analysis_rules}
+- **再用剧集对照校正**：身份/亲属/阵营须与对照表一致；**谐音/ASR 错字须归并为同一人**（见上方「人名谐音/ASR 归并」）
+- **时间戳**：{sd_timestamp_rule}
+- **画面要点**：性别/表情/动作/场景/昼夜**必须与锚点表同段抽帧一致**；禁止写「场景N」，改用 **时间段+地点**
+- 产出**可执行脚本蓝图**，不是 3–5 段空泛总结
 
-重要：本分析用于指导**细粒度切段**，不是让你把整集压成少量大段；后续 JSON items 须覆盖上述时间线上的多个节点。
+必须按以下标题逐项填写（缺一不可）：
+
+## 主要人物表
+- **每人只列一行**：用对照表**规范全名**；subtitle 谐音/简称须归并到同一人，括号注明「又名/字幕常写：…」
+- 身份/关系 + **性别** + 外貌/气质（抽帧）；须出现在抽帧或对照表
+- **禁止**因写法不同拆成两个角色（如小月/胡小月/胡晓月均指胡小跃）
+
+## 开头高潮方案（→ JSON 第 1 段 OST=1）
+- 从**全片**选最爆燃段落；金句原文 + **HH:MM:SS,mmm-HH:MM:SS,mmm** + 画面（时间段+地点+动作）
+- 第 1 段纯原声，禁止旁白
+
+## 原片时间线（按{sd_timeline_label}，供选材）
+- 至少 **12–16 个情节点**；每点：**抽帧时间段 + 事件 + 画面要点**
+- 标注适合 OST=0 串场 vs OST=1 原声
+
+## 成片叙事顺序方案（→ JSON 的 `_id` 播放顺序 · 重要）
+- **`_id` = 播放顺序**；`timestamp` = 原片裁剪区间，二者独立
+- 写出至少 **18–28 个 `_id` 段**规划（含 OST=0/1），估算能否支撑 **{min_minutes}–{max_minutes} 分钟**成片
+- 每段标注 **OST=0 或 OST=1**（仅写 0/1，勿写错别字）
+- 第 1 段倒叙爆点 → 第 2 段「宝子们，我们开始看{theme}。」→ 末段「宝子们，我们下期再见！」
+
+## 建议保留原声 OST=1（成片原声时长约 70%）
+- **至少 {min_ost1_plot} 条**（含时间戳）；每条：说话人 + 台词原文 + **HH:MM:SS,mmm-HH:MM:SS,mmm** + 画面张力 + 用途
+- **每条 timestamp 须为连续对白块，时长 {ost1_dur_min}–{ost1_dur_max} 秒**（禁止 2–6 秒碎段）
+- 单句对白不足 {ost1_dur_min} 秒时，须合并前后相邻 subtitle_entries 为一条连续区间
+- 同场连续对白可成块规划
+
+## 解说 OST=0 脉络规划（成片解说时长约 30%）
+- 每条 ≥20 字；注明对应原片时间段与承上启下
+- **铺垫下一段 OST=1**：写清取画起点 = 该 OST=1 开始时间 − 约 {int(cfg.get("ost0_lead_before_ost1_sec", 10) or 10)} 秒
+- **点评上一段 OST=1**：写清与上一段原声同场 `timestamp`
+
+## 声画对位注意
+- 抽帧内部不一致处；昼夜光线易错点；声画反差 moment
+
+禁忌：不要警员1/说话人1；不要「场景N」编号；不要 `-->` 时间戳；不要编造抽帧未支持的人名/时间戳
 """
-        system_prompt = (
-            "你是短剧解说策划，擅长高潮前置与快节奏细切。"
-            "输出结构化策划蓝图，时间戳必须来自字幕原文，不要 JSON。"
-        )
-        min_chars = max(min_chars, 500)
+            system_prompt = (
+                "你是短剧解说策划，擅长字幕×抽帧联合梳理剧集剧情。"
+                if has_srt_subtitle
+                else "你是短剧解说策划，擅长以抽帧画面梳理剧集剧情。"
+            ) + (
+                "须依据字幕/抽帧与剧集人物关系对照输出完整 Markdown 蓝图；"
+                "谐音/ASR 人名须归并为同一人，关系须准确，不要 JSON，不要中途截断。"
+            )
+        else:
+            prompt = f"""{append_block}{knowledge_section}{lexicon_section}你是顶级短剧解说策划。请**先熟悉上方「剧集人物关系对照」**，再**同时深读字幕、抽帧画面与「抽帧字幕人物索引」**，交叉验证后输出供写 JSON 脚本的**完美剧情构思方案**（**2000–3500 字**，结构化 Markdown，不要 JSON）。
+
+作品/主题：{theme}
+
+## 分析原则（硬性）
+- **先熟悉剧集人物关系对照，再对照字幕/抽帧**：人物身份、亲属、阵营、对立关系须与对照表一致；禁止臆造或张冠李戴
+- **人名与对白以对照表 + 抽帧字幕索引 + 原始字幕为准**：含**全名、小名、昵称、关系称呼**（老叶、小跃、师傅、文妈等），须与字幕原文一致；可映射全名但勿把 A 的台词写成 B
+- **所有时间戳**必须来自字幕，格式统一为 **HH:MM:SS,mmm-HH:MM:SS,mmm**（用连字符 `-`，**禁止** SRT 箭头 `-->`）
+- **抽帧画面**：人物性别/表情/动作/场景/昼夜光线写入画面要点；**禁止**写「场景1/场景2」等采样编号，改用 **原片时间段+地点**（如 `00:03:20 废弃厂区·灌木潜行`）
+- 字幕与画面冲突：**台词/时间戳以字幕为准**，画面描述以抽帧为准
+- 产出**可执行脚本蓝图**，不是 3–5 段空泛总结
+
+必须按以下标题逐项填写（缺一不可）：
+
+## 主要人物表
+- 姓名（**须出现在剧集对照表或抽帧字幕/索引中**）+ 身份/关系（**与对照表一致**）+ **性别** + 外貌/气质（抽帧）
+- 相似或简称须与对照表一致（如胡小跃禁止写胡小月；秦枫禁止秦峰），**禁止混用不同角色的名字**
+
+## 开头高潮方案（→ JSON 第 1 段 OST=1）
+- 从**全片**选最爆燃段落；金句原文 + **HH:MM:SS,mmm-HH:MM:SS,mmm** + 画面（时间段+地点+动作）
+- 第 1 段纯原声，禁止旁白
+
+## 原片时间线（按字幕 chronology，供选材）
+- 至少 **12–16 个情节点**；每点：**时间段 + 事件 + 画面要点（勿写场景N）**
+- 标注适合 OST=0 串场 vs OST=1 原声
+
+## 成片叙事顺序方案（→ JSON 的 `_id` 播放顺序 · 重要）
+- **`_id` = 播放顺序**；`timestamp` = 原片裁剪区间，二者独立
+- 写出至少 **18–28 个 `_id` 段**规划（含 OST=0/1），估算能否支撑 **{min_minutes}–{max_minutes} 分钟**成片
+- 每段标注 **OST=0 或 OST=1**（仅写 0/1，勿写错别字）
+- 第 1 段倒叙爆点 → 第 2 段「宝子们，我们开始看{theme}。」→ 末段「宝子们，我们下期再见！」
+
+## 建议保留原声 OST=1（成片原声时长约 70%）
+- **至少 {min_ost1_plot} 条**（含时间戳）；每条：说话人 + 台词原文 + **HH:MM:SS,mmm-HH:MM:SS,mmm** + 画面张力 + 用途
+- **每条 timestamp 须为连续对白块，时长 {ost1_dur_min}–{ost1_dur_max} 秒**（禁止 2–6 秒碎段）
+- 单句对白不足 {ost1_dur_min} 秒时，须合并相邻字幕为一条连续区间
+- 同场连续对白可成块规划
+
+## 解说 OST=0 脉络规划（成片解说时长约 30%）
+- 每条 ≥20 字；注明对应原片时间段与承上启下
+- **铺垫下一段 OST=1**：写清取画起点 = 该 OST=1 开始时间 − 约 {int(cfg.get("ost0_lead_before_ost1_sec", 10) or 10)} 秒
+- **点评上一段 OST=1**：写清与上一段原声同场 `timestamp`
+
+## 声画对位注意
+- 字幕/画面不一致处；昼夜光线易错点；声画反差 moment
+
+禁忌：不要警员1/说话人1；不要「场景N」编号；不要 `-->` 时间戳；不要编造人名/时间戳
+"""
+            system_prompt = (
+                "你是短剧解说策划，擅长剧集人物关系梳理与字幕×画面联合分析。"
+                "须先依据提供的剧集人物关系对照熟悉全剧，再输出完整 Markdown 蓝图；"
+                "人名、关系、对白归属必须准确，不要 JSON，不要中途截断。"
+            )
     else:
         prompt = f"""你是一位拥有 30 年经验的资深解说员，请以**原始字幕为主**、抽帧画面摘要为辅，输出供写脚本使用的对照分析（300–500 字）。
 
@@ -650,16 +1909,17 @@ def analyze_subtitle_with_frames(
             "输出简洁、可执行，不要 JSON。"
         )
 
-    prompt = prompt + f"""
-
-<video_frame_summary>
-{frame_summary}
-</video_frame_summary>
-
-<subtitles>
-{subtitle_excerpt}
-</subtitles>
-"""
+    prompt = _append_plot_blueprint_material_sections(
+        prompt,
+        frame_summary=frame_summary,
+        subtitle_excerpt=subtitle_excerpt,
+        has_subtitle=has_subtitle,
+        source_note=source_note,
+        for_plot_blueprint=for_plot_blueprint,
+        frame_subtitle_excerpt=frame_subtitle_excerpt,
+        has_srt_subtitle=has_srt_subtitle,
+        has_frame_subtitle=has_frame_subtitle,
+    )
 
     text_provider = config.app.get("text_llm_provider", "openai").lower()
     api_key = config.app.get(f"text_{text_provider}_api_key")
@@ -671,9 +1931,23 @@ def analyze_subtitle_with_frames(
 
     analysis_temperature = 0.35 if is_fazu2_compact_settings(cfg) else 0.7
     fazu2 = is_fazu2_compact_settings(cfg)
-    max_attempts = 3 if fazu2 else 2
+    validation_settings = cfg if (fazu2 or for_plot_blueprint) else sd_settings
+    if for_plot_blueprint:
+        max_attempts = 3
+    elif is_short_drama:
+        max_attempts = 3
+    else:
+        max_attempts = 3 if fazu2 else 2
     current_prompt = prompt
     analysis = ""
+    last_validation: dict = {}
+    source_duration_ms = (
+        int(float(source_duration_sec) * 1000)
+        if source_duration_sec and source_duration_sec > 0
+        else None
+    )
+    frame_max_ms = int(frame_time_bounds.get("max_ms") or 0) or None
+    frame_min_ms = int(frame_time_bounds.get("min_ms") or 0)
 
     try:
         for attempt in range(max_attempts):
@@ -689,13 +1963,99 @@ def analyze_subtitle_with_frames(
                 for_script=True,
             )
             analysis = (result or "").strip()
+
+            if for_plot_blueprint:
+                last_validation = validate_plot_blueprint(
+                    analysis,
+                    source_duration_ms=source_duration_ms,
+                    frame_max_ms=frame_max_ms,
+                    frame_min_ms=frame_min_ms,
+                    settings=validation_settings,
+                    lexicon=frame_lexicon_data,
+                    drama_known_names=drama_known_names,
+                    min_chars=min_chars,
+                    require_all_sections=is_short_drama
+                    or not is_fazu2_compact_settings(cfg),
+                )
+                emit_plot_blueprint_validation_report(last_validation)
+                if last_validation.get("ok"):
+                    emit_plot_analysis_full_text(
+                        analysis,
+                        title=f"{analysis_label} · 完美剧情构思方案",
+                    )
+                    logger.info(f"{analysis_label}完成，约 {len(analysis)} 字")
+                    return analysis
+                if attempt + 1 >= max_attempts:
+                    logger.warning(
+                        "构思蓝图校验未完全通过，返回最后一次输出（请人工修正时间戳与画面对位）"
+                    )
+                    emit_plot_analysis_full_text(
+                        analysis,
+                        title=f"{analysis_label} · 完美剧情构思方案（校验未通过）",
+                    )
+                    return analysis
+                issue_lines = "\n".join(
+                    f"- {item}" for item in (last_validation.get("issues") or [])
+                )
+                cap_label = ""
+                if last_validation.get("hard_cap_ms"):
+                    from app.services.srt_utils import format_timestamp_ms
+
+                    cap_label = format_timestamp_ms(int(last_validation["hard_cap_ms"]))
+                cap_hint = (
+                    f"所有 timestamp 不得超过 **{cap_label}**；"
+                    if cap_label
+                    else ""
+                )
+                current_prompt = (
+                    prompt
+                    + f"\n\n## 重试要求（第 {attempt + 2} 次 · 须修正以下问题）\n"
+                    f"{issue_lines}\n"
+                    f"{cap_hint}"
+                    f"必须输出完整方案，**不少于 {min_chars} 字**；"
+                    "时间戳须来自「抽帧时间边界与场景锚点」表；"
+                    "画面描述须与锚点表 observation 一致；"
+                    "胡小跃/小跃为男性刑警；禁止 OST=1 2–6 秒碎段。"
+                )
+                continue
+
+            if is_short_drama:
+                last_validation = validate_short_drama_plot_analysis(
+                    analysis,
+                    lexicon=frame_lexicon_data,
+                    drama_known_names=drama_known_names,
+                    settings=sd_settings,
+                    min_chars=min_chars,
+                )
+                logger.info(format_plot_analysis_validation_report(last_validation))
+                if last_validation.get("ok"):
+                    logger.info(f"{analysis_label}完成，约 {len(analysis)} 字")
+                    return analysis
+                if attempt + 1 >= max_attempts:
+                    logger.warning(
+                        "短剧联合构思校验未完全通过，返回最后一次输出（最佳努力）"
+                    )
+                    return analysis
+                issue_lines = "\n".join(
+                    f"- {item}" for item in (last_validation.get("issues") or [])
+                )
+                current_prompt = (
+                    prompt
+                    + f"\n\n## 重试要求（第 {attempt + 2} 次 · 须修正以下问题）\n"
+                    f"{issue_lines}\n"
+                    f"必须输出完整方案，**不少于 {min_chars} 字**，"
+                    "按全部标题逐项填写；人名/关系须与剧集对照表一致、对白以字幕为准；"
+                    "时间戳用 HH:MM:SS,mmm-HH:MM:SS,mmm；禁止「场景N」。"
+                )
+                continue
+
             if len(analysis) >= min_chars or (not fazu2 and len(analysis) >= 200):
-                logger.info(f"字幕×抽帧对照分析完成，约 {len(analysis)} 字")
+                logger.info(f"{analysis_label}完成，约 {len(analysis)} 字")
                 return analysis
 
             preview = analysis[:120].replace("\n", " ")
             logger.warning(
-                f"字幕×抽帧对照分析过短（{len(analysis)} 字），"
+                f"{analysis_label}过短（{len(analysis)} 字），"
                 f"预览: {preview!r}，重试 {attempt + 1}/{max_attempts}"
             )
             if attempt + 1 >= max_attempts:
@@ -709,10 +2069,10 @@ def analyze_subtitle_with_frames(
             )
 
         if analysis:
-            logger.warning(f"字幕×抽帧对照分析仍未达标，最终仅 {len(analysis)} 字")
+            logger.warning(f"{analysis_label}仍未达标，最终仅 {len(analysis)} 字")
         return analysis
     except Exception as exc:
-        logger.warning(f"字幕×抽帧对照分析失败，将仅注入原始字幕: {exc}")
+        logger.warning(f"{analysis_label}失败: {exc}")
         return ""
 
 
@@ -727,6 +2087,12 @@ def build_subtitle_narration_sections(
     if not cfg.get("enable_subtitle_enrichment", True):
         return []
     if not (subtitle_content or "").strip():
+        if (subtitle_analysis or "").strip():
+            if is_fazu2_compact_settings(cfg):
+                title = "## 完美剧情构思方案（脚本生成主依据 · 无原始字幕附件）"
+            else:
+                title = "## 剧情构思方案（脚本生成主依据）"
+            return [f"{title}\n{subtitle_analysis.strip()}"]
         return []
 
     sections: list[str] = [

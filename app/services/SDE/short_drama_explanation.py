@@ -109,9 +109,12 @@ class SubtitleAnalyzer:
                 subtitle_frame_analysis
                 or "（未提供字幕×抽帧对照分析，请主要依据剧情概述与字幕）"
             )
-            parameters["segment_count_hint"] = self.script_extra_params.get(
-                "segment_count_hint",
-                "按字幕长度自然切段，保持快节奏细切，不要人为压缩段数。",
+            parameters["output_duration_hint"] = self.script_extra_params.get(
+                "output_duration_hint",
+                self.script_extra_params.get(
+                    "segment_count_hint",
+                    "按字幕剧情自然切段，成片总时长 8–13 分钟，解说/原声约 3:7。",
+                ),
             )
             from app.services.short_drama_settings import get_short_drama_script_prompt_params
 

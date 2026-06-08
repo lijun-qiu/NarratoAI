@@ -25,18 +25,21 @@ from app.services.documentary.documentary_material_resolver import (
 )
 from app.services.documentary.documentary_subtitle_enrichment import (
     analyze_subtitle_with_frames,
+    extract_subtitle_srt_from_frame_analysis,
     truncate_subtitle_content,
 )
 from app.services.documentary.opening_climax_resolver import apply_opening_climax_fix
 from app.services.short_drama_settings import (
-    compute_short_drama_ost_bounds,
-    compute_short_drama_segment_bounds,
     get_short_drama_script_prompt_params,
     get_short_drama_settings,
 )
 from app.services.short_drama_script_optimizer import (
     optimize_short_drama_script_items,
-    validate_short_drama_script_counts,
+    pick_best_short_drama_script_candidate,
+    repair_short_drama_script_timestamps,
+    score_short_drama_script_quality,
+    validate_short_drama_script_duration,
+    validate_short_drama_script_timestamps,
 )
 from app.services.generate_narration_script import parse_frame_analysis_to_markdown
 from app.utils.video_processor import VideoProcessor
@@ -44,6 +47,7 @@ from app.utils.video_processor import VideoProcessor
 import app.services.llm  # 这会触发提供商注册
 from app.services.llm.migration_adapter import SubtitleAnalyzerAdapter
 import re
+from webui.tools.plot_blueprint_workflow import get_plot_blueprint, save_plot_blueprint
 
 
 def parse_and_fix_json(json_string):
@@ -181,36 +185,78 @@ def _prepare_frame_summary(analysis_json_path: str, doc_settings: dict) -> str:
     return markdown_output
 
 
-def _build_segment_count_hint(
-    *,
-    enabled: bool,
-    min_segments: int,
-    max_segments: int,
-    sd_settings: dict | None = None,
-) -> str:
+def _build_output_duration_hint(*, sd_settings: dict | None = None) -> str:
     cfg = sd_settings or get_short_drama_settings()
     narr_pct = int(cfg.get("narration_percent", 30))
     orig_pct = int(cfg.get("original_audio_percent", 70))
-    expected = (min_segments + max_segments) // 2
-    bounds = compute_short_drama_ost_bounds(expected, cfg)
-    ratio_block = (
-        f"- **解说 OST=0 约 {narr_pct}%**，**原声 OST=1 约 {orig_pct}%**（按 `_id` 播放顺序统计段数，不是按 timestamp）\n"
-        f"- **OST=0 至少 {bounds['ost0_min']} 段**，**OST=1 最多 {bounds['ost1_max']} 段**；"
-        f"**同场可连续 {cfg.get('max_consecutive_ost1', 4)} 段 OST=1，整块播完再 OST=0**；"
-        f"以成片时长 3:7 为准，OST=0 至少 {bounds['ost0_min']} 段\n"
-        f"- 情节点之间须 OST=0 串场；同场可连续 {cfg.get('max_consecutive_ost1', 4)} 段 OST=1 成块\n"
-    )
-    if not enabled:
-        return (
-            "按字幕长度自然切段，保持快节奏细切，不要人为压缩段数。\n"
-            + ratio_block
-        )
+    min_min = int(cfg.get("target_output_minutes_min", 8))
+    max_min = int(cfg.get("target_output_minutes_max", 13))
+    narr_chars_min = int(cfg.get("narration_chars_min", 20))
+    narr_chars_max = int(cfg.get("narration_chars_max", 120))
+    ost1_min = int(cfg.get("ost1_duration_min", 8))
+    ost1_max = int(cfg.get("ost1_duration_max", 18))
+    ost0_min = int(cfg.get("ost0_duration_min", 5))
+    max_run = int(cfg.get("max_consecutive_ost1", 4))
     return (
-        f"- **items 总数须达到 {min_segments}–{max_segments} 段**（低于 {min_segments} 段视为无效输出）\n"
-        f"- 对照分析中的情节点须落实，但**以 OST=0 解说串场为主、OST=1 原声点睛为辅**\n"
-        f"- 1/3 成片时长靠**合理切段 + 原声时长**达成，不是靠堆满 OST=1\n"
-        + ratio_block
+        f"- **成片总时长目标 {min_min}–{max_min} 分钟**（按 `_id` 播放顺序累加各段时长估算）\n"
+        f"- **不限制段数**；解说 vs 原声成片时长约 **{narr_pct}:{orig_pct}**\n"
+        f"- **每段须完整表达一条脉络**，禁止过短碎段：\n"
+        f"  - OST=0 解说每段 **{narr_chars_min}–{narr_chars_max} 字**（估算 ≥{ost0_min} 秒）\n"
+        f"  - OST=1 原声每段 **{ost1_min}–{ost1_max} 秒**，覆盖整句对白\n"
+        f"- 同场可连续 **{max_run} 段 OST=1** 成块播完，再接 OST=0 串场/点评\n"
+        f"- 情节点之间用 OST=0 串场；同一场戏内可连续多段 OST=1\n"
     )
+
+
+def _log_plot_analysis_block(title: str, content: str) -> None:
+    """将剧情构思/分析方案完整输出到控制台。"""
+    text = (content or "").strip()
+    separator = "=" * 72
+    if not text:
+        logger.info(f"\n{separator}\n{title}（空）\n{separator}")
+        return
+    logger.info(f"\n{separator}\n{title}\n{separator}\n{text}\n{separator}")
+
+
+def _log_short_drama_validation_report(
+    *,
+    stage: str,
+    attempt: int | None,
+    dur_validation: dict,
+    ts_validation: dict,
+    item_count: int = 0,
+) -> None:
+    """每次校验后将成片时长/时间戳达标情况输出到控制台。"""
+    attempt_label = f"第 {attempt} 次" if attempt is not None else "—"
+    duration_ok = bool(dur_validation.get("ok"))
+    timestamp_ok = bool(ts_validation.get("ok"))
+    overall_ok = duration_ok and timestamp_ok
+    status = "通过" if overall_ok else "未达标"
+
+    lines = [
+        "",
+        "-" * 72,
+        f"【短剧脚本校验 · {stage} · {attempt_label}】{status}",
+        "-" * 72,
+        f"段数: {item_count}",
+        f"成片时长: {dur_validation.get('total_sec', 0) / 60:.1f} 分钟 "
+        f"（解说 {dur_validation.get('narration_pct', 0)}% / "
+        f"原声 {dur_validation.get('original_pct', 0)}%）",
+        f"时长校验: {'通过' if duration_ok else '未达标'} — "
+        f"{dur_validation.get('message') or '无'}",
+        f"时间戳校验: {'通过' if timestamp_ok else '未达标'} — "
+        f"{ts_validation.get('message') or '无'}",
+    ]
+    dur_issues = dur_validation.get("issues") or []
+    if dur_issues:
+        lines.append("时长问题明细:")
+        lines.extend(f"  - {issue}" for issue in dur_issues)
+    ts_issues = ts_validation.get("issues") or []
+    if ts_issues:
+        lines.append("时间戳/解说问题明细:")
+        lines.extend(f"  - {issue}" for issue in ts_issues)
+    lines.append("-" * 72)
+    logger.info("\n".join(lines))
 
 
 def _resolve_frame_analysis_for_short_drama(video_path: str) -> str:
@@ -228,7 +274,148 @@ def _resolve_frame_analysis_for_short_drama(video_path: str) -> str:
     )
 
 
-def generate_script_short_sunmmary(params, subtitle_path, video_theme, temperature):
+def generate_plot_blueprint_short(
+    params,
+    subtitle_path: str,
+    video_theme: str,
+    *,
+    fingerprint: str = "",
+):
+    """第一步：生成短剧解说「完美剧情构思方案」并在 session 中保存。"""
+    progress_bar = st.progress(0)
+    status_text = st.empty()
+
+    def update_progress(progress: float, message: str = ""):
+        progress_bar.progress(int(progress))
+        status_text.text(f"📝 {message}" if message else f"进度: {int(progress)}%")
+
+    try:
+        with st.spinner("正在生成剧情构思方案..."):
+            if not params.video_origin_path:
+                st.error("请先选择视频文件")
+                return
+
+            enable_frame_analysis = bool(st.session_state.get("sd_enable_frame_analysis", True))
+            doc_settings = get_documentary_settings()
+            plot_analysis = ""
+            source_label = "字幕×抽帧×剧情联合分析"
+            analysis_json_path = ""
+
+            if enable_frame_analysis:
+                analysis_json_path = _resolve_frame_analysis_for_short_drama(params.video_origin_path)
+                if not analysis_json_path:
+                    st.error("未找到可用的抽帧分析 JSON，请先完成抽帧或取消勾选「结合抽帧分析」")
+                    return
+                subtitle_content = ""
+                if subtitle_path and os.path.exists(subtitle_path):
+                    subtitle_content = read_subtitle_text(subtitle_path).text
+                update_progress(20, "正在整理抽帧分析结果...")
+                frame_summary = _prepare_frame_summary(analysis_json_path, doc_settings)
+                if not (frame_summary or "").strip():
+                    st.error("抽帧分析结果为空，请重新执行「抽帧并分析」")
+                    return
+                update_progress(
+                    40,
+                    "正在分析字幕并对照抽帧构思剧情方案..."
+                    if (subtitle_content or "").strip()
+                    else "正在以抽帧为主构思剧情方案...",
+                )
+                source_duration_sec = 0.0
+                try:
+                    source_duration_sec = float(
+                        VideoProcessor(params.video_origin_path).duration or 0.0
+                    )
+                except Exception:
+                    source_duration_sec = 0.0
+                plot_analysis = analyze_subtitle_with_frames(
+                    subtitle_content=subtitle_content,
+                    frame_markdown=frame_summary,
+                    video_theme=video_theme or "本短剧",
+                    progress_callback=lambda msg: update_progress(55, msg),
+                    documentary_settings=doc_settings,
+                    analysis_style="short_drama",
+                    frame_json_path=analysis_json_path,
+                    append_custom_prompt=str(st.session_state.get("append_custom_prompt") or ""),
+                    for_plot_blueprint=True,
+                    source_duration_sec=source_duration_sec or None,
+                )
+            else:
+                subtitle_content = ""
+                if subtitle_path and os.path.exists(subtitle_path):
+                    subtitle_content = read_subtitle_text(subtitle_path).text
+                if not (subtitle_content or "").strip():
+                    st.error("未开启抽帧分析时，构思蓝图需要字幕文件")
+                    return
+                source_label = "字幕剧情分析"
+                text_provider = config.app.get("text_llm_provider", "openai").lower()
+                text_model, text_api_key, text_base_url = resolve_role_credentials("text")
+                temperature = float(
+                    st.session_state.get("temperature")
+                    or get_short_drama_settings().get("narration_script_temperature", 0.4)
+                )
+                update_progress(40, "正在分析字幕剧情...")
+                analyzer = SubtitleAnalyzerAdapter(
+                    text_api_key,
+                    text_model,
+                    text_base_url,
+                    text_provider,
+                )
+                try:
+                    analysis_result = analyzer.analyze_subtitle(subtitle_content)
+                except Exception as exc:
+                    logger.warning(f"使用新LLM服务失败，回退到旧实现: {exc}")
+                    analysis_result = analyze_subtitle(
+                        subtitle_file_path=subtitle_path,
+                        api_key=text_api_key,
+                        model=text_model,
+                        base_url=text_base_url,
+                        save_result=True,
+                        temperature=temperature,
+                        provider=text_provider,
+                    )
+                if analysis_result.get("status") != "success":
+                    st.error(f"剧情分析失败: {analysis_result.get('message', 'unknown')}")
+                    return
+                plot_analysis = (analysis_result.get("analysis") or "").strip()
+
+            if not (plot_analysis or "").strip():
+                st.error("剧情构思方案为空，请检查文本模型 API 与素材")
+                return
+
+            save_plot_blueprint(
+                content=plot_analysis,
+                fingerprint=fingerprint,
+                mode="summary",
+                meta={
+                    "source_label": source_label,
+                    "analysis_path": analysis_json_path,
+                    "subtitle_path": subtitle_path,
+                },
+            )
+            _log_plot_analysis_block(f"【短剧】{source_label} · 完美剧情构思方案", plot_analysis)
+            logger.info(f"剧情构思方案生成完成，约 {len(plot_analysis)} 字")
+            st.rerun()
+
+        progress_bar.progress(100)
+        status_text.text("🎉 剧情构思方案生成完成！")
+
+    except Exception as err:
+        st.error(f"❌ 生成构思方案时发生错误: {str(err)}")
+        logger.exception(f"生成构思方案时发生错误\n{traceback.format_exc()}")
+    finally:
+        time.sleep(1.5)
+        progress_bar.empty()
+        status_text.empty()
+
+
+def generate_script_short_sunmmary(
+    params,
+    subtitle_path,
+    video_theme,
+    temperature,
+    *,
+    plot_blueprint: str | None = None,
+):
     """
     生成 短剧解说 视频脚本
     要求: 提供高质量短剧字幕；可选结合抽帧分析（参照逐帧精剪工作流）
@@ -257,9 +444,19 @@ def generate_script_short_sunmmary(params, subtitle_path, video_theme, temperatu
             1. 获取字幕
             """
             update_progress(30, "正在解析字幕...")
-            # 判断字幕文件是否存在
-            if not os.path.exists(subtitle_path):
+            prebuilt_blueprint = (plot_blueprint or get_plot_blueprint() or "").strip()
+            blueprint_only = bool(prebuilt_blueprint)
+
+            if not blueprint_only and not os.path.exists(subtitle_path):
                 st.error("字幕文件不存在")
+                return
+
+            # 读取字幕文件内容（有构思方案时可选）
+            subtitle_content = ""
+            if subtitle_path and os.path.exists(subtitle_path):
+                subtitle_content = read_subtitle_text(subtitle_path).text
+            if not blueprint_only and not subtitle_content:
+                st.error("字幕文件内容为空或无法读取")
                 return
 
             """
@@ -267,12 +464,6 @@ def generate_script_short_sunmmary(params, subtitle_path, video_theme, temperatu
             """
             text_provider = config.app.get("text_llm_provider", "openai").lower()
             text_model, text_api_key, text_base_url = resolve_role_credentials("text")
-
-            # 读取字幕文件内容（无论使用哪种实现都需要）
-            subtitle_content = read_subtitle_text(subtitle_path).text
-            if not subtitle_content:
-                st.error("字幕文件内容为空或无法读取")
-                return
 
             enable_frame_analysis = bool(
                 st.session_state.get("sd_enable_frame_analysis", True)
@@ -282,7 +473,32 @@ def generate_script_short_sunmmary(params, subtitle_path, video_theme, temperatu
             subtitle_frame_analysis = ""
             analysis_json_path = ""
 
-            if enable_frame_analysis:
+            if prebuilt_blueprint:
+                update_progress(40, "复用已确认的剧情构思方案，准备生成脚本...")
+                plot_analysis = prebuilt_blueprint
+                script_subtitle_content = subtitle_content
+                if enable_frame_analysis:
+                    analysis_json_path = _resolve_frame_analysis_for_short_drama(
+                        params.video_origin_path
+                    ) or ""
+                    subtitle_frame_analysis = prebuilt_blueprint
+                    if subtitle_content:
+                        script_subtitle_content = truncate_subtitle_content(
+                            subtitle_content,
+                            int(doc_settings.get("subtitle_max_chars", 15000)),
+                        )
+                analysis_result = {
+                    "status": "success",
+                    "analysis": plot_analysis,
+                    "model": text_model,
+                    "temperature": temperature,
+                    "source": "confirmed_blueprint",
+                }
+                _log_plot_analysis_block(
+                    "【短剧】复用已确认的完美剧情构思方案",
+                    plot_analysis,
+                )
+            elif enable_frame_analysis:
                 analysis_json_path = _resolve_frame_analysis_for_short_drama(
                     params.video_origin_path
                 )
@@ -307,19 +523,25 @@ def generate_script_short_sunmmary(params, subtitle_path, video_theme, temperatu
                     return
                 logger.info(f"短剧解说复用抽帧分析: {analysis_json_path}")
 
-                update_progress(38, "正在分析字幕并对照抽帧画面...")
+                update_progress(38, "正在联合分析字幕与抽帧，构思剧情方案...")
                 subtitle_frame_analysis = analyze_subtitle_with_frames(
                     subtitle_content=subtitle_content,
                     frame_markdown=frame_summary,
                     video_theme=video_theme or "本短剧",
-                    progress_callback=lambda msg: update_progress(40, msg),
+                    progress_callback=lambda msg: update_progress(42, msg),
                     documentary_settings=doc_settings,
                     analysis_style="short_drama",
+                    frame_json_path=analysis_json_path,
+                    append_custom_prompt=str(
+                        st.session_state.get("append_custom_prompt") or ""
+                    ),
                 )
                 if subtitle_frame_analysis:
                     logger.info(
-                        f"字幕×抽帧对照分析完成，约 {len(subtitle_frame_analysis)} 字"
+                        f"字幕×抽帧联合剧情构思完成，约 {len(subtitle_frame_analysis)} 字"
                     )
+                else:
+                    logger.warning("字幕×抽帧联合分析未产出有效内容，将回退为仅字幕分析")
 
             source_duration_sec = 0.0
             try:
@@ -327,114 +549,119 @@ def generate_script_short_sunmmary(params, subtitle_path, video_theme, temperatu
             except Exception as duration_err:
                 logger.warning(f"无法读取原片时长: {duration_err}")
 
-            min_segments, max_segments = compute_short_drama_segment_bounds(source_duration_sec)
             sd_settings = get_short_drama_settings()
-            segment_count_hint = _build_segment_count_hint(
-                enabled=enable_frame_analysis,
-                min_segments=min_segments,
-                max_segments=max_segments,
-                sd_settings=sd_settings,
-            )
+            output_duration_hint = _build_output_duration_hint(sd_settings=sd_settings)
             prompt_extra = {
-                "segment_count_hint": segment_count_hint,
+                "output_duration_hint": output_duration_hint,
                 **get_short_drama_script_prompt_params(
                     source_duration_sec=source_duration_sec,
-                    expected_total_segments=(min_segments + max_segments) // 2,
                     settings=sd_settings,
                 ),
             }
-            script_subtitle_content = subtitle_content
-            if enable_frame_analysis and subtitle_frame_analysis:
-                script_subtitle_content = truncate_subtitle_content(
-                    subtitle_content,
-                    int(doc_settings.get("subtitle_max_chars", 15000)),
+            if not prebuilt_blueprint:
+                script_subtitle_content = subtitle_content
+                if enable_frame_analysis and subtitle_frame_analysis:
+                    script_subtitle_content = truncate_subtitle_content(
+                        subtitle_content,
+                        int(doc_settings.get("subtitle_max_chars", 15000)),
+                    )
+                    logger.info(
+                        f"结合抽帧：脚本 prompt 字幕由 {len(subtitle_content)} 字截断为 "
+                        f"{len(script_subtitle_content)} 字（时间戳仍以字幕为准）"
+                    )
+
+            analyzer = SubtitleAnalyzerAdapter(
+                text_api_key,
+                text_model,
+                text_base_url,
+                text_provider,
+                script_extra_params=prompt_extra,
+            )
+            plot_analysis = plot_analysis if prebuilt_blueprint else ""
+            script_frame_analysis = subtitle_frame_analysis
+            analysis_result: dict = analysis_result if prebuilt_blueprint else {
+                "status": "error",
+                "message": "未执行剧情分析",
+            }
+
+            if not prebuilt_blueprint and enable_frame_analysis and (subtitle_frame_analysis or "").strip():
+                plot_analysis = subtitle_frame_analysis.strip()
+                script_frame_analysis = (
+                    "（完美剧情构思方案已并入上方「剧情概述」，写脚本时以剧情概述为准。）"
                 )
-                logger.info(
-                    f"结合抽帧：脚本 prompt 字幕由 {len(subtitle_content)} 字截断为 "
-                    f"{len(script_subtitle_content)} 字（时间戳仍以字幕为准）"
+                analysis_result = {
+                    "status": "success",
+                    "analysis": plot_analysis,
+                    "model": text_model,
+                    "temperature": temperature,
+                    "source": "subtitle_frame_joint",
+                }
+                update_progress(52, "字幕×抽帧联合剧情构思完成")
+                logger.info("字幕×抽帧联合剧情构思成功！")
+                _log_plot_analysis_block(
+                    "【短剧】字幕×抽帧联合剧情构思方案",
+                    plot_analysis,
+                )
+            elif not prebuilt_blueprint:
+                try:
+                    logger.info(
+                        "使用 LLM 进行字幕剧情分析"
+                        + ("（含抽帧摘要）" if frame_summary else "")
+                    )
+                    analysis_result = analyzer.analyze_subtitle(
+                        subtitle_content,
+                        frame_summary=frame_summary,
+                    )
+                except Exception as e:
+                    logger.warning(f"使用新LLM服务失败，回退到旧实现: {str(e)}")
+                    analysis_result = analyze_subtitle(
+                        subtitle_file_path=subtitle_path,
+                        api_key=text_api_key,
+                        model=text_model,
+                        base_url=text_base_url,
+                        save_result=True,
+                        temperature=temperature,
+                        provider=text_provider,
+                        frame_summary=frame_summary,
+                    )
+
+                if analysis_result["status"] == "success":
+                    plot_analysis = analysis_result["analysis"]
+                    logger.info("字幕剧情分析成功！")
+                    _log_plot_analysis_block(
+                        "【短剧】字幕剧情分析方案",
+                        plot_analysis,
+                    )
+
+            if not prebuilt_blueprint and enable_frame_analysis and (subtitle_frame_analysis or "").strip():
+                script_frame_analysis = (
+                    "（完美剧情构思方案已并入上方「剧情概述」，写脚本时以剧情概述为准。）"
+                )
+            elif prebuilt_blueprint and enable_frame_analysis:
+                script_frame_analysis = (
+                    "（完美剧情构思方案已并入上方「剧情概述」，写脚本时以剧情概述为准。）"
                 )
 
-            try:
-                # 优先使用新的LLM服务架构
-                logger.info("使用新的LLM服务架构进行字幕分析")
-                analyzer = SubtitleAnalyzerAdapter(
-                    text_api_key,
-                    text_model,
-                    text_base_url,
-                    text_provider,
-                    script_extra_params=prompt_extra,
-                )
-
-                analysis_result = analyzer.analyze_subtitle(
-                    subtitle_content,
-                    frame_summary=frame_summary,
-                )
-
-            except Exception as e:
-                logger.warning(f"使用新LLM服务失败，回退到旧实现: {str(e)}")
-                # 回退到旧的实现
-                analysis_result = analyze_subtitle(
-                    subtitle_file_path=subtitle_path,
-                    api_key=text_api_key,
-                    model=text_model,
-                    base_url=text_base_url,
-                    save_result=True,
-                    temperature=temperature,
-                    provider=text_provider,
-                    frame_summary=frame_summary,
-                )
-            """
-            3. 根据剧情生成解说文案
-            """
             if analysis_result["status"] != "success":
-                logger.error(f"分析失败: {analysis_result['message']}")
-                st.error("生成脚本失败，请检查日志")
+                logger.error(f"分析失败: {analysis_result.get('message', 'unknown')}")
+                st.error("剧情分析失败，请检查日志")
                 st.stop()
 
-            logger.info("字幕分析成功！")
-            update_progress(60, "正在生成文案...")
-
-            plot_analysis = analysis_result["analysis"]
+            update_progress(60, "正在生成解说脚本...")
             narration_result = None
             narration_dict = None
-            max_attempts = 3
+            max_llm_attempts = 3
+            max_repair_passes = 3
+            generation_candidates: list[dict] = []
+            used_best_effort = False
 
-            for attempt in range(1, max_attempts + 1):
-                retry_reasons: list[str] = []
-                if attempt > 1 and narration_dict:
-                    item_count = len(narration_dict.get("items") or [])
-                    if enable_frame_analysis and item_count < min_segments:
-                        retry_reasons.append(
-                            f"items 仅 {item_count} 段，低于 {min_segments} 段下限"
-                        )
-                    validation = validate_short_drama_script_counts(
-                        narration_dict.get("items") or [],
-                        sd_settings,
+            for attempt in range(1, max_llm_attempts + 1):
+                if attempt > 1:
+                    update_progress(
+                        65,
+                        f"JSON 解析失败，正在第 {attempt} 次重新生成...",
                     )
-                    if not validation["ok"]:
-                        retry_reasons.append(validation["message"])
-                if attempt > 1 and retry_reasons:
-                    update_progress(65, f"比例/段数不足，正在第 {attempt} 次重新生成...")
-                    plot_for_retry = (
-                        f"{analysis_result['analysis']}\n\n"
-                        f"【重要修正·第{attempt}次】上次输出无效："
-                        f"{'；'.join(retry_reasons)}。"
-                        f"请重新输出完整 JSON：items {min_segments}–{max_segments} 段；"
-                        f"OST=0 解说至少 {validation['ost0_min']} 段（约 30%），"
-                        f"OST=1 原声最多 {validation['ost1_max']} 段（约 70% 成片时长）；"
-                        f"同场可连续 {sd_settings.get('max_consecutive_ost1', 4)} 段原声成块，整块播完再解说；"
-                        f"禁止几乎全是 OST=1。"
-                    )
-                elif attempt > 1:
-                    update_progress(65, f"段数不足，正在第 {attempt} 次重新生成...")
-                    plot_for_retry = (
-                        f"{analysis_result['analysis']}\n\n"
-                        f"【重要修正·第{attempt}次】上次 JSON items 仅 {len(narration_dict.get('items', []))} 段，"
-                        f"低于要求的 {min_segments} 段下限，输出无效。"
-                        f"请重新输出完整 JSON，items 总数须达到 {min_segments}–{max_segments} 段。"
-                    )
-                else:
-                    plot_for_retry = plot_analysis
+                plot_for_retry = plot_analysis
 
                 try:
                     logger.info("使用新的LLM服务架构生成解说文案")
@@ -442,8 +669,8 @@ def generate_script_short_sunmmary(params, subtitle_path, video_theme, temperatu
                         short_name=video_theme,
                         plot_analysis=plot_for_retry,
                         subtitle_content=script_subtitle_content,
-                        temperature=min(1.2, temperature + 0.1 * (attempt - 1)),
-                        subtitle_frame_analysis=subtitle_frame_analysis,
+                        temperature=temperature,
+                        subtitle_frame_analysis=script_frame_analysis,
                     )
                 except Exception as e:
                     logger.warning(f"使用新LLM服务失败，回退到旧实现: {str(e)}")
@@ -455,57 +682,75 @@ def generate_script_short_sunmmary(params, subtitle_path, video_theme, temperatu
                         model=text_model,
                         base_url=text_base_url,
                         save_result=True,
-                        temperature=min(1.2, temperature + 0.1 * (attempt - 1)),
+                        temperature=temperature,
                         provider=text_provider,
-                        subtitle_frame_analysis=subtitle_frame_analysis,
+                        subtitle_frame_analysis=script_frame_analysis,
                         script_extra_params=prompt_extra,
                     )
 
                 if narration_result["status"] != "success":
-                    break
+                    continue
 
                 narration_dict = parse_and_fix_json(narration_result["narration_script"])
                 if narration_dict is None or "items" not in narration_dict:
-                    break
+                    continue
 
                 item_count = len(narration_dict.get("items") or [])
-                validation = validate_short_drama_script_counts(
+                dur_validation = validate_short_drama_script_duration(
                     narration_dict.get("items") or [],
                     sd_settings,
                 )
-                segment_ok = item_count >= min_segments
-                ratio_ok = validation["ok"]
-                if segment_ok and ratio_ok:
-                    break
-                if attempt >= max_attempts:
-                    if enable_frame_analysis and item_count < min_segments:
-                        logger.warning(
-                            f"短剧解说段数仍不足: {item_count}/{min_segments}，已用尽重试"
-                        )
-                        st.warning(
-                            f"脚本段数偏少（{item_count} 段，建议 ≥{min_segments} 段）。"
-                        )
-                    if not ratio_ok:
-                        logger.warning(f"短剧解说 OST 比例未达标: {validation['message']}")
-                        st.warning(
-                            f"解说段偏少（OST=0 {validation['ost0_count']} 段，"
-                            f"建议 ≥{validation['ost0_min']} 段）。后处理已尝试自动修正。"
-                        )
-                    break
-
-                logger.info(
-                    f"短剧解说未达标（段数 {item_count}/{min_segments}，"
-                    f"OST=0 {validation['ost0_count']}/{validation['ost0_min']}），"
-                    f"准备第 {attempt + 1} 次生成"
+                ts_validation = validate_short_drama_script_timestamps(
+                    narration_dict.get("items") or [],
+                    sd_settings,
                 )
-
-            if narration_result is None or narration_result["status"] != "success":
-                logger.info(
-                    f"\n解说文案生成失败: "
-                    f"{narration_result.get('message', 'unknown') if narration_result else 'unknown'}"
+                quality_score = score_short_drama_script_quality(
+                    dur_validation, ts_validation, sd_settings
                 )
-                st.error("生成脚本失败，请检查日志")
-                st.stop()
+                generation_candidates.append(
+                    {
+                        "attempt": attempt,
+                        "narration_dict": narration_dict,
+                        "dur_validation": dur_validation,
+                        "ts_validation": ts_validation,
+                        "score": quality_score,
+                    }
+                )
+                _log_short_drama_validation_report(
+                    stage="LLM 生成后",
+                    attempt=attempt,
+                    dur_validation=dur_validation,
+                    ts_validation=ts_validation,
+                    item_count=item_count,
+                )
+                logger.info(
+                    f"短剧脚本 LLM 输出 第{attempt}次 接近度分数={quality_score:.3f} "
+                    f"（时间轴问题将走后处理自动修复，不重写全文）"
+                )
+                break
+
+            if narration_dict is None and generation_candidates:
+                best = pick_best_short_drama_script_candidate(generation_candidates)
+                if best:
+                    used_best_effort = True
+                    narration_dict = best["narration_dict"]
+                    logger.warning(
+                        f"末次生成未得到有效 JSON，回退到最接近的第 {best['attempt']} 次候选 "
+                        f"（分数 {best['score']:.3f}）"
+                    )
+
+            if narration_result is None or narration_result.get("status") != "success":
+                if generation_candidates and narration_dict is not None:
+                    logger.warning(
+                        "末次 LLM 调用失败，仍输出已缓存的最接近脚本候选"
+                    )
+                else:
+                    logger.info(
+                        f"\n解说文案生成失败: "
+                        f"{narration_result.get('message', 'unknown') if narration_result else 'unknown'}"
+                    )
+                    st.error("生成脚本失败，请检查日志")
+                    st.stop()
 
             """
             4. 生成文案
@@ -516,7 +761,10 @@ def generate_script_short_sunmmary(params, subtitle_path, video_theme, temperatu
                 narration_dict = parse_and_fix_json(narration_result["narration_script"])
             if narration_dict is None:
                 st.error("生成的解说文案格式错误，无法解析为JSON")
-                logger.error(f"JSON解析失败，原始内容: {narration_result['narration_script']}")
+                if narration_result:
+                    logger.error(
+                        f"JSON解析失败，原始内容: {narration_result.get('narration_script', '')}"
+                    )
                 st.stop()
 
             if 'items' not in narration_dict:
@@ -542,12 +790,79 @@ def generate_script_short_sunmmary(params, subtitle_path, video_theme, temperatu
                 settings=sd_settings,
             )
 
+            for repair_pass in range(1, max_repair_passes + 1):
+                ts_validation = validate_short_drama_script_timestamps(
+                    narration_dict.get("items") or [],
+                    sd_settings,
+                )
+                if ts_validation["ok"]:
+                    break
+                update_progress(
+                    72,
+                    f"自动修复时间轴（第 {repair_pass}/{max_repair_passes} 次，不改文案）...",
+                )
+                logger.info(
+                    f"时间轴未达标，第 {repair_pass} 次自动扩展/对位："
+                    f"{ts_validation.get('message')}"
+                )
+                narration_dict["items"] = repair_short_drama_script_timestamps(
+                    narration_dict["items"],
+                    subtitle_content=subtitle_content,
+                    frame_analysis_path=analysis_json_path if enable_frame_analysis else "",
+                    settings=sd_settings,
+                )
+                _log_short_drama_validation_report(
+                    stage=f"时间轴修复后 · 第{repair_pass}次",
+                    attempt=repair_pass,
+                    dur_validation=validate_short_drama_script_duration(
+                        narration_dict.get("items") or [],
+                        sd_settings,
+                    ),
+                    ts_validation=validate_short_drama_script_timestamps(
+                        narration_dict.get("items") or [],
+                        sd_settings,
+                    ),
+                    item_count=len(narration_dict.get("items") or []),
+                )
+
+            final_dur_validation = validate_short_drama_script_duration(
+                narration_dict.get("items") or [],
+                sd_settings,
+            )
+            final_ts_validation = validate_short_drama_script_timestamps(
+                narration_dict.get("items") or [],
+                sd_settings,
+            )
+            _log_short_drama_validation_report(
+                stage="后处理完成",
+                attempt=None,
+                dur_validation=final_dur_validation,
+                ts_validation=final_ts_validation,
+                item_count=len(narration_dict.get("items") or []),
+            )
+            if not final_ts_validation["ok"] or not final_dur_validation["ok"]:
+                used_best_effort = True
+                logger.warning(
+                    "后处理后脚本仍未完全达标，仍输出最接近的结果。"
+                    f"时长：{final_dur_validation.get('message')}；"
+                    f"时间戳：{final_ts_validation.get('message')}"
+                )
+                st.warning(
+                    "脚本后处理后仍有未达标项，已输出当前最接近可用的版本，"
+                    "建议人工检查后再生成视频。"
+                    f"{final_ts_validation.get('message') or final_dur_validation.get('message')}"
+                )
+            elif used_best_effort:
+                logger.info("已输出最佳努力脚本（生成阶段未完全达标）")
+
             script = json.dumps(narration_dict['items'], ensure_ascii=False, indent=2)
 
             if script is None:
                 st.error("生成脚本失败，请检查日志")
                 st.stop()
             logger.success(f"剪辑脚本生成完成")
+            st.session_state["narration_workflow_mode"] = "summary"
+            config.app["narration_workflow_mode"] = "summary"
             if isinstance(script, list):
                 st.session_state['video_clip_json'] = script
             elif isinstance(script, str):

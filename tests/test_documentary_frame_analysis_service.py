@@ -500,6 +500,20 @@ class DocumentaryFrameAnalysisCompactTests(unittest.TestCase):
             ],
         }
 
+    def test_compact_script_export_includes_segment_time_range(self):
+        from app.services.documentary.frame_analysis_compact import compact_analysis_artifact
+
+        compact = compact_analysis_artifact(
+            self._sample_artifact(),
+            include_frame_observations=False,
+            include_summaries=True,
+            include_batch_index=True,
+            keep_batch_meta=True,
+        )
+        segment = compact["scene_segments"][0]
+        self.assertIn("time_range", segment)
+        self.assertEqual("00:00:01,940-00:00:02,900", segment["time_range"])
+
     def test_compact_analysis_artifact_removes_debug_fields(self):
         from app.services.documentary.frame_analysis_compact import compact_analysis_artifact
 
@@ -564,7 +578,6 @@ class DocumentaryFrameAnalysisCompactTests(unittest.TestCase):
             self.assertEqual(
                 {
                     "timestamp",
-                    "time_range",
                     "scene",
                     "observation",
                     "action",
@@ -572,7 +585,9 @@ class DocumentaryFrameAnalysisCompactTests(unittest.TestCase):
                 },
                 set(segment.keys()),
             )
-            self.assertEqual("00:00:01,940-00:00:02,900", payload["scene_segments"][0]["time_range"])
+            self.assertEqual("白爷；你好", segment["subtitle"])
+            self.assertNotIn("subtitle_entries", segment)
+            self.assertNotIn("time_range", segment)
             self.assertEqual("对话", payload["scene_segments"][0]["action"])
             self.assertEqual("对话", payload["scene_segments"][0]["observation"])
             self.assertNotIn("batches", payload)
@@ -679,11 +694,9 @@ class DocumentaryFrameGenderHintTests(unittest.TestCase):
     def test_analysis_prompt_requires_gender_in_characters(self):
         service = DocumentaryFrameAnalysisService()
         prompt = service._build_analysis_prompt(frame_count=2)
-        self.assertIn("姓名(男)", prompt)
-        self.assertIn("姓名(女)", prompt)
-        self.assertIn("未名人员(男)", prompt)
-        self.assertIn("未名人员(女)", prompt)
-        self.assertIn("禁止把「领导」", prompt)
+        self.assertIn("未名人员(男/女)", prompt)
+        self.assertIn("须含可见性别", prompt)
+        self.assertIn("仅可见画面", prompt)
 
     def test_batch_prompt_includes_gender_hint(self):
         service = DocumentaryFrameAnalysisService()
@@ -709,6 +722,54 @@ class DocumentaryFrameGenderHintTests(unittest.TestCase):
         self.assertIn("无法从字幕确认身份时", prompt)
         self.assertIn("老叶与伟业并肩", prompt)
         self.assertIn("勿把与之对话的上级/长辈称为伟业", prompt)
+
+    def test_batch_prompt_default_skips_drama_knowledge_for_fazu_theme(self):
+        service = DocumentaryFrameAnalysisService()
+        prompt = service._build_batch_prompt(
+            frame_count=2,
+            video_theme="罚罪2",
+            custom_prompt="",
+            documentary_settings={
+                "documentary_compact_mode": True,
+                "documentary_compact_style": "fazu2",
+            },
+            time_range="00:00:00,000-00:00:06,000",
+        )
+        self.assertNotIn("剧集人物关系对照（抽帧分析必读", prompt)
+        self.assertIn("仅可见画面", prompt)
+
+    def test_batch_prompt_includes_drama_knowledge_for_fazu_theme(self):
+        service = DocumentaryFrameAnalysisService()
+        prompt = service._build_batch_prompt(
+            frame_count=2,
+            video_theme="罚罪2",
+            custom_prompt="",
+            documentary_settings={
+                "documentary_compact_mode": True,
+                "documentary_compact_style": "fazu2",
+                "enable_frame_analysis_drama_knowledge": True,
+            },
+            time_range="00:00:00,000-00:00:06,000",
+        )
+        self.assertIn("剧集人物关系对照（抽帧分析必读", prompt)
+        self.assertIn("秦枫", prompt)
+        self.assertIn("胡小跃", prompt)
+
+    def test_batch_prompt_skips_drama_knowledge_when_disabled(self):
+        service = DocumentaryFrameAnalysisService()
+        prompt = service._build_batch_prompt(
+            frame_count=2,
+            video_theme="罚罪2",
+            custom_prompt="",
+            documentary_settings={
+                "documentary_compact_mode": True,
+                "documentary_compact_style": "fazu2",
+                "enable_frame_analysis_drama_knowledge": False,
+                "enable_subtitle_analysis_drama_knowledge": False,
+            },
+            time_range="00:00:00,000-00:00:06,000",
+        )
+        self.assertNotIn("剧集人物关系对照（抽帧分析必读", prompt)
 
     @patch("app.services.documentary.documentary_settings.logger.warning")
     def test_warn_frame_analysis_gender_mismatch_detects_female_tag(self, mock_warning):
@@ -750,8 +811,18 @@ class DocumentaryFrameSubtitleAttachmentTests(unittest.TestCase):
                     "batch_index": 0,
                     "time_range": "00:00:00,000-00:00:09,000",
                     "frame_observations": [
-                        {"timestamp": "00:00:02,000", "observation": "出现老叶字样"},
-                        {"timestamp": "00:00:05,000", "observation": "对话中"},
+                        {
+                            "timestamp": "00:00:02,000",
+                            "observation": "出现老叶字样",
+                            "burned_in_subtitle": "老叶，",
+                            "has_burned_in_subtitle": True,
+                        },
+                        {
+                            "timestamp": "00:00:05,000",
+                            "observation": "对话中",
+                            "burned_in_subtitle": "你都到厅级了，",
+                            "has_burned_in_subtitle": True,
+                        },
                     ],
                     "scene_segments": [
                         {"timestamp": "00:00:01,940-00:00:09,940", "scene": "楼顶天台"},
@@ -759,8 +830,20 @@ class DocumentaryFrameSubtitleAttachmentTests(unittest.TestCase):
                 }
             ],
             "frame_observations": [
-                {"timestamp": "00:00:02,000", "observation": "出现老叶字样", "batch_index": 0},
-                {"timestamp": "00:00:05,000", "observation": "对话中", "batch_index": 0},
+                {
+                    "timestamp": "00:00:02,000",
+                    "observation": "出现老叶字样",
+                    "batch_index": 0,
+                    "burned_in_subtitle": "老叶，",
+                    "has_burned_in_subtitle": True,
+                },
+                {
+                    "timestamp": "00:00:05,000",
+                    "observation": "对话中",
+                    "batch_index": 0,
+                    "burned_in_subtitle": "你都到厅级了，",
+                    "has_burned_in_subtitle": True,
+                },
             ],
             "scene_segments": [
                 {"timestamp": "00:00:01,940-00:00:09,940", "scene": "楼顶天台", "batch_index": 0},
@@ -769,25 +852,218 @@ class DocumentaryFrameSubtitleAttachmentTests(unittest.TestCase):
 
         enriched = attach_subtitles_to_frame_analysis_artifact(artifact, self.SAMPLE_SRT)
         self.assertTrue(enriched.get("subtitle_attached"))
-        frame0 = enriched["frame_observations"][0]
-        self.assertIn("老叶", frame0["subtitle"])
-        self.assertEqual("00:00:01,940", frame0["subtitle_start"])
-        self.assertEqual("00:00:02,420", frame0["subtitle_end"])
-        self.assertIn("你都到厅级了", enriched["frame_observations"][1]["subtitle"])
-        self.assertIn("subtitle_entries", enriched["batches"][0])
-        self.assertIn("subtitle", enriched["scene_segments"][0])
-        entries = enriched["scene_segments"][0]["subtitle_entries"]
-        self.assertTrue(any(item.get("start") == "00:00:01,940" for item in entries))
+        self.assertEqual("burned_in_only", enriched.get("subtitle_source"))
+        segment = enriched["scene_segments"][0]
+        self.assertIn("subtitle", segment)
+        self.assertIn("老叶", segment["subtitle"])
+        self.assertIn("厅级", segment["subtitle"])
+        self.assertNotIn("subtitle_entries", segment)
+        self.assertNotIn("time_range", segment)
+        self.assertNotIn("subtitle_entries", enriched["batches"][0])
 
-    def test_attach_subtitles_prefers_burned_in_text_with_srt_time(self):
-        from app.services.documentary.documentary_subtitle_enrichment import (
-            attach_subtitles_to_frame_analysis_artifact,
+    def test_dedupe_scene_environment_across_segments(self):
+        from app.services.documentary.frame_timeline_sampling import (
+            dedupe_scene_environment_across_segments,
         )
 
+        segments = [
+            {
+                "timestamp": "00:00:00,000-00:00:10,000",
+                "scene": "楼顶天台",
+                "key_visual": "阴天冷色调，云层低垂",
+                "emotion": "压抑",
+                "observation": "阴天冷色调；胡小跃站在天台边缘",
+                "action": "胡小跃(男)站立",
+            },
+            {
+                "timestamp": "00:00:10,000-00:00:20,000",
+                "scene": "楼顶天台",
+                "key_visual": "阴天冷色调，云层低垂",
+                "emotion": "压抑",
+                "observation": "阴天冷色调；秦枫与胡小跃对话",
+                "action": "秦枫(男)与胡小跃交谈",
+            },
+            {
+                "timestamp": "00:00:20,000-00:00:30,000",
+                "scene": "地下仓库",
+                "key_visual": "昏暗仓库",
+                "action": "扭打",
+            },
+        ]
+        dedupe_scene_environment_across_segments(segments)
+        self.assertIn("scene", segments[0])
+        self.assertNotIn("scene", segments[1])
+        self.assertNotIn("key_visual", segments[1])
+        self.assertNotIn("emotion", segments[1])
+        self.assertIn("秦枫", segments[1]["observation"])
+        self.assertNotIn("阴天冷色调", segments[1]["observation"])
+        self.assertIn("scene", segments[2])
+
+    def test_compress_analysis_artifact_strips_debug_and_subtitle_dup(self):
+        from app.services.documentary.frame_analysis_compact import compress_analysis_artifact
+
+        artifact = {
+            "scene_segments": [
+                {
+                    "timestamp": "00:00:00,000-00:00:05,000",
+                    "scene": "办公室",
+                    "subtitle": "老叶，",
+                    "subtitle_entries": [
+                        {"start": "00:00:01,940", "end": "00:00:02,420", "text": "老叶，"},
+                    ],
+                    "batch_index": 0,
+                }
+            ],
+            "batches": [
+                {
+                    "batch_index": 0,
+                    "status": "success",
+                    "time_range": "00:00:00,000-00:00:05,000",
+                    "raw_response": "x" * 5000,
+                    "frame_paths": ["/tmp/a.jpg"],
+                    "subtitle": "老叶，",
+                    "subtitle_entries": [{"start": "00:00:01,940", "end": "00:00:02,420", "text": "老叶，"}],
+                    "frame_observations": [{"timestamp": "00:00:02,000", "observation": "画面"}],
+                }
+            ],
+            "frame_observations": [
+                {
+                    "timestamp": "00:00:02,000",
+                    "observation": "画面",
+                    "subtitle": "老叶，",
+                    "batch_index": 0,
+                }
+            ],
+        }
+        compress_analysis_artifact(artifact)
+        segment = artifact["scene_segments"][0]
+        self.assertIn("subtitle", segment)
+        self.assertNotIn("subtitle_entries", segment)
+        batch = artifact["batches"][0]
+        self.assertNotIn("raw_response", batch)
+        self.assertNotIn("frame_paths", batch)
+        self.assertNotIn("frame_observations", batch)
+        frame = artifact["frame_observations"][0]
+        self.assertNotIn("observation", frame)
+        self.assertIn("subtitle", frame)
+
+    def test_assign_subtitle_entries_to_segments_assigns_once(self):
+        from app.services.documentary.documentary_subtitle_enrichment import (
+            assign_subtitle_entries_to_segments,
+            extract_subtitle_entries_from_frame_analysis,
+        )
+        from app.services.srt_utils import parse_srt
+
         srt = """1
-00:00:16,940 --> 00:00:18,700
-胡小月是我的徒弟
+00:00:29,150 --> 00:00:31,550
+我了解小月。
+
+2
+00:00:31,990 --> 00:00:35,230
+她不是对组织、对自己失去
+
+3
+00:00:36,750 --> 00:00:38,790
+更不是害怕和逃避。
 """
+        rooftop = {
+            "timestamp": "00:00:25,000-00:00:35,000",
+            "scene": "楼顶天台",
+            "batch_index": 0,
+        }
+        warehouse = {
+            "timestamp": "00:00:30,000-00:00:40,000",
+            "scene": "地下仓库",
+            "batch_index": 0,
+        }
+        segments = [rooftop, warehouse]
+        assign_subtitle_entries_to_segments(segments, parse_srt(srt))
+
+        rooftop_starts = {item["start"] for item in rooftop.get("subtitle_entries") or []}
+        warehouse_starts = {item["start"] for item in warehouse.get("subtitle_entries") or []}
+        self.assertEqual(set(), rooftop_starts & warehouse_starts)
+        self.assertIn("00:00:29,150", rooftop_starts)
+        self.assertIn("00:00:36,750", warehouse_starts)
+
+        extracted = extract_subtitle_entries_from_frame_analysis(
+            {"scene_segments": segments, "batches": []}
+        )
+        starts = [entry.start_ms for entry in extracted]
+        self.assertEqual(len(starts), len(set(starts)))
+
+    def test_partition_subtitle_entries_removes_overlap_duplicates(self):
+        from app.services.documentary.documentary_subtitle_enrichment import (
+            partition_subtitle_entries_across_segments,
+            resolve_segment_time_range,
+        )
+
+        rooftop = {
+            "timestamp": "00:00:25,000-00:00:35,000",
+            "scene": "楼顶天台",
+            "subtitle_entries": [
+                {"start": "00:00:23,340", "end": "00:00:26,740", "text": "还有一些关于举报他个人的材料也正在核实。"},
+                {"start": "00:00:28,390", "end": "00:00:29,070", "text": "我的徒弟，"},
+                {"start": "00:00:29,150", "end": "00:00:31,550", "text": "我了解小月。"},
+                {"start": "00:00:31,990", "end": "00:00:35,230", "text": "她不是对组织、对自己失去"},
+                {"start": "00:00:35,230", "end": "00:00:35,830", "text": "信心，"},
+            ],
+        }
+        warehouse = {
+            "timestamp": "00:00:30,000-00:00:40,000",
+            "scene": "地下仓库",
+            "subtitle_entries": [
+                {"start": "00:00:29,150", "end": "00:00:31,550", "text": "我了解小月。"},
+                {"start": "00:00:31,990", "end": "00:00:35,230", "text": "她不是对组织、对自己失去"},
+                {"start": "00:00:35,230", "end": "00:00:35,830", "text": "信心，"},
+                {"start": "00:00:36,750", "end": "00:00:38,790", "text": "更不是害怕和逃避。"},
+            ],
+        }
+        segments = [rooftop, warehouse]
+        partition_subtitle_entries_across_segments(segments)
+
+        rooftop_starts = {item["start"] for item in rooftop["subtitle_entries"]}
+        warehouse_starts = {item["start"] for item in warehouse["subtitle_entries"]}
+        self.assertEqual(
+            set(),
+            rooftop_starts & warehouse_starts,
+            "重叠 scene 不应共享同一条 subtitle_entries",
+        )
+        self.assertIn("00:00:29,150", rooftop_starts)
+        self.assertIn("00:00:36,750", warehouse_starts)
+        self.assertNotIn("00:00:29,150", warehouse_starts)
+        self.assertEqual(
+            "00:00:23,340-00:00:31,550",
+            resolve_segment_time_range(rooftop),
+        )
+        self.assertEqual(
+            "00:00:31,990-00:00:38,790",
+            resolve_segment_time_range(warehouse),
+        )
+
+    def test_resolve_segment_time_range_from_subtitle_entries(self):
+        from app.services.documentary.documentary_subtitle_enrichment import (
+            resolve_segment_time_range,
+        )
+
+        segment = {
+            "timestamp": "00:00:01,000-00:00:09,940",
+            "subtitle_entries": [
+                {"start": "00:00:01,940", "end": "00:00:02,420", "text": "老叶，"},
+                {"start": "00:00:05,100", "end": "00:00:06,340", "text": "你都到厅级了，"},
+            ],
+        }
+        self.assertEqual("00:00:01,940-00:00:06,340", resolve_segment_time_range(segment))
+
+    def test_attach_subtitles_uses_burned_in_only(self):
+        from app.services.documentary.documentary_subtitle_enrichment import (
+            attach_burned_in_subtitles_to_artifact,
+            attach_subtitles_to_frame_analysis_artifact,
+            is_phantom_subtitle_fragment,
+        )
+
+        self.assertTrue(is_phantom_subtitle_fragment("了。"))
+        self.assertFalse(is_phantom_subtitle_fragment("胡小跃是我的徒弟。"))
+
         artifact = {
             "batches": [],
             "frame_observations": [
@@ -796,13 +1072,699 @@ class DocumentaryFrameSubtitleAttachmentTests(unittest.TestCase):
                     "observation": "伟业说话",
                     "burned_in_subtitle": "胡小跃是我的徒弟",
                     "has_burned_in_subtitle": True,
+                    "batch_index": 0,
                 }
             ],
-            "scene_segments": [],
+            "scene_segments": [
+                {"timestamp": "00:00:16,000-00:00:18,000", "batch_index": 0},
+            ],
         }
-        enriched = attach_subtitles_to_frame_analysis_artifact(artifact, srt)
-        frame = enriched["frame_observations"][0]
-        self.assertEqual("胡小跃是我的徒弟", frame["subtitle"])
-        self.assertEqual("00:00:16,940", frame["subtitle_start"])
-        self.assertEqual("00:00:18,700", frame["subtitle_end"])
-        self.assertEqual("burned_in_corrected", frame["subtitle_text_source"])
+        enriched = attach_subtitles_to_frame_analysis_artifact(
+            artifact,
+            """1
+00:00:16,940 --> 00:00:18,700
+胡小月是我的徒弟
+""",
+        )
+        self.assertEqual("胡小跃是我的徒弟", enriched["scene_segments"][0]["subtitle"])
+        self.assertNotIn("subtitle_entries", enriched["scene_segments"][0])
+
+        artifact_with_phantom = {
+            "batches": [],
+            "frame_observations": [
+                {
+                    "timestamp": "00:00:09,940",
+                    "burned_in_subtitle": "了。",
+                    "has_burned_in_subtitle": True,
+                    "batch_index": 0,
+                },
+                {
+                    "timestamp": "00:00:12,000",
+                    "burned_in_subtitle": "胡小跃是我的徒弟。",
+                    "has_burned_in_subtitle": True,
+                    "batch_index": 0,
+                },
+            ],
+            "scene_segments": [
+                {"timestamp": "00:00:09,000-00:00:16,000", "batch_index": 0},
+            ],
+        }
+        attach_burned_in_subtitles_to_artifact(artifact_with_phantom)
+        subtitle = artifact_with_phantom["scene_segments"][0].get("subtitle", "")
+        self.assertIn("胡小跃", subtitle)
+        self.assertNotIn("了。", subtitle)
+
+
+class FrameAnalysisDramaKnowledgeTests(unittest.TestCase):
+    def test_correct_name_mistakes_in_text(self):
+        from app.services.short_drama_drama_knowledge import correct_name_mistakes_in_text
+
+        self.assertEqual(
+            "秦枫与胡小跃对话",
+            correct_name_mistakes_in_text("秦峰与胡小月对话"),
+        )
+
+    def test_apply_name_corrections_to_frame_analysis_artifact(self):
+        from app.services.short_drama_drama_knowledge import (
+            apply_name_corrections_to_frame_analysis_artifact,
+        )
+
+        artifact = {
+            "scene_segments": [
+                {
+                    "action": "秦峰(男)与罗伯对峙",
+                    "observation": "胡小月在旁",
+                    "subtitle": "秦峰说",
+                    "subtitle_entries": [{"start": "00:00:29,150", "end": "00:00:31,550", "text": "我了解小月。"}],
+                },
+            ],
+            "batches": [
+                {
+                    "scene_segments": [{"subtitle": "秦峰说"}],
+                    "frame_observations": [{"observation": "罗伯出现", "burned_in_subtitle": "罗伯出现"}],
+                }
+            ],
+        }
+        apply_name_corrections_to_frame_analysis_artifact(artifact)
+        self.assertIn("秦枫", artifact["scene_segments"][0]["action"])
+        self.assertIn("胡小跃", artifact["scene_segments"][0]["observation"])
+        self.assertIn("秦峰", artifact["scene_segments"][0]["subtitle"])
+        self.assertEqual("我了解小月。", artifact["scene_segments"][0]["subtitle_entries"][0]["text"])
+        self.assertIn("秦峰", artifact["batches"][0]["scene_segments"][0]["subtitle"])
+        self.assertIn("罗博", artifact["batches"][0]["frame_observations"][0]["observation"])
+        self.assertEqual("罗伯出现", artifact["batches"][0]["frame_observations"][0]["burned_in_subtitle"])
+
+    def test_extract_subtitle_srt_from_subtitle_entries(self):
+        from app.services.documentary.documentary_subtitle_enrichment import (
+            extract_subtitle_entries_from_frame_analysis,
+        )
+
+        data = {
+            "scene_segments": [
+                {
+                    "timestamp": "00:00:29,150-00:00:38,790",
+                    "subtitle_entries": [
+                        {
+                            "start": "00:00:29,150",
+                            "end": "00:00:31,550",
+                            "text": "我了解小月。",
+                        },
+                        {
+                            "start": "00:00:31,990",
+                            "end": "00:00:35,230",
+                            "text": "她不是对组织、对自己失去",
+                        },
+                    ],
+                }
+            ],
+            "batches": [],
+        }
+        entries = extract_subtitle_entries_from_frame_analysis(data)
+        self.assertEqual(2, len(entries))
+        self.assertEqual("我了解小月。", entries[0].text)
+        self.assertEqual("她不是对组织、对自己失去", entries[1].text)
+
+    def test_build_plot_blueprint_material_principles(self):
+        from app.services.documentary.documentary_subtitle_enrichment import (
+            build_plot_blueprint_material_principles,
+        )
+
+        with_srt_and_frame = build_plot_blueprint_material_principles(
+            has_srt_subtitle=True,
+            has_frame_subtitle=True,
+            theme="罚罪",
+        )
+        self.assertIn("抽帧（主·画面/场景）", with_srt_and_frame)
+        self.assertIn("SRT 字幕（对白/时间戳主）", with_srt_and_frame)
+        self.assertIn("抽帧内字幕（辅）", with_srt_and_frame)
+        self.assertIn("人名谐音/ASR 归并", with_srt_and_frame)
+
+        with_frame_only = build_plot_blueprint_material_principles(
+            has_frame_subtitle=True,
+            theme="罚罪",
+        )
+        self.assertIn("对白字幕（取自抽帧）", with_frame_only)
+        self.assertNotIn("SRT 字幕", with_frame_only)
+
+        without_sub = build_plot_blueprint_material_principles(
+            has_srt_subtitle=False,
+            has_frame_subtitle=False,
+        )
+        self.assertIn("对白字幕（暂无）", without_sub)
+
+    def test_resolve_subtitles_for_plot_blueprint(self):
+        import json
+        import tempfile
+        from app.services.documentary.documentary_subtitle_enrichment import (
+            resolve_subtitles_for_plot_blueprint,
+        )
+
+        srt = "1\n00:00:01,000 --> 00:00:02,000\n测试对白"
+        payload = {
+            "scene_segments": [
+                {
+                    "subtitle_entries": [
+                        {
+                            "start": "00:00:29,150",
+                            "end": "00:00:31,550",
+                            "text": "我了解小月。",
+                        }
+                    ]
+                }
+            ],
+            "batches": [],
+        }
+        with tempfile.NamedTemporaryFile("w", encoding="utf-8", suffix=".json", delete=False) as fp:
+            json.dump(payload, fp, ensure_ascii=False)
+            path = fp.name
+        try:
+            srt_text, frame_text, source = resolve_subtitles_for_plot_blueprint(
+                subtitle_content=srt,
+                frame_json_path=path,
+            )
+            self.assertEqual("srt_file", source)
+            self.assertIn("测试对白", srt_text)
+            self.assertIn("我了解小月。", frame_text)
+        finally:
+            os.remove(path)
+
+    def test_build_plot_blueprint_name_unification_section(self):
+        from app.services.short_drama_drama_knowledge import (
+            build_plot_blueprint_name_unification_section,
+        )
+
+        fazu = build_plot_blueprint_name_unification_section(theme="罚罪2")
+        self.assertIn("胡小跃", fazu)
+        self.assertIn("秦峰", fazu)
+        self.assertIn("叶天佑（老叶）≠ 伟业", fazu)
+        self.assertIn("禁止", fazu)
+
+        generic = build_plot_blueprint_name_unification_section(theme="某新剧")
+        self.assertIn("人名谐音/简称归并", generic)
+        self.assertNotIn("胡小跃 ←", generic)
+
+    def test_resolve_frame_subtitle_for_plot_blueprint(self):
+        import json
+        import tempfile
+        from app.services.documentary.documentary_subtitle_enrichment import (
+            resolve_frame_subtitle_for_plot_blueprint,
+        )
+
+        payload = {
+            "scene_segments": [
+                {
+                    "subtitle_entries": [
+                        {
+                            "start": "00:00:29,150",
+                            "end": "00:00:31,550",
+                            "text": "我了解小月。",
+                        }
+                    ]
+                }
+            ],
+            "batches": [],
+        }
+        with tempfile.NamedTemporaryFile("w", encoding="utf-8", suffix=".json", delete=False) as fp:
+            json.dump(payload, fp, ensure_ascii=False)
+            path = fp.name
+        try:
+            text = resolve_frame_subtitle_for_plot_blueprint(path)
+            self.assertIn("我了解小月。", text)
+        finally:
+            os.remove(path)
+
+    def test_finalize_scene_segments_applies_name_corrections(self):
+        from app.services.documentary.frame_extraction_service import DocumentaryFrameExtractionService
+
+        artifact = {
+            "scene_segments": [
+                {
+                    "timestamp": "00:00:00,000-00:00:05,000",
+                    "scene": "办公室",
+                    "action": "秦峰与胡小月交谈",
+                }
+            ],
+            "batches": [],
+        }
+        DocumentaryFrameExtractionService._finalize_scene_segments_in_artifact(artifact)
+        self.assertIn("秦枫", artifact["scene_segments"][0]["action"])
+        self.assertIn("胡小跃", artifact["scene_segments"][0]["action"])
+
+
+class SceneSegmentDedupTests(unittest.TestCase):
+    def test_dedupe_scene_segments_picks_richer_for_identical_timestamp(self):
+        from app.services.documentary.frame_timeline_sampling import dedupe_scene_segments
+
+        segments = [
+            {
+                "timestamp": "00:00:00,000-00:00:10,000",
+                "scene": "地下仓库",
+                "observation": "打斗",
+                "action": "扭打",
+            },
+            {
+                "timestamp": "00:00:00,000-00:00:10,000",
+                "scene": "楼顶天台",
+                "observation": "阴天城市远景下，两名男性角色在天台边缘对峙，气氛严肃",
+                "action": "老叶(男)与楚青桐(男)并肩站在天台边缘交谈",
+                "emotion": "严肃、压抑",
+            },
+        ]
+        result = dedupe_scene_segments(segments)
+        self.assertEqual(1, len(result))
+        kept = result[0]
+        self.assertEqual("楼顶天台", kept["scene"])
+        self.assertNotIn("切换至", kept["scene"])
+        self.assertIn("阴天城市远景", kept["observation"])
+        self.assertNotIn("画面由", kept["observation"])
+        self.assertIn("老叶", kept["action"])
+        self.assertEqual("严肃、压抑", kept["emotion"])
+
+    def test_split_scene_segments_splits_scene_chain(self):
+        from app.services.documentary.frame_timeline_sampling import split_scene_segments
+
+        segments = [
+            {
+                "timestamp": "00:00:00,000-00:00:20,000",
+                "scene": "从天空切换至地下车库切换至地下仓库",
+                "observation": "画面由天空切换至地下车库切换至地下仓库；阴云密布；昏暗车库；仓库内搏斗",
+                "action": "说话；站立；扭打",
+                "emotion": "压抑；紧张；混乱",
+                "key_visual": "冷色调；低光；杂乱",
+            }
+        ]
+        result = split_scene_segments(segments)
+        self.assertEqual(3, len(result))
+        self.assertEqual("天空", result[0]["scene"])
+        self.assertEqual("地下车库", result[1]["scene"])
+        self.assertEqual("地下仓库", result[2]["scene"])
+        self.assertNotIn("切换至", result[0]["scene"])
+        self.assertNotIn("画面由", result[0]["observation"])
+
+    def test_dedupe_scene_segments_keeps_different_scenes_when_overlapping(self):
+        from app.services.documentary.frame_timeline_sampling import dedupe_scene_segments
+
+        segments = [
+            {
+                "timestamp": "00:01:57,550-00:02:19,000",
+                "scene": "废弃建筑内部",
+                "observation": "秦枫与汪涛在破窗前对话，表情严肃互探态度，气氛紧张疑虑，环境破旧",
+                "action": "秦枫(男)与汪涛(男)在破窗前对话",
+            },
+            {
+                "timestamp": "00:01:55,000-00:01:59,000",
+                "scene": "窗后特写",
+                "observation": "短",
+            },
+            {
+                "timestamp": "00:02:00,000-00:02:10,000",
+                "scene": "废弃建筑楼梯间",
+                "observation": "楼梯间",
+            },
+        ]
+        result = dedupe_scene_segments(segments)
+        self.assertEqual(3, len(result))
+        scenes = {item["scene"] for item in result}
+        self.assertIn("窗后特写", scenes)
+        self.assertIn("废弃建筑内部", scenes)
+        self.assertIn("废弃建筑楼梯间", scenes)
+        for item in result:
+            self.assertNotIn("切换至", item["scene"])
+
+    def test_merge_same_scene_within_batch(self):
+        from app.services.documentary.frame_timeline_sampling import merge_same_scene_within_batch
+
+        segments = [
+            {
+                "batch_index": 0,
+                "timestamp": "00:00:01,000-00:00:05,000",
+                "scene": "楼顶天台",
+                "observation": "两人对话",
+                "action": "站立交谈",
+            },
+            {
+                "batch_index": 0,
+                "timestamp": "00:00:05,000-00:00:10,000",
+                "scene": "楼顶天台",
+                "observation": "继续对话",
+                "action": "并肩站立",
+            },
+            {
+                "batch_index": 0,
+                "timestamp": "00:00:06,000-00:00:09,000",
+                "scene": "室外停车场",
+                "observation": "停车场",
+            },
+        ]
+        merged = merge_same_scene_within_batch(segments)
+        self.assertEqual(2, len(merged))
+        rooftop = next(item for item in merged if item["scene"] == "楼顶天台")
+        self.assertEqual("00:00:01,000-00:00:10,000", rooftop["timestamp"])
+        self.assertIn("继续对话", rooftop["observation"])
+
+    def test_prune_cross_scene_overlaps_keeps_richest(self):
+        from app.services.documentary.frame_timeline_sampling import prune_cross_scene_overlaps
+
+        segments = [
+            {
+                "batch_index": 0,
+                "timestamp": "00:00:01,940-00:00:16,940",
+                "scene": "楼顶天台",
+                "observation": "阴天楼顶，叶天佑与另一男子面对面站立，气氛严肃压抑",
+                "action": "叶天佑(男)与未名人员(男)在天台交谈",
+                "emotion": "严肃、压抑",
+                "key_visual": "阴天冷色调，城市建筑远景",
+            },
+            {
+                "batch_index": 0,
+                "timestamp": "00:00:02,100-00:00:06,000",
+                "scene": "案发现场",
+                "observation": "男警倒在血泊中",
+                "action": "胡小跃(男)倒地",
+            },
+            {
+                "batch_index": 0,
+                "timestamp": "00:00:03,500-00:00:08,000",
+                "scene": "龙湾村航拍",
+                "observation": "航拍渔村",
+            },
+        ]
+        pruned = prune_cross_scene_overlaps(segments, overlap_ratio=0.5)
+        self.assertEqual(1, len(pruned))
+        self.assertEqual("楼顶天台", pruned[0]["scene"])
+
+    def test_normalize_scene_segments_strict_prunes_opening_hallucinations(self):
+        from app.services.documentary.frame_timeline_sampling import normalize_scene_segments
+
+        segments = [
+            {
+                "batch_index": 0,
+                "timestamp": "00:00:00,000-00:00:15,000",
+                "scene": "室外夜景与住宅区",
+                "observation": "警服与住宅区",
+            },
+            {
+                "batch_index": 0,
+                "timestamp": "00:00:01,940-00:00:16,940",
+                "scene": "楼顶天台",
+                "observation": "阴天楼顶，两人交谈，气氛严肃",
+                "action": "两人并肩对话",
+                "emotion": "压抑",
+            },
+            {
+                "batch_index": 0,
+                "timestamp": "00:00:04,500-00:00:09,000",
+                "scene": "室内仓库",
+                "observation": "仓库突袭",
+                "action": "持枪搜索",
+            },
+        ]
+        result = normalize_scene_segments(segments, strict_scene_rules=True)
+        self.assertLessEqual(len(result), 2)
+        scenes = {item["scene"] for item in result}
+        self.assertNotIn("室内仓库", scenes & {"室内仓库", "室外夜景与住宅区"})
+
+    def test_parse_scene_chain_repairs_corrupted_cong_prefix(self):
+        from app.services.documentary.frame_timeline_sampling import (
+            _format_scene_chain,
+            _parse_scene_chain,
+        )
+
+        scenes = _parse_scene_chain("从从从天空切换至地下车库切换至从地下仓库")
+        self.assertEqual(["天空", "地下车库", "地下仓库"], scenes)
+        self.assertEqual(
+            "从天空切换至地下车库切换至地下仓库",
+            _format_scene_chain(scenes),
+        )
+
+    def test_compact_analysis_artifact_deduplicates_scene_segments(self):
+        from app.services.documentary.frame_analysis_compact import compact_analysis_artifact
+
+        artifact = {
+            "artifact_version": "documentary-frame-analysis-v3",
+            "video_path": "/tmp/demo.mp4",
+            "scene_segments": [
+                {
+                    "timestamp": "00:00:00,000-00:00:10,000",
+                    "scene": "地下车库",
+                    "observation": "x",
+                },
+                {
+                    "timestamp": "00:00:00,000-00:00:10,000",
+                    "scene": "天空",
+                    "observation": "阴云密布的天空中，阳光从云层缝隙透出",
+                },
+                {
+                    "timestamp": "00:00:10,900-00:00:19,000",
+                    "scene": "楼顶天台",
+                    "observation": "对话",
+                },
+            ],
+            "batches": [],
+        }
+        compact = compact_analysis_artifact(artifact, include_frame_observations=False)
+        self.assertEqual(2, len(compact["scene_segments"]))
+        self.assertEqual("天空", compact["scene_segments"][0]["scene"])
+        self.assertIn("阴云密布", compact["scene_segments"][0]["observation"])
+        self.assertEqual("楼顶天台", compact["scene_segments"][1]["scene"])
+
+
+class PlotBlueprintValidationTests(unittest.TestCase):
+    def test_validate_plot_blueprint_rejects_out_of_bounds_timestamp(self):
+        from app.services.documentary.documentary_plot_blueprint_validator import (
+            validate_plot_blueprint,
+        )
+
+        text = (
+            "## 主要人物表\n- 胡小跃(男)\n"
+            "## 开头高潮方案\n00:40:00,000-00:40:10,000\n"
+            "## 原片时间线\n1. 事件\n"
+            "## 成片叙事顺序方案\n_id 1\n"
+            "## 建议保留原声 OST=1\n"
+            "1. 说话人：老叶 台词：「测试」 时间戳：00:40:05,000-00:40:15,000\n"
+            "## 解说 OST=0 脉络规划\n- 解说\n"
+            "## 声画对位注意\n- 无\n"
+            + "补" * 2100
+        )
+        result = validate_plot_blueprint(
+            text,
+            source_duration_ms=38 * 60 * 1000 + 13 * 1000,
+            frame_max_ms=38 * 60 * 1000 + 13 * 1000,
+            min_chars=2000,
+        )
+        self.assertFalse(result["ok"])
+        self.assertTrue(
+            any("超出" in issue for issue in result.get("issues") or [])
+        )
+
+    def test_validate_plot_blueprint_rejects_short_ost1_clip(self):
+        from app.services.documentary.documentary_plot_blueprint_validator import (
+            validate_plot_blueprint,
+        )
+
+        text = (
+            "## 主要人物表\n- 胡小跃(男)\n"
+            "## 开头高潮方案\n00:00:58,370-00:01:03,410\n"
+            "## 原片时间线\n1. 事件\n"
+            "## 成片叙事顺序方案\n_id 1\n"
+            "## 建议保留原声 OST=1\n"
+            "1. 说话人：胡小跃 台词：「那你们跟着我。」 "
+            "时间戳：00:02:51,080-00:02:51,920\n"
+            "## 解说 OST=0 脉络规划\n- 解说\n"
+            "## 声画对位注意\n- 无\n"
+            + "补" * 2100
+        )
+        result = validate_plot_blueprint(
+            text,
+            frame_max_ms=40 * 60 * 1000,
+            settings={"ost1_duration_min": 8, "ost1_duration_max": 18},
+            min_chars=2000,
+        )
+        self.assertFalse(result["ok"])
+        self.assertTrue(
+            any("过短" in issue for issue in result.get("issues") or [])
+        )
+
+    def test_validate_plot_blueprint_rejects_huxiaoyue_as_female(self):
+        from app.services.documentary.documentary_plot_blueprint_validator import (
+            validate_plot_blueprint,
+        )
+
+        text = (
+            "## 主要人物表\n- 胡小跃：女警\n"
+            "## 开头高潮方案\n00:00:58,370-00:01:03,410\n"
+            "## 原片时间线\n1. 事件\n"
+            "## 成片叙事顺序方案\n_id 1\n"
+            "## 建议保留原声 OST=1\n"
+            "1. 说话人：老叶 台词：「测试」 时间戳：00:00:58,370-00:01:08,370\n"
+            "## 解说 OST=0 脉络规划\n- 解说\n"
+            "## 声画对位注意\n- 无\n"
+            + "补" * 2100
+        )
+        result = validate_plot_blueprint(
+            text,
+            frame_max_ms=40 * 60 * 1000,
+            min_chars=2000,
+        )
+        self.assertFalse(result["ok"])
+        self.assertTrue(
+            any("胡小跃" in issue for issue in result.get("issues") or [])
+        )
+
+    def test_build_frame_analysis_time_bounds_section(self):
+        from app.services.documentary.documentary_subtitle_enrichment import (
+            build_frame_analysis_time_bounds_section,
+        )
+
+        section = build_frame_analysis_time_bounds_section(
+            "",
+            source_duration_sec=2300.0,
+        )
+        self.assertIn("抽帧时间边界", section)
+
+
+class Fazu2Ost0TimingTests(unittest.TestCase):
+    def test_align_ost0_lead_in_before_next_ost1(self):
+        from app.services.documentary.documentary_script_optimizer import (
+            _align_fazu2_ost0_to_adjacent_ost1,
+        )
+        from app.services.documentary.documentary_settings import get_documentary_compact_settings
+        from app.services.srt_utils import parse_timestamp_range
+
+        items = [
+            {
+                "_id": 1,
+                "timestamp": "00:37:59,940-00:38:13,520",
+                "picture": "庙会冲突",
+                "narration": "播放原片",
+                "OST": 1,
+            },
+            {
+                "_id": 2,
+                "timestamp": "00:00:01,940-00:00:16,260",
+                "picture": "解说引入正叙",
+                "narration": "宝子们，我们开始看罚罪2第一集。故事，得从另一场更绝望的对峙说起。",
+                "OST": 0,
+            },
+            {
+                "_id": 3,
+                "timestamp": "00:03:08,639-00:03:17,639",
+                "picture": "铁笼内，胡小跃被囚禁刑讯",
+                "narration": "播放原片3",
+                "OST": 1,
+            },
+        ]
+        cfg = get_documentary_compact_settings()
+        result = _align_fazu2_ost0_to_adjacent_ost1(items, cfg)
+        ost0 = result[1]
+        start_ms, end_ms = parse_timestamp_range(ost0["timestamp"])
+        next_start_ms, _ = parse_timestamp_range(result[2]["timestamp"])
+        lead_ms = int(float(cfg.get("ost0_lead_before_ost1_sec", 10)) * 1000)
+        self.assertGreaterEqual(next_start_ms - start_ms, lead_ms - 500)
+        self.assertLess(end_ms, next_start_ms)
+        self.assertNotEqual("00:00:01,940", ost0["timestamp"].split("-", 1)[0])
+
+    def test_align_ost0_commentary_uses_previous_ost1(self):
+        from app.services.documentary.documentary_script_optimizer import (
+            _align_fazu2_ost0_to_adjacent_ost1,
+        )
+        from app.services.documentary.documentary_settings import get_documentary_compact_settings
+
+        items = [
+            {
+                "_id": 1,
+                "timestamp": "00:00:16,940-00:00:26,700",
+                "narration": "播放原片",
+                "OST": 1,
+            },
+            {
+                "_id": 2,
+                "timestamp": "00:00:01,940-00:00:16,260",
+                "narration": "一句话把领导噎住了。",
+                "OST": 0,
+            },
+            {
+                "_id": 3,
+                "timestamp": "00:00:30,000-00:00:40,000",
+                "narration": "播放原片",
+                "OST": 0,
+            },
+        ]
+        cfg = get_documentary_compact_settings()
+        result = _align_fazu2_ost0_to_adjacent_ost1(items, cfg)
+        self.assertTrue(result[1]["timestamp"].startswith("00:00:16,940"))
+
+
+class OpeningClimaxReplayTests(unittest.TestCase):
+    def test_apply_opening_climax_chronological_replay_inserts_before_chronological_slot(self):
+        from app.services.documentary.opening_climax_resolver import (
+            apply_opening_climax_chronological_replay,
+        )
+
+        items = [
+            {
+                "_id": 1,
+                "timestamp": "00:10:23,010-00:10:39,520",
+                "picture": "审讯室暖黄光，胡小跃背对镜头",
+                "narration": "播放原片6",
+                "OST": 1,
+            },
+            {
+                "_id": 2,
+                "timestamp": "00:00:00,000-00:00:10,000",
+                "picture": "黑屏",
+                "narration": "宝子们，我们开始看罚罪2第1集。",
+                "OST": 0,
+            },
+            {
+                "_id": 10,
+                "timestamp": "00:09:13,520-00:10:12,560",
+                "picture": "审讯室对峙",
+                "narration": "播放原片6",
+                "OST": 1,
+            },
+            {
+                "_id": 11,
+                "timestamp": "00:11:41,920-00:12:00,900",
+                "picture": "局里宣布停职",
+                "narration": "局里宣布胡小跃停职检讨",
+                "OST": 0,
+            },
+        ]
+        updated = apply_opening_climax_chronological_replay(items, enabled=True)
+        self.assertEqual(5, len(updated))
+        replay_items = [
+            item
+            for item in updated
+            if item.get("timestamp") == "00:10:23,010-00:10:39,520" and int(item.get("_id") or 0) != 1
+        ]
+        self.assertEqual(1, len(replay_items))
+        replay = replay_items[0]
+        self.assertEqual(1, int(replay.get("OST")))
+        self.assertIn("【复现】", str(replay.get("picture") or ""))
+        self.assertEqual(5, int(updated[-1]["_id"]))
+        self.assertEqual("00:11:41,920-00:12:00,900", updated[-1]["timestamp"])
+
+    def test_apply_opening_climax_chronological_replay_skips_when_already_present(self):
+        from app.services.documentary.opening_climax_resolver import (
+            apply_opening_climax_chronological_replay,
+        )
+
+        items = [
+            {
+                "_id": 1,
+                "timestamp": "00:10:23,010-00:10:39,520",
+                "picture": "开篇",
+                "narration": "播放原片",
+                "OST": 1,
+            },
+            {
+                "_id": 2,
+                "timestamp": "00:10:23,010-00:10:39,520",
+                "picture": "【复现】开篇",
+                "narration": "播放原片",
+                "OST": 1,
+            },
+        ]
+        updated = apply_opening_climax_chronological_replay(items, enabled=True)
+        self.assertEqual(2, len(updated))

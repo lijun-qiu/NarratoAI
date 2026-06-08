@@ -121,6 +121,8 @@ def init_global_state():
         st.session_state['video_clip_json_path'] = 'auto_compact'
     if 'documentary_script_mode' not in st.session_state:
         st.session_state['documentary_script_mode'] = 'auto_compact'
+    if 'narration_workflow_mode' not in st.session_state:
+        st.session_state['narration_workflow_mode'] = config.app.get('narration_workflow_mode', '')
     # 移除subclip_videos初始化 - 现在使用统一裁剪策略
 
 

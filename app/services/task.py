@@ -109,7 +109,10 @@ def _build_merge_video_options(
     from app.services.short_drama_settings import resolve_video_output_for_script_mode
 
     script_mode = str(getattr(params, "video_clip_json_path", "") or "").strip().lower()
-    video_output = resolve_video_output_for_script_mode(video_output, script_path=script_mode)
+    workflow_mode = str(getattr(params, "narration_workflow_mode", "") or "").strip().lower()
+    video_output = resolve_video_output_for_script_mode(
+        video_output, script_path=script_mode, workflow_mode=workflow_mode
+    )
     if hasattr(params, 'watermark_text') and params.watermark_text is not None:
         video_output["watermark_text"] = params.watermark_text
     if hasattr(params, 'enable_picture_narration') and params.enable_picture_narration is not None:
@@ -184,13 +187,20 @@ def _merge_task_subtitles(
 def _collect_video_clips_from_script(
     new_script_list: list,
     subclip_path_videos: dict = None,
-) -> list:
-    """收集可合并的视频片段路径（与脚本顺序一致）。"""
+) -> tuple[list, list]:
+    """收集可合并的视频片段路径及对应 OST（跳过无有效视频的片段，二者索引对齐）。"""
     video_clips = []
+    video_ost = []
+
+    def _append_clip(path: str, ost: int) -> None:
+        video_clips.append(path)
+        video_ost.append(int(ost))
+
     for new_script in new_script_list:
+        ost = int(new_script.get("OST", 0) or 0)
         video_path = new_script.get("video")
         if video_path and is_valid_video_file(video_path):
-            video_clips.append(video_path)
+            _append_clip(video_path, ost)
             continue
 
         logger.warning(
@@ -199,13 +209,13 @@ def _collect_video_clips_from_script(
         if subclip_path_videos and new_script.get("_id") in subclip_path_videos:
             backup_video = subclip_path_videos[new_script.get("_id")]
             if is_valid_video_file(backup_video):
-                video_clips.append(backup_video)
+                _append_clip(backup_video, ost)
                 logger.info(f"使用备用视频: {backup_video}")
             else:
                 logger.error(f"备用视频也不存在: {backup_video}")
         else:
             logger.error(f"无法找到片段 {new_script.get('_id')} 的视频文件")
-    return video_clips
+    return video_clips, video_ost
 
 
 def _merge_video_clips_and_sync_timeline(
@@ -268,7 +278,14 @@ def _merge_audio_and_subtitles(
             logger.info(f"音频文件合并成功->{merged_audio_path}")
 
         merged_subtitle_path = _merge_task_subtitles(task_id, new_script_list, params)
+        from app.services.short_drama_settings import resolve_video_output_for_script_mode
+
         video_output = get_video_output_settings()
+        script_path = str(getattr(params, "video_clip_json_path", "") or "").strip().lower()
+        workflow_mode = str(getattr(params, "narration_workflow_mode", "") or "").strip().lower()
+        video_output = resolve_video_output_for_script_mode(
+            video_output, script_path=script_path, workflow_mode=workflow_mode
+        )
         if hasattr(params, "enable_picture_narration") and params.enable_picture_narration is not None:
             video_output["enable_picture_narration"] = params.enable_picture_narration
         picture_narration_path = _build_picture_narration_path(
@@ -500,9 +517,11 @@ def start_subclip(task_id: str, params: VideoClipParams, subclip_path_videos: di
     final_video_paths = []
     combined_video_paths = []
 
-    video_clips = _collect_video_clips_from_script(new_script_list, subclip_path_videos)
+    video_clips, clip_ost_list = _collect_video_clips_from_script(
+        new_script_list, subclip_path_videos
+    )
     combined_video_path, new_script_list = _merge_video_clips_and_sync_timeline(
-        task_id, new_script_list, video_clips, video_ost, params, video_script_path
+        task_id, new_script_list, video_clips, clip_ost_list, params, video_script_path
     )
     sm.state.update_task(task_id, state=const.TASK_STATE_PROCESSING, progress=75)
 
@@ -645,9 +664,9 @@ def start_subclip_unified(task_id: str, params: VideoClipParams):
     final_video_paths = []
     combined_video_paths = []
 
-    video_clips = _collect_video_clips_from_script(new_script_list)
+    video_clips, clip_ost_list = _collect_video_clips_from_script(new_script_list)
     combined_video_path, new_script_list = _merge_video_clips_and_sync_timeline(
-        task_id, new_script_list, video_clips, video_ost, params, video_script_path
+        task_id, new_script_list, video_clips, clip_ost_list, params, video_script_path
     )
     sm.state.update_task(task_id, state=const.TASK_STATE_PROCESSING, progress=75)
 

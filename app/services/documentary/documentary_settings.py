@@ -64,6 +64,17 @@ DOCUMENTARY_DEFAULTS: Dict[str, Any] = {
     "narration_input_max_chars": 65000,
     "narration_input_max_tokens": 85000,
     "narration_compact_markdown_chars": 120000,
+    # 抽帧 JSON 保存：去掉 raw_response / frame_paths 等调试字段
+    "strip_frame_analysis_debug_fields": True,
+    # 同一场景连续片段不重复写入 scene / key_visual / emotion / 观察句
+    "dedupe_scene_environment": True,
+    # 抽帧 JSON 保存为紧凑单行（无 indent，体积更小）
+    "compact_analysis_json": False,
+    # 抽帧视觉分析：默认不注入剧集人物关系知识库（避免脑补全剧名场面）
+    "enable_frame_analysis_drama_knowledge": False,
+    # 抽帧 scene_segments 硬性规则：仅可见画面、同批同景合并、跨场景重叠剔除
+    "enable_frame_strict_scene_rules": True,
+    "frame_cross_scene_overlap_prune_ratio": 0.5,
     "narration_chunk_max_chars": 50000,
     "narration_chunk_max_sections": 30,
     # 单次 LLM 调用可靠输出的 items 上限；分块数以段数容量为下限，仅单块超限时才增块
@@ -139,9 +150,12 @@ DOCUMENTARY_COMPACT_OVERRIDES: Dict[str, Any] = {
     "min_ost1_segments": 15,
     "max_ost1_segments": 28,
     "ost1_every_n_segments": 2,
+    # OST=0 引出下一段 OST=1 时，取画起点 = 下一段原声开始时间 − 该秒数
+    "ost0_lead_before_ost1_sec": 10,
     "fazu2_core_theme": "",
     "fazu2_opening_climax_hint": FAZU2_DEFAULT_OPENING_CLIMAX_HINT,
     "enable_opening_closing_hook": True,
+    "enable_opening_climax_chronological_replay": True,
     "opening_hook_template": "",
     # 仅第 1 集开头高潮末尾使用；第 2 集起由模型按当集名场面自拟转场
     "transition_hook_template": "故事，得从头讲起。",
@@ -209,10 +223,18 @@ DOCUMENTARY_SETTING_KEYS = frozenset(
         "target_output_ratio",
         "target_output_minutes",
         "ost0_segment_min",
+        "ost0_lead_before_ost1_sec",
         "ost1_duration_hard_max",
         "min_ost1_segments",
         "max_ost1_segments",
         "require_subtitle_for_script",
+        "enable_frame_analysis_drama_knowledge",
+        "frame_analysis_drama_knowledge_max_chars",
+        "enable_subtitle_analysis_drama_knowledge",
+        "subtitle_analysis_drama_knowledge_max_chars",
+        "enable_drama_knowledge",
+        "enable_frame_strict_scene_rules",
+        "frame_cross_scene_overlap_prune_ratio",
     }
 )
 
@@ -351,8 +373,9 @@ def build_fazu2_ost_interleave_section(
 | **悬疑** | 您猜他怎么回？往下看！ / 更狠的还在后面。 | 金句原声 |
 | **钩子** | 注意看，这群人已经蹲守三天了。且看他们怎么收网。 | 行动现场原声 |
 
-- 引出原声的 OST=0 段：`timestamp` 取**原声开始之前**的剧情画面；**不要**与下一段 OST=1 时间重叠
-- 原声播完后，再用 OST=0 **点评/承接**；形成「铺垫引出原声 → 原声整句播完 → 点评」节奏
+- 引出原声的 OST=0 段：`timestamp` **起点** = 下一段 OST=1 的 `timestamp` 开始时间 **往前约 {int(cfg.get("ost0_lead_before_ost1_sec", 10))} 秒**（取该时段剧情画面作 B-roll）；**不要**与下一段 OST=1 时间重叠
+- **禁止** OST=0 铺垫段长期停留在片头同一区间（如全片复用 `00:00:01`）；铺垫写什么剧情，`timestamp` 就对准下一段原声前后
+- 原声播完后，再用 OST=0 **点评/承接**（`timestamp` 取**上一段 OST=1** 同场景区间）；形成「铺垫引出原声 → 原声整句播完 → 点评」节奏
 - **突兀感红线**：观众应听完一句完整原台词或一个完整原声片段，再听到解说；勿在话说到一半切走
 """
 
@@ -399,16 +422,36 @@ def build_fazu2_frame_character_gender_reference() -> str:
     )
 
 
+def build_frame_visible_content_hint(
+    settings: Optional[Dict[str, Any]] = None,
+    *,
+    frame_count: int = 0,
+) -> str:
+    """抽帧视觉分析：仅描述本批次帧内可见内容（硬性）。"""
+    cfg = settings or get_documentary_settings()
+    if cfg.get("enable_frame_strict_scene_rules") is False:
+        return ""
+    count_text = str(frame_count) if frame_count > 0 else "本批次"
+    return (
+        f"**仅可见画面（硬性）**：scene_segments 只能描述本批次 {count_text} 张图片中实际可见的内容；"
+        "禁止编造未出现在画面中的地点、人物、闪回、航拍、牺牲、追车、仓库突袭等「印象名场面」。"
+        "若连续帧为同一地点、同一组人物对话，**本批次只输出 1 条** scene_segment，合并 timestamp 覆盖该对话时段；"
+        "同一批次内 timestamp 不得重叠；不同地点/不同场景不得拆成多条重叠时间段。"
+        "人名仅在本批次硬字幕或 SRT 对白摘录中出现过时可写，否则用「未名人员(男/女)」。"
+    )
+
+
 def build_frame_character_naming_hint(settings: Optional[Dict[str, Any]] = None) -> str:
     """视觉分析阶段：人名须有据，无据用未名人员+性别。"""
     cfg = settings or get_documentary_settings()
     hints: list[str] = [
-        "人名**仅在本批次硬字幕或对白摘录中明确出现**时才能写入 characters / observation；",
-        f"无法从字幕确认身份时，characters 用「{FRAME_UNKNOWN_CHARACTER_MALE}」「{FRAME_UNKNOWN_CHARACTER_FEMALE}」，"
-        f"observation 用「{FRAME_UNKNOWN_CHARACTER_MALE}与……并肩」等，**禁止臆造姓名**；",
-        f"禁止用「领导」「警员」「男子A」等泛称写入 characters（无真名时用未名人员+性别）；",
+        "人名/称呼**仅在本批次硬字幕、SRT 对白摘录、scene_segments.subtitle_entries.text 中出现过**时才能写入 observation/action；",
+        "subtitle_entries 每条 text 即为**原片字幕原文**（含 ASR 错字如「小月」也须原样出现在摘录侧，画面描述侧对照关系表写「胡小跃」）；",
+        "摘录中的**全名、小名、昵称、关系称呼**（老叶、小跃、师傅、文妈等）须与字幕原文一致；",
+        f"无法从字幕确认身份时，用「{FRAME_UNKNOWN_CHARACTER_MALE}」「{FRAME_UNKNOWN_CHARACTER_FEMALE}」，"
+        f"**禁止**用「领导」「警员」「男子A」等泛称作姓名；",
         "「伟业」是局长人物专属名，勿把与之对话的上级/长辈称为伟业；",
-        "硬字幕出现「老叶」时可写「老叶(男)」，与「伟业(男)」区分两人。",
+        "硬字幕/SRT 出现「老叶」时写「老叶(男)」，与「伟业(男)」区分两人。",
     ]
     if is_fazu2_compact_settings(cfg):
         hints.append(
@@ -614,16 +657,17 @@ def build_compact_story_script_rules(
 |------|----------|----------|-----|
 | ① 开头高潮 | 第 1 段 | **默认跳楼牺牲**（胡小跃楼顶纵身跃下，金句「天就快亮了。」），**纯原声，无旁白** | 1 |
 | ② 转场+正叙开始 | 第 2 段 | 以「宝子们」开头，接「{transition_tpl}」，然后进入正叙 | 0 |
-| ③ 正叙剧情 | 第 3 段至倒数第 2 段 | 按时间线推进；**推荐 OST=0 铺垫/悬疑引出 OST=1 原声**，原声播完再接 OST=0 点评 | 混合 |
-| ④ 高潮复现+后续+结束语 | 最后一段 | 可复现开头名场面，推进高潮后情节，以道别收尾 | 0 或 1 |
+| ③ 正叙剧情 | 第 3 段至倒数第 2 段 | 按时间线推进；**正叙走到第 1 段开篇高潮的原片时刻，须再插入同一片段 OST=1（【复现】）**；推荐 OST=0 铺垫后接 OST=1 原声 | 混合 |
+| ④ 高潮复现+后续+结束语 | 最后一段 | 可再次呼应开头名场面；须含道别语收尾 | 0 或 1 |
 
-**`_id` = 成片播放顺序**（1→2→3…）。① 可用本集中后段时间戳倒叙开场，③ 再从片头正叙；`timestamp` 均须从字幕原样复制。
+**`_id` = 成片播放顺序**（1→2→3…）。① 倒叙开篇高潮 → ② 转场正叙 → ③ 正叙推进至第 1 段时间戳处**必须复现同一片段** → ④ 收尾。
 
 ### ③ 开头高潮选取（第 1 段 OST=1 · 硬性）
 - **默认优先**：{resolve_fazu2_opening_climax_hint(cfg)}
 - 用户「追加提示词」若指定开头名场面 → **以追加为准**
 - 中段冲突台词（如狗贩子争吵、掏枪对峙）可作正叙 **OST=1**，**不得**顶替跳楼作第 1 段
-- 最后一段「高潮复现」应呼应**第 1 段跳楼**，不是中段台词
+- **正叙复现（硬性）**：播放顺序推进到第 1 段 `timestamp` 对应的原片时刻时，**必须再插入一段与第 1 段完全相同的 OST=1**（同 timestamp / original_line / picture，picture 可加「【复现】」前缀）
+- 最后一段可再次呼应开头名场面，但**不能替代**正叙中的这次复现
 
 {build_fazu2_character_roles_section()}
 {build_fazu2_picture_narration_sync_section()}
@@ -798,11 +842,13 @@ def build_fazu2_generation_anti_patterns(
     cfg = settings or get_documentary_compact_settings()
     ost_dur_min = int(cfg.get("ost1_duration_min", 8))
     ost_dur_max = int(cfg.get("ost1_duration_max", 18))
+    lead_sec = int(cfg.get("ost0_lead_before_ost1_sec", 10) or 10)
     return f"""## 错误示范 vs 正确示范
 
 ### ❌ 禁止
 - 第 1 段 OST=0 或含旁白/「宝子们」
 - 第 2 段没有「宝子们」开头
+- OST=0 铺垫段 `timestamp` 全片复用片头同一区间（如全是 `00:00:01`），与下一段 OST=1 画面相隔数分钟
 - OST=1 的 `narration` 为空或写解说词（应固定「播放原片」）
 - OST=1 缺少 `original_line` 字段
 - 在 `narration` 中用 `**「金句」**` 代替 `original_line`（旧版格式，已废弃）
@@ -816,6 +862,7 @@ def build_fazu2_generation_anti_patterns(
 ### ✅ 必须
 - 第 1 段 OST=1：跳楼 sacrifice +「天就快亮了。」类金句；`播放原片` + `original_line`；纯原声无旁白
 - 第 2 段 OST=0：以「宝子们」开头，接「故事，得从头讲起」进入正叙
+- OST=0 铺垫下一段 OST=1：`timestamp` **起点** = 下一段原声开始 **− 约 {lead_sec} 秒**（取画与解说/原声内容一致）
 - 关键台词前 OST=0 埋伏/悬疑引出 → OST=1：`"narration": "播放原片"` + `"original_line": "「台词」"` → 下段 OST=0 点评
 - 最后一段含「宝子们，我们下期再见！」；可复现开头名场面（OST=0 时台词用「」嵌入 narration）
 - 输出顶层 JSON 数组 `[...]`；`_id` 为播放顺序；人名严格按字幕

@@ -18,6 +18,10 @@ from loguru import logger
 # 导入新的LLM服务模块 - 确保提供商被注册
 import app.services.llm  # 这会触发提供商注册
 from app.services.documentary.documentary_settings import get_narration_script_llm_params
+from app.services.documentary.frame_timeline_sampling import (
+    format_scene_segment as _format_scene_segment,
+    frame_analysis_to_timeline_sampled_markdown,
+)
 from app.services.llm.migration_adapter import generate_narration as generate_narration_new
 # 导入新的提示词管理系统
 from app.services.prompts import PromptManager
@@ -67,46 +71,6 @@ def parse_frame_analysis_to_markdown(json_file_path, *, detail_level: str = "ful
 
         compact = (detail_level or "full").lower() == "compact"
 
-        def format_scene_segment(segment: dict, index: int) -> str:
-            timestamp = segment.get("timestamp", "")
-            scene = segment.get("scene", "")
-            characters = segment.get("characters") or []
-            if isinstance(characters, list):
-                characters_text = "、".join(str(name) for name in characters if str(name).strip())
-            else:
-                characters_text = str(characters)
-            lines = [f"## 场景 {index}", f"- 时间：{timestamp}"]
-            if scene:
-                lines.append(f"- 场景：{scene}")
-            if characters_text:
-                lines.append(f"- 人物：{characters_text}")
-            observation = str(segment.get("observation") or "").strip()
-            if observation:
-                lines.append(f"- 观察：{observation}")
-            for label, key in (
-                ("动作", "action"),
-                ("情绪", "emotion"),
-                ("关键视觉", "key_visual"),
-                ("音效/原声", "audio_cue"),
-                ("重要度", "importance"),
-                ("字幕", "subtitle"),
-            ):
-                value = str(segment.get(key) or "").strip()
-                if value:
-                    lines.append(f"- {label}：{value}")
-            entries = segment.get("subtitle_entries")
-            if isinstance(entries, list) and entries:
-                lines.append("- 字幕明细：")
-                for entry in entries:
-                    if not isinstance(entry, dict):
-                        continue
-                    start = str(entry.get("start") or "").strip()
-                    end = str(entry.get("end") or "").strip()
-                    text = str(entry.get("text") or "").strip()
-                    if start and end and text:
-                        lines.append(f"  - [{start}-{end}] {text}")
-            return "\n".join(lines) + "\n\n"
-
         def format_sample_frames(observations: list) -> str:
             if not observations:
                 return ""
@@ -140,9 +104,10 @@ def parse_frame_analysis_to_markdown(json_file_path, *, detail_level: str = "ful
 
         top_level_segments = data.get("scene_segments")
         if isinstance(top_level_segments, list) and top_level_segments:
+            env_context: dict[str, str] = {}
             for index, segment in enumerate(top_level_segments, 1):
                 if isinstance(segment, dict):
-                    markdown += format_scene_segment(segment, index)
+                    markdown += _format_scene_segment(segment, index, env_context=env_context)
             return markdown
 
         # 新结构：按批次保存完整分析产物
@@ -152,9 +117,10 @@ def parse_frame_analysis_to_markdown(json_file_path, *, detail_level: str = "ful
             for i, batch in enumerate(ordered_batches, 1):
                 batch_segments = batch.get("scene_segments") or []
                 if batch_segments:
+                    env_context: dict[str, str] = {}
                     for segment in batch_segments:
                         if isinstance(segment, dict):
-                            markdown += format_scene_segment(segment, i)
+                            markdown += _format_scene_segment(segment, i, env_context=env_context)
                     continue
 
                 time_range = batch.get("time_range", "")

@@ -20,13 +20,19 @@ from app.services.documentary.documentary_settings import (
     build_frame_character_naming_hint,
     build_frame_gender_hint,
     build_frame_highlight_hint,
+    build_frame_visible_content_hint,
     get_documentary_settings,
     warn_frame_analysis_gender_mismatch,
 )
 from app.services.documentary.frame_analysis_compact import slim_scene_segment_for_artifact
+from app.services.documentary.frame_timeline_sampling import normalize_scene_segments
 from app.services.documentary.documentary_subtitle_enrichment import (
     attach_subtitles_to_frame_analysis_artifact,
     subtitle_excerpt_for_time_range,
+)
+from app.services.short_drama_drama_knowledge import (
+    apply_name_corrections_to_frame_analysis_artifact,
+    build_frame_analysis_drama_knowledge_section,
 )
 from app.config.llm_gateway_router import describe_llm_route, resolve_llm_credentials
 from app.services.documentary.vision_model_rotation import (
@@ -39,19 +45,24 @@ from app.utils import utils, video_processor
 class DocumentaryFrameExtractionService:
     PROMPT_TEMPLATE = """
 我提供了 {frame_count} 张视频帧，它们按时间顺序排列，代表一个连续的视频片段。
-请综合这些帧，识别其中的**独立场景片段**（同一地点、同一组人物、连续动作可合并为一条），输出结构化 JSON。
+请综合这些帧，识别本批次**实际可见**的场景（同一地点、同一组人物、连续动作须合并为一条），输出结构化 JSON。
+
+**仅可见画面（硬性）**：
+- 只描述这 {frame_count} 张图片里看得见的内容；禁止编造画面未出现的地点、闪回、航拍、追车、牺牲等
+- 若整批画面为同一场景对话，只输出 **1 条** scene_segment
+- 禁止凭剧情印象或外部知识填充「名场面」
 
 **timestamp 规则（硬性）**：
 - 格式必须为 `HH:MM:SS,mmm-HH:MM:SS,mmm`（起止时间，逗号分隔毫秒）
 - 必须与本批次提供的字幕对白时间尽量对齐，用于后期剪辑定位
 - 每条 segment 的 timestamp 应覆盖该场景在批次内的实际时间，不要编造批次外的时间
-- 同一批次内各 segment 的 timestamp 不要重叠
+- 同一批次内各 segment 的 timestamp **不得重叠**
 
 **scene_segments 每条必填字段（仅输出以下 6 项，不要额外键）**：
 - timestamp: 时间范围字符串
 - scene: 场景名称（如「办公室」「楼顶天台」）
 - observation: 本场景一句话画面观察（人物+动作+氛围，30–80 字；勿复述对白）
-- action: 人物在做什么（如「老叶与伟业并肩站在天台边缘交谈」），须含可见性别
+- action: 人物在做什么（须含可见性别；无字幕依据时用「未名人员(男/女)」）
 - emotion: 画面情绪（紧张、愤怒、悲伤、绝望等）
 - key_visual: 光线/色调/构图等特殊视觉（如「阴天冷色调，云层低垂，城市远景」）
 
@@ -67,15 +78,15 @@ JSON 必须包含以下键：
   "scene_segments": [
     {{
       "timestamp": "00:00:01,940-00:00:09,940",
-      "scene": "楼顶天台",
-      "observation": "阴天楼顶，老叶与伟业并肩对峙，气氛压抑",
-      "action": "老叶与伟业并肩站在天台边缘交谈",
+      "scene": "室外天台",
+      "observation": "阴天，两名男子并肩站立交谈，气氛严肃",
+      "action": "未名人员(男)与未名人员(男)在天台边缘对话",
       "emotion": "严肃、压抑",
       "key_visual": "阴天冷色调，城市建筑远景，云层低垂"
     }}
   ],
   "frame_observations": [
-    {{"timestamp": "00:00:00,000", "observation": "楼顶天台，老叶与伟业并肩，阴天冷色调"{burned_in_subtitle_example}}}
+    {{"timestamp": "00:00:00,000", "observation": "室外天台，两名男子并肩，阴天冷色调"{burned_in_subtitle_example}}}
   ],
   "overall_activity_summary": "本批次主要活动总结"
 }}
@@ -86,9 +97,9 @@ JSON 必须包含以下键：
 
     BURNED_IN_SUBTITLE_PROMPT_SUFFIX = """
 同时，请识别每帧画面**底部烧录硬字幕**（烧录在画面上的对白文字，非画面描述）：
-- burned_in_subtitle: 硬字幕原文；若无硬字幕、仅水印/logo 或无法辨认，则为空字符串
+- burned_in_subtitle: **逐字原样**复制硬字幕原文；若无硬字幕、仅水印/logo 或无法辨认，则为空字符串
 - has_burned_in_subtitle: 布尔值，画面底部是否清晰可见硬字幕
-不要猜测听不清的内容；多行字幕合并为一行。该字段用于对照原字幕文件修正错别字，请尽量逐字准确。
+不要猜测听不清的内容；不要改写、补全或「纠正」错别字；多行字幕合并为一行。该字段用于对照字幕与构思蓝图，请尽量准确复刻画面文字。
 """.strip()
 
     BURNED_IN_SUBTITLE_JSON_EXAMPLE = (
@@ -403,16 +414,40 @@ JSON 必须包含以下键：
     @staticmethod
     def enrich_analysis_artifact_subtitles(
         artifact: dict[str, Any],
-        subtitle_content: str,
+        subtitle_content: str = "",
         *,
         documentary_settings: dict | None = None,
     ) -> dict[str, Any]:
-        """为已有抽帧分析 JSON 注入 SRT 字幕字段（无需重跑视觉模型）。"""
-        return attach_subtitles_to_frame_analysis_artifact(
-            artifact,
-            subtitle_content,
-            settings=documentary_settings or get_documentary_settings(),
+        """刷新抽帧 JSON 内 scene 字幕（仅 burned_in，无需重抽帧、无需 SRT）。"""
+        cfg = documentary_settings or get_documentary_settings()
+        from app.services.documentary.documentary_subtitle_enrichment import (
+            attach_burned_in_subtitles_to_artifact,
         )
+        from app.services.documentary.frame_analysis_compact import compress_analysis_artifact
+
+        attach_burned_in_subtitles_to_artifact(artifact, settings=cfg)
+        return compress_analysis_artifact(artifact, settings=cfg)
+
+    @staticmethod
+    def refresh_subtitles_in_analysis_file(
+        analysis_json_path: str,
+        *,
+        documentary_settings: dict | None = None,
+    ) -> str:
+        """已有抽帧 JSON：仅按硬字幕重算 segment.subtitle，不重新抽帧。"""
+        artifact = pairing_load_analysis_artifact(analysis_json_path)
+        cfg = documentary_settings or get_documentary_settings()
+        DocumentaryFrameExtractionService.enrich_analysis_artifact_subtitles(
+            artifact,
+            documentary_settings=cfg,
+        )
+        with open(analysis_json_path, "w", encoding="utf-8") as fp:
+            if cfg.get("compact_analysis_json"):
+                json.dump(artifact, fp, ensure_ascii=False, separators=(",", ":"))
+            else:
+                json.dump(artifact, fp, ensure_ascii=False, indent=2)
+        logger.info(f"已刷新抽帧硬字幕字段: {analysis_json_path}")
+        return analysis_json_path
 
     @staticmethod
     def compact_analysis_artifact(
@@ -821,6 +856,13 @@ JSON 必须包含以下键：
             include_burned_in_subtitle=bool(cfg.get("enable_hard_subtitle_ocr", True)),
         )
         extra_lines: list[str] = []
+        visible_hint = build_frame_visible_content_hint(cfg, frame_count=frame_count)
+        if visible_hint:
+            extra_lines.append(visible_hint)
+        theme_text = (video_theme or cfg.get("default_video_theme") or "").strip()
+        drama_block, _ = build_frame_analysis_drama_knowledge_section(theme_text, cfg)
+        if drama_block.strip():
+            extra_lines.append(drama_block.strip())
         naming_hint = build_frame_character_naming_hint(cfg)
         if naming_hint:
             extra_lines.append(naming_hint)
@@ -839,8 +881,13 @@ JSON 必须包含以下键：
             )
             if dialogue:
                 extra_lines.append(
-                    f"本批次时间范围 {time_range} 附近字幕对白（分析画面时请对照，不要虚构台词）：{dialogue}"
+                    f"本批次时间范围 {time_range} 附近字幕对白（分析画面时请对照，不要虚构台词；"
+                    f"出现的小名/昵称/关系称呼如老叶、小跃、师傅等须原样使用）：{dialogue}"
                 )
+        extra_lines.append(
+            "scene_segments 若含 subtitle_entries（每项 start/end/text），其中 text 即为**原片字幕逐条原文**，"
+            "与硬字幕同等效力；写 observation/action 时人名须与这些 text 或硬字幕一致，勿改写 subtitle_entries。"
+        )
         if (video_theme or "").strip():
             extra_lines.append(f"视频主题：{video_theme.strip()}")
         if (custom_prompt or "").strip():
@@ -848,7 +895,7 @@ JSON 必须包含以下键：
         if not extra_lines:
             return prompt
 
-        extras = "\n".join(f"- {line}" for line in extra_lines)
+        extras = "\n\n".join(extra_lines)
         return f"{prompt}\n\n补充分析要求：\n{extras}"
 
     @staticmethod
@@ -974,35 +1021,55 @@ JSON 必须包含以下键：
             "frame_observations": frame_observations,
             "overall_activity_summaries": overall_activity_summaries,
         }
-        if (subtitle_content or "").strip():
-            attach_subtitles_to_frame_analysis_artifact(
-                artifact,
-                subtitle_content,
-                settings=documentary_settings or get_documentary_settings(),
-            )
         self._finalize_scene_segments_in_artifact(artifact)
+        attach_subtitles_to_frame_analysis_artifact(
+            artifact,
+            subtitle_content or "",
+            settings=documentary_settings or get_documentary_settings(),
+        )
+        from app.services.documentary.frame_analysis_compact import compress_analysis_artifact
+
+        compress_analysis_artifact(
+            artifact,
+            settings=documentary_settings or get_documentary_settings(),
+        )
         return artifact
 
     @staticmethod
     def _finalize_scene_segments_in_artifact(artifact: dict[str, Any]) -> None:
-        """统一 scene_segments 为六核心字段（+ 可选字幕对位字段）。"""
+        """统一 scene_segments 为六核心字段（+ 可选字幕对位字段），并去重重叠片段。"""
+        from app.services.documentary.documentary_settings import get_documentary_settings
+
+        cfg = get_documentary_settings()
+        strict_scene_rules = bool(cfg.get("enable_frame_strict_scene_rules", True))
+        cross_scene_overlap_prune_ratio = float(
+            cfg.get("frame_cross_scene_overlap_prune_ratio", 0.5) or 0.5
+        )
         segments = artifact.get("scene_segments") or []
-        if isinstance(segments, list):
-            artifact["scene_segments"] = [
+        if isinstance(segments, list) and segments:
+            slimmed = [
                 slim_scene_segment_for_artifact(segment)
                 for segment in segments
                 if isinstance(segment, dict)
             ]
-        for batch in artifact.get("batches") or []:
-            if not isinstance(batch, dict):
-                continue
-            batch_segments = batch.get("scene_segments") or []
-            if isinstance(batch_segments, list):
-                batch["scene_segments"] = [
-                    slim_scene_segment_for_artifact(segment)
-                    for segment in batch_segments
-                    if isinstance(segment, dict)
-                ]
+            normalized = normalize_scene_segments(
+                slimmed,
+                strict_scene_rules=strict_scene_rules,
+                cross_scene_overlap_prune_ratio=cross_scene_overlap_prune_ratio,
+            )
+            artifact["scene_segments"] = normalized
+
+            segments_by_batch: dict[int, list[dict[str, Any]]] = {}
+            for segment in normalized:
+                batch_index = int(segment.get("batch_index", 0))
+                segments_by_batch.setdefault(batch_index, []).append(segment)
+
+            for batch in artifact.get("batches") or []:
+                if not isinstance(batch, dict):
+                    continue
+                batch_index = int(batch.get("batch_index", 0))
+                batch["scene_segments"] = segments_by_batch.get(batch_index, [])
+        apply_name_corrections_to_frame_analysis_artifact(artifact)
 
     @staticmethod
     def analysis_artifact_dir() -> str:
@@ -1060,7 +1127,13 @@ JSON 必须包含以下键：
                 suffix += 1
 
         with open(file_path, "w", encoding="utf-8") as fp:
-            json.dump(artifact, fp, ensure_ascii=False, indent=2)
+            from app.services.documentary.documentary_settings import get_documentary_settings
+
+            cfg = get_documentary_settings()
+            if cfg.get("compact_analysis_json"):
+                json.dump(artifact, fp, ensure_ascii=False, separators=(",", ":"))
+            else:
+                json.dump(artifact, fp, ensure_ascii=False, indent=2)
         logger.info(f"分析结果已保存到: {file_path}")
         return file_path
 
@@ -1098,12 +1171,25 @@ JSON 必须包含以下键：
         return clips
 
     @staticmethod
-    def _format_scene_segment_picture(segment: dict[str, Any]) -> str:
-        observation = str(segment.get("observation") or "").strip()
+    def _format_scene_segment_picture(
+        segment: dict[str, Any],
+        *,
+        env_context: dict[str, str] | None = None,
+    ) -> str:
+        from app.services.documentary.frame_timeline_sampling import (
+            resolve_segment_display_fields,
+            update_segment_environment_context,
+        )
+
+        display = resolve_segment_display_fields(segment, env_context)
+        if env_context is not None:
+            update_segment_environment_context(env_context, segment)
+
+        observation = str(display.get("observation") or "").strip()
         if observation:
             return observation
         parts: list[str] = []
-        scene = str(segment.get("scene") or "").strip()
+        scene = str(display.get("scene") or "").strip()
         if scene:
             parts.append(scene)
         characters = segment.get("characters") or []
@@ -1112,7 +1198,7 @@ JSON 必须包含以下键：
             if names:
                 parts.append("、".join(names))
         for key in ("action", "key_visual", "emotion"):
-            text = str(segment.get(key) or "").strip()
+            text = str(display.get(key) or segment.get(key) or "").strip()
             if text:
                 parts.append(text)
         return "，".join(parts) or str(segment.get("action") or "").strip() or "场景片段"

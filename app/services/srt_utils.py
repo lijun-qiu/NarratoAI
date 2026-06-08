@@ -222,34 +222,87 @@ def is_valid_script_timestamp_range(
     return end_ms > start_ms and (end_ms - start_ms) >= min_ms
 
 
+def _expand_timestamp_to_min_duration(
+    start_ms: int,
+    end_ms: int,
+    *,
+    min_ms: int,
+    max_end_ms: int | None = None,
+    hard_max_ms: int | None = None,
+) -> tuple[int, int]:
+    """将区间扩展到至少 min_ms，受下一区间与 hard_max 约束。"""
+    if end_ms <= start_ms:
+        end_ms = start_ms + max(min_ms, 500)
+    if end_ms - start_ms >= min_ms:
+        return start_ms, end_ms
+
+    target_end = start_ms + min_ms
+    if hard_max_ms and hard_max_ms > 0:
+        target_end = min(target_end, start_ms + hard_max_ms)
+    if max_end_ms is not None:
+        target_end = min(target_end, max_end_ms)
+    if target_end <= start_ms:
+        target_end = start_ms + min_ms
+    return start_ms, max(end_ms, target_end)
+
+
 def repair_or_drop_invalid_timestamp_items(
     items: list[dict[str, Any]],
     *,
     subtitle_content: str = "",
     min_duration_ms: int = 500,
     ost1_min_duration_ms: int = 800,
+    ost1_max_duration_ms: int = 18000,
+    drop_unrecoverable: bool = False,
 ) -> list[dict[str, Any]]:
     """
-    无效或过短 timestamp：优先按字幕重新对位；仍无效则剔除并重排 _id。
-    不盲目延长区间。
+    无效或过短 timestamp：优先按字幕重新对位；仍不足则自动扩展区间（不删段）。
+    drop_unrecoverable=True 时，仅在完全无法解析时间轴时才剔除。
     """
     entries = parse_srt(subtitle_content or "")
-    kept: list[dict[str, Any]] = []
+    ordered = sorted(items, key=lambda row: int(row.get("_id") or 0))
+    next_starts: list[int] = []
+    for item in ordered:
+        ts = str(item.get("timestamp") or "").strip()
+        if "-" in ts:
+            start_ms, _ = parse_timestamp_range(ts)
+        else:
+            start_ms = 0
+        next_starts.append(start_ms)
 
-    for item in items:
+    kept: list[dict[str, Any]] = []
+    expanded_count = 0
+
+    for index, item in enumerate(ordered):
         row = dict(item)
         ts = str(row.get("timestamp") or "").strip()
         is_ost1 = int(row.get("OST", 0) or 0) == 1
         min_ms = ost1_min_duration_ms if is_ost1 else min_duration_ms
+        hard_max_ms = ost1_max_duration_ms if is_ost1 else None
+        next_start_cap = (
+            next_starts[index + 1] - 50
+            if index + 1 < len(next_starts)
+            else None
+        )
 
         if is_valid_script_timestamp_range(ts, min_duration_ms=min_ms):
             kept.append(row)
             continue
 
         start_ms, end_ms = parse_timestamp_range(ts) if "-" in ts else (0, 0)
-        span: tuple[int, int] | None = None
+        if start_ms <= 0 and end_ms <= 0 and entries:
+            line = str(row.get("original_line") or row.get("narration") or "")
+            line = re.sub(r"^播放原片\d*$", "", line).strip()
+            global_span = find_subtitle_span_global(
+                entries,
+                line,
+                max_span_ms=hard_max_ms or 22_000,
+            )
+            if global_span:
+                start_ms, end_ms = global_span
 
-        if entries:
+        span: tuple[int, int] | None = None
+        if entries and start_ms >= 0:
             line = str(row.get("original_line") or row.get("narration") or "")
             line = re.sub(r"^播放原片\d*$", "", line).strip()
             span = find_subtitle_span_for_line(
@@ -257,6 +310,7 @@ def repair_or_drop_invalid_timestamp_items(
                 line,
                 near_start_ms=start_ms,
                 near_end_ms=max(end_ms, start_ms + 500),
+                max_span_ms=hard_max_ms or 22_000,
             )
             if not span:
                 span = find_subtitle_span_for_line(
@@ -264,26 +318,58 @@ def repair_or_drop_invalid_timestamp_items(
                     "",
                     near_start_ms=start_ms,
                     near_end_ms=max(end_ms, start_ms + 500),
+                    max_span_ms=hard_max_ms or 22_000,
                 )
 
-        if span and span[1] > span[0] and (span[1] - span[0]) >= min_ms:
-            row["timestamp"] = (
-                f"{format_timestamp_ms(span[0])}-{format_timestamp_ms(span[1])}"
+        if span and span[1] > span[0]:
+            start_ms, end_ms = span
+
+        if start_ms > 0 or end_ms > start_ms:
+            start_ms, end_ms = _expand_timestamp_to_min_duration(
+                start_ms,
+                end_ms,
+                min_ms=min_ms,
+                max_end_ms=next_start_cap,
+                hard_max_ms=hard_max_ms,
             )
-            logger.info(f"片段 #{row.get('_id')} 已按字幕重新对位: {row['timestamp']}")
-            kept.append(row)
+            row["timestamp"] = (
+                f"{format_timestamp_ms(start_ms)}-{format_timestamp_ms(end_ms)}"
+            )
+            if is_valid_script_timestamp_range(row["timestamp"], min_duration_ms=min_ms):
+                logger.info(
+                    f"片段 #{row.get('_id')} 已扩展/对位 timestamp: {row['timestamp']}"
+                )
+                expanded_count += 1
+                kept.append(row)
+                continue
+
+        if drop_unrecoverable and start_ms <= 0 and end_ms <= start_ms:
+            logger.warning(
+                f"片段 #{row.get('_id')} timestamp 无法恢复，已移除: {ts}"
+            )
             continue
 
-        logger.warning(
-            f"片段 #{row.get('_id')} timestamp 无效/过短且无法对位，已移除: {ts}"
+        fallback_start = max(0, start_ms)
+        fallback_end = fallback_start + max(min_ms, 500)
+        if next_start_cap is not None:
+            fallback_end = min(fallback_end, max(fallback_start + 200, next_start_cap))
+        if hard_max_ms:
+            fallback_end = min(fallback_end, fallback_start + hard_max_ms)
+        row["timestamp"] = (
+            f"{format_timestamp_ms(fallback_start)}-{format_timestamp_ms(fallback_end)}"
         )
+        logger.warning(
+            f"片段 #{row.get('_id')} timestamp 强制扩展保留: {row['timestamp']}"
+        )
+        expanded_count += 1
+        kept.append(row)
 
     for index, row in enumerate(kept, 1):
         row["_id"] = index
-    if len(kept) < len(items):
+    if expanded_count:
         logger.info(
             f"timestamp 校验：保留 {len(kept)}/{len(items)} 段，"
-            f"移除 {len(items) - len(kept)} 段无效片段"
+            f"扩展/对位 {expanded_count} 段"
         )
     return kept
 

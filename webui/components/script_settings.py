@@ -15,10 +15,26 @@ from app.services.subtitle_video_pairing import (
     load_subtitle_content,
 )
 from app.utils import utils, check_script
-from webui.tools.generate_script_docu import generate_script_docu
+from webui.tools.generate_script_docu import (
+    generate_plot_blueprint_docu,
+    generate_script_docu,
+)
 from webui.tools.generate_script_short import generate_script_short
-from webui.tools.generate_short_summary import generate_script_short_sunmmary
+from webui.tools.generate_short_summary import (
+    generate_plot_blueprint_short,
+    generate_script_short_sunmmary,
+)
 from webui.tools.generate_film_tv_summary import generate_script_film_tv_summary
+from webui.tools.plot_blueprint_workflow import (
+    build_plot_blueprint_fingerprint,
+    clear_plot_blueprint,
+    commit_plot_blueprint_draft,
+    get_plot_blueprint,
+    is_plot_blueprint_ready,
+    is_plot_blueprint_valid,
+    render_plot_blueprint_panel,
+    uses_plot_blueprint_workflow,
+)
 from webui.components.documentary_material_pickers import render_documentary_material_pickers
 from webui.components.documentary_preprocess_panel import render_documentary_preprocess_panel
 from webui.components.frame_analysis_settings import (
@@ -88,6 +104,12 @@ def render_script_panel(tr):
             # 默认为空
             pass
 
+        # 两步生成：先展示剧情构思方案，再生成脚本
+        script_path = st.session_state.get("video_clip_json_path", "")
+        if uses_plot_blueprint_workflow(script_path):
+            fingerprint = _compute_plot_blueprint_fingerprint(params, script_path)
+            render_plot_blueprint_panel(fingerprint=fingerprint, mode=script_path)
+
         # 渲染脚本操作按钮
         render_script_buttons(tr, params)
 
@@ -156,7 +178,13 @@ def render_script_file(tr, params):
             new_mode = mode_options[selected_label]
             st.session_state.video_clip_json_path = new_mode
             params.video_clip_json_path = new_mode
-            if new_mode == MODE_AUTO_COMPACT:
+            if new_mode == MODE_SUMMARY:
+                st.session_state["narration_workflow_mode"] = MODE_SUMMARY
+                config.app["narration_workflow_mode"] = MODE_SUMMARY
+            elif new_mode == MODE_FILM_TV:
+                st.session_state["narration_workflow_mode"] = MODE_FILM_TV
+                config.app["narration_workflow_mode"] = MODE_FILM_TV
+            elif new_mode in (MODE_AUTO_COMPACT, MODE_AUTO):
                 st.session_state["documentary_script_mode"] = MODE_AUTO_COMPACT
                 from app.services.documentary.documentary_settings import (
                     get_compact_custom_prompt_display,
@@ -490,8 +518,8 @@ def render_video_details(tr, params, *, compact: bool = False):
         default_prompt = st.session_state[prompt_key]
         st.caption(
             "默认「逐帧精剪」：在下方选用或导入字幕与抽帧分析 JSON（也可在「素材预处理」完成）"
-            "→ 生成脚本时自动做字幕×抽帧对照分析 → 再按罚罪2 V2 规则生成 JSON。"
-            "视频主题填剧名集数（如《罚罪2》第1集）。"
+            "→ **① 生成剧情构思方案** 或 **在下方直接填写/修正** → 保存或确认 "
+            "→ **② 生成 JSON 脚本**（有构思方案后无需字幕/抽帧）。视频主题填剧名集数（如《罚罪2》第1集）。"
         )
         with st.expander("转场句 / 结尾（可配置）", expanded=False):
             enable_hook = st.checkbox(
@@ -576,6 +604,8 @@ def render_video_details(tr, params, *, compact: bool = False):
         "追加提示词",
         help=(
             "置于脚本生成 prompt **首位**（最高优先级），不参与抽帧视觉分析。"
+            "联合构思可注入「剧集人物关系对照」（config: enable_subtitle_analysis_drama_knowledge）；"
+            "抽帧分析默认不注入（enable_frame_analysis_drama_knowledge=false），避免脑补全剧名场面。"
             "适合写本集固定要求，如开头高潮名场面、必讲情节等。"
         ),
         height=72,
@@ -681,9 +711,11 @@ def _render_short_drama_frame_analysis_block(tr) -> None:
 
 def short_drama_summary(tr):
     """短剧解说 渲染视频主题和提示词（支持抽帧分析，工作流参照逐帧精剪）"""
+    st.session_state.setdefault("narration_workflow_mode", "summary")
+    config.app.setdefault("narration_workflow_mode", "summary")
     st.caption(
         "推荐流程：完成字幕转录与抽帧分析 → 下方选用抽帧 JSON 与字幕 → "
-        "生成时自动做字幕×抽帧对照分析 → 再按短剧解说规则输出 JSON 脚本。"
+        "**① 自动生成** 或 **手动填写/修正** 剧情构思方案 → **② 生成 JSON 脚本**（有方案后无需字幕/抽帧）。"
     )
     _render_short_drama_frame_analysis_block(tr)
     st.divider()
@@ -1133,6 +1165,23 @@ def render_subtitle_narration_panel(
     return video_theme
 
 
+def _compute_plot_blueprint_fingerprint(params, script_path: str) -> str:
+    subtitle_path = _resolve_active_subtitle_path()
+    analysis_path = (st.session_state.get("frame_analysis_json_path") or "").strip()
+    enable_frame = True
+    if script_path == "summary":
+        enable_frame = bool(st.session_state.get("sd_enable_frame_analysis", True))
+    return build_plot_blueprint_fingerprint(
+        mode=script_path,
+        video_path=(params.video_origin_path or "").strip(),
+        subtitle_path=subtitle_path,
+        analysis_path=analysis_path,
+        video_theme=str(st.session_state.get("video_theme") or ""),
+        append_prompt=str(st.session_state.get("append_custom_prompt") or ""),
+        enable_frame_analysis=enable_frame,
+    )
+
+
 def render_script_buttons(tr, params):
     """渲染脚本操作按钮"""
     # 获取当前选择的脚本类型
@@ -1157,7 +1206,62 @@ def render_script_buttons(tr, params):
         button_name = tr("Please Select Script File")
 
     is_preprocess = script_path == "preprocess"
-    if st.button(
+    if uses_plot_blueprint_workflow(script_path):
+        fingerprint = _compute_plot_blueprint_fingerprint(params, script_path)
+        blueprint_ready = is_plot_blueprint_ready(fingerprint=fingerprint, mode=script_path)
+        col_blueprint, col_script = st.columns(2)
+        with col_blueprint:
+            if st.button(
+                "① 生成剧情构思方案",
+                key="generate_plot_blueprint",
+                disabled=is_preprocess,
+                use_container_width=True,
+            ):
+                if script_path == "auto_compact":
+                    generate_plot_blueprint_docu(params, compact=True, fingerprint=fingerprint)
+                elif script_path == "summary":
+                    subtitle_path = _resolve_active_subtitle_path()
+                    video_theme = st.session_state.get("video_theme")
+                    generate_plot_blueprint_short(
+                        params,
+                        subtitle_path,
+                        video_theme,
+                        fingerprint=fingerprint,
+                    )
+        with col_script:
+            if st.button(
+                "② 生成 JSON 脚本",
+                key="generate_script_from_blueprint",
+                disabled=is_preprocess or not blueprint_ready,
+                use_container_width=True,
+            ):
+                try:
+                    commit_plot_blueprint_draft(fingerprint=fingerprint, mode=script_path)
+                except ValueError as exc:
+                    st.error(str(exc))
+                    st.stop()
+                blueprint = get_plot_blueprint()
+                if script_path == "auto_compact":
+                    generate_script_docu(params, compact=True, plot_blueprint=blueprint)
+                elif script_path == "summary":
+                    subtitle_path = _resolve_active_subtitle_path()
+                    video_theme = st.session_state.get("video_theme")
+                    temperature = st.session_state.get("temperature")
+                    generate_script_short_sunmmary(
+                        params,
+                        subtitle_path,
+                        video_theme,
+                        temperature,
+                        plot_blueprint=blueprint,
+                    )
+        if blueprint_ready and st.button(
+            "清除构思方案（重新构思）",
+            key="clear_plot_blueprint",
+            use_container_width=True,
+        ):
+            clear_plot_blueprint()
+            st.rerun()
+    elif st.button(
         button_name,
         key="script_action",
         disabled=not script_path or is_preprocess,
@@ -1316,6 +1420,9 @@ def save_script_with_validation(tr, video_clip_json_details):
                 json.dump(data, file, ensure_ascii=False, indent=4)
                 st.session_state['video_clip_json'] = data
                 st.session_state['video_clip_json_path'] = save_path
+                workflow = st.session_state.get("narration_workflow_mode") or MODE_SUMMARY
+                st.session_state["narration_workflow_mode"] = workflow
+                config.app["narration_workflow_mode"] = workflow
                 
                 # 标记需要切换到文件选择模式（在下次渲染前处理）
                 st.session_state['_switch_to_file_mode'] = True
@@ -1351,6 +1458,11 @@ def get_script_params():
     return {
         'video_language': st.session_state.get('video_language', ''),
         'video_clip_json_path': st.session_state.get('video_clip_json_path', ''),
+        'narration_workflow_mode': (
+            st.session_state.get('narration_workflow_mode')
+            or config.app.get('narration_workflow_mode')
+            or ''
+        ),
         'video_origin_path': video_origin_path,
         'video_name': st.session_state.get('video_name', ''),
         'video_plot': st.session_state.get('video_plot', ''),

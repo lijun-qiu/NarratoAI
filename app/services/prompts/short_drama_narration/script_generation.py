@@ -19,8 +19,8 @@ class ScriptGenerationPrompt(ParameterizedPrompt):
         metadata = PromptMetadata(
             name="script_generation",
             category="short_drama_narration",
-            version="v2.2",
-            description="短剧解说：3:7解说原声比、time_range字幕边界、原声段picture双引号旁白",
+            version="v2.4",
+            description="短剧解说：成片8-13分钟、3:7时长比、播放顺序可倒叙/正叙、每段完整脉络",
             model_type=ModelType.TEXT,
             output_format=OutputFormat.JSON,
             tags=["短剧", "解说脚本", "文案生成", "原声片段", "黄金开场", "爽点放大", "个性吐槽", "悬念预埋"],
@@ -29,15 +29,17 @@ class ScriptGenerationPrompt(ParameterizedPrompt):
                 "plot_analysis",
                 "subtitle_content",
                 "subtitle_frame_analysis",
-                "segment_count_hint",
+                "output_duration_hint",
                 "narration_percent",
                 "original_audio_percent",
-                "ost0_segment_min",
-                "ost0_segment_max",
-                "ost1_segment_max",
+                "target_output_minutes_min",
+                "target_output_minutes_max",
                 "narration_chars_min",
                 "narration_chars_max",
                 "max_consecutive_ost1",
+                "ost1_duration_min",
+                "ost1_duration_max",
+                "ost0_duration_min",
             ]
         )
         super().__init__(metadata, required_parameters=["drama_name", "plot_analysis"])
@@ -67,44 +69,58 @@ ${subtitle_content}
 ${subtitle_frame_analysis}
 </subtitle_frame_analysis>
 
-**素材优先级（硬性）：以字幕为主，抽帧为辅。**
+**素材优先级（硬性）：以字幕为主，抽帧为辅；剧情构思须同时利用二者。**
 - **字幕（主）**：剧情、`narration`、人名、**所有 `timestamp`**
-- **抽帧（辅）**：`picture` 画面描述，以及 `time_range` 剪辑边界对位
-- 对照分析中的原声建议、开头高潮方案须落实，但时间戳与台词仍以字幕为准；`picture` 参考抽帧，昼夜/光线/天气以画面为准
+- **抽帧（辅）**：`picture` 画面描述，以及 `subtitle_entries` 剪辑边界对位
+- 对照分析中的**成片叙事顺序方案**、开头高潮方案、OST=1 清单须落实；时间戳与台词仍以字幕为准
+- 若剧情概述已含完整构思方案，下方对照分析可忽略
 
-### 片段边界（硬性 · 对齐抽帧 time_range）
-- 抽帧 JSON 中 `time_range` = **字幕对位剪辑范围**（优先按 `subtitle_entries` 首尾；无则同 `timestamp`）
-- 每条 item 的 `timestamp` **结束时间以该段字幕结束时间为准**（即 time_range 的右端 / 最后一条 subtitle_entries 的 `end`）
-- **禁止**在原声台词未说完、字幕未结束前截断；OST=1 须覆盖整句对白
-- 有抽帧分析时：先在 JSON 中定位对应 scene 的 `time_range`，再写入 item 的 `timestamp`
+### 片段边界（硬性 · 对齐抽帧 subtitle_entries）
+- 抽帧 JSON 中 **`subtitle_entries`** = 字幕对位剪辑片段列表，每项含 `start` / `end` / `text`
+- 每条 item 的 `timestamp` **结束时间以该段最后一条 subtitle_entries 的 `end` 为准**
+- OST=1 须覆盖整句对白，**禁止**在原声台词未说完、字幕未结束前截断
+- 有抽帧分析时：先在 JSON 中定位对应 scene 的 `subtitle_entries`，再写入 item 的 `timestamp`
 
-### 段数密度（重要）
-${segment_count_hint}
+### timestamp 硬性约束（违反则整份 JSON 无效）
+- 格式固定：`HH:MM:SS,mmm-HH:MM:SS,mmm`（**结束时间必须严格大于开始时间**）
+- **禁止零时长**：不得出现起止相同，如 `00:01:02,000-00:01:02,000`
+- OST=1 每段须从字幕复制**完整对白区间**，时长通常 **${ost1_duration_min}–${ost1_duration_max} 秒**（见配置）
+- **`_id` = 成片播放顺序**；`timestamp` = 原片裁剪区间，二者独立——**根据剧情需要**，原片时间可正叙、倒叙、闪回、跳跃，**不要求**按 `_id` 在原片时间轴上递增或递减
+
+### 播放顺序 vs 原片时间（重要）
+- **段落 `_id` 顺序**：决定观众先看到什么、后看到什么，按解说叙事逻辑排列
+- **各段 `timestamp`**：从字幕复制原片区间，可跳回更早时间（倒叙）或跳到更晚时间（预叙）
+- **正叙示例**：_id 2→3→4 的 timestamp 在原片上大致递增，平稳推进
+- **倒叙/闪回示例**：_id 1 用片尾爆点 timestamp，_id 2「宝子们」后 _id 3 跳回片头 timestamp
+- OST=0 解说须帮观众理清时间关系（如「故事，得从头讲起。」「而这时，画面切回三天前——」）
+
+### 成片时长与切段（重要 · 硬性）
+${output_duration_hint}
 
 **结合抽帧分析时**：以**字幕剧情**为正叙切段骨架；**情节点之间**用 OST=0 串场，**同一场戏内**可连续多段 OST=1；勿把全部情节点都标成 OST=1。
 
-## OST 段数比例（硬性 · 不满足则输出无效）
+## 解说/原声时长比例（硬性 · 不满足则输出无效）
 
-| 类型 | 目标占比 | 段数要求 |
-|------|----------|----------|
-| **解说 OST=0** | **约 ${narration_percent}%** | **至少 ${ost0_segment_min} 段**，建议 ${ost0_segment_min}–${ost0_segment_max} 段 |
-| **原声 OST=1** | **约 ${original_audio_percent}%** | **最多 ${ost1_segment_max} 段**（金句/名场面精选，勿堆砌） |
+| 类型 | 目标占比 | 要求 |
+|------|----------|------|
+| **解说 OST=0** | **约 ${narration_percent}% 成片时长** | 每段 **${narration_chars_min}–${narration_chars_max} 字**，估算 ≥${ost0_duration_min} 秒，**完整表达一条脉络** |
+| **原声 OST=1** | **约 ${original_audio_percent}% 成片时长** | 每段 **${ost1_duration_min}–${ost1_duration_max} 秒**，金句/名场面精选，**禁止过短碎段** |
 
-- **同场原声块**：同一场戏/连续对白可 **连续 ${max_consecutive_ost1} 段 OST=1**（每段仍须覆盖整句字幕），**整块播完后**再接 OST=0；勿把每句台词都拆成「原声-解说-原声」三段
-- **段数比例（辅助）**：OST=0 至少 ${ost0_segment_min} 段、OST=1 最多 ${ost1_segment_max} 段；**以成片时长 3:7 为准**，段数仅作参考
-- OST=0 每段 **${narration_chars_min}–${narration_chars_max} 字**；OST=1 的 `narration` 固定「播放原片+序号」
-- **错误示范**：33 段里只有 3 段 OST=0、30 段 OST=1 —— 无效（解说段过少）
-- **正确节奏**：OST=0 埋伏 → OST=1×1~${max_consecutive_ost1} 原声块 → OST=0 点评/过渡 → …
+- **不限制段数**；以**成片总时长 ${target_output_minutes_min}–${target_output_minutes_max} 分钟**与 **3:7 时长占比**为准
+- **同场原声块**：同一场戏/连续对白可 **连续 ${max_consecutive_ost1} 段 OST=1**（每段仍须覆盖整句字幕），**整块播完后**再接 OST=0
+- OST=1 的 `narration` 固定「播放原片+序号」
+- **错误示范**：成片 15 分钟但几乎全是 2–3 秒 OST=1 碎段 —— 无效
+- **正确节奏**：OST=0 埋伏/串场 → OST=1×1~${max_consecutive_ost1} 原声块 → OST=0 点评/过渡 → …
 
 ## 开篇与收尾结构（硬性 · 优先于下方「黄金开场」）
 
-**`_id` = 成片播放顺序**（1→2→3…）。第 1 段可用本集任意时间戳倒叙开场，第 3 段起正叙须按剧情时间线向前。
+**`_id` = 成片播放顺序**（1→2→3…）。第 1 段常用倒叙爆点原声；后续各段 `timestamp` 在原片上可正叙、倒叙或跳跃，由解说逻辑串联即可。
 
 | 段落 | OST | 硬性要求 |
 |------|-----|----------|
 | **第 1 段** | **1** | 从**全片字幕**中选取**最爆燃/最高能**段落（冲突爆发、追逐枪战、情感顶点、名场面反转等），**纯原声播放，禁止旁白** |
 | **第 2 段** | **0** | **`narration` 必须以「宝子们」开头**，接「我们开始看${drama_name}。」（名称已含集数则照写，如「罚罪2第1集」），再自然转入正叙（可参考「故事，得从头讲起。」） |
-| **中间段** | 0/1 穿插 | 按 **3:7 成片时长**（解说约 30%、原声约 70%）；同一场戏可 **连续 2–${max_consecutive_ost1} 段 OST=1** 成块播完，再 OST=0 点评；第 3 段起按剧情时间线正叙 |
+| **中间段** | 0/1 穿插 | 按 **3:7 成片时长**（解说约 30%、原声约 70%）；同一场戏可 **连续 2–${max_consecutive_ost1} 段 OST=1** 成块播完，再 OST=0 点评；原片 timestamp 顺序可灵活安排 |
 | **最后一段** | 0 或 1 | **必须**含结束语「宝子们，我们下期再见！」；可先总结本集悬念再道别 |
 
 **禁止：**
@@ -199,18 +215,18 @@ ${segment_count_hint}
 - **时间戳绝对不能重叠**，确保剪辑后无重复画面
 - **时间段必须连续且不交叉**，严格按时间顺序排列
 - **每个时间戳都必须在原始字幕中找到对应范围**
-- **片段结束边界优先对齐抽帧 `time_range` 的字幕结束时间**（subtitle_entries 最后一条的 end）
+- **片段结束边界优先对齐抽帧 `subtitle_entries` 最后一条的 `end`**
 - 可以拆分原时间片段，但必须保持时间连续性
 - 时间戳的格式必须与原始字幕中的格式完全一致
 
-### 时长控制（1/3原则）
-- **解说视频总长度 = 原视频长度的 1/3**
-- 精确控制节奏和密度，既不能过短也不能过长
-- **解说与原声成片时长比例约 3:7**（解说 30%，原声 70%）
+### 时长控制
+- **成片总时长目标 ${target_output_minutes_min}–${target_output_minutes_max} 分钟**（按 `_id` 播放顺序累加各段时长）
+- **解说与原声成片时长比例约 ${narration_percent}:${original_audio_percent}**
+- 每段须完整表达一条脉络，**禁止过短碎段**
 
 ### 剧情连贯性
 - **保持故事逻辑完整**，确保情节发展自然流畅
-- **第 1 段**时间戳可取自全片任意爆点（倒叙开场）；**第 3 段起**严格按剧情时间顺序正叙，禁止跳跃式叙述
+- **第 1 段**时间戳可取自全片任意爆点（倒叙开场）；各段 `timestamp` 在原片时间轴上**不必**随 `_id` 递增，倒叙/闪回均可，解说须帮观众理清时间关系
 - **符合因果逻辑**：先发生A，再发生B，A导致B
 
 ## 原声片段使用规范
@@ -362,7 +378,7 @@ ${segment_count_hint}
 - **原声格式规范**：narration字段必须使用"播放原片+序号"格式
 - **关键情绪点**：必须保留原片原声，增强观众代入感
 - **时间戳精度**：精确到毫秒级别，确保与字幕完美匹配
-- **逻辑连贯性**：第 3 段起按剧情时间线正叙（第 1 段可倒叙取爆点）
+- **逻辑连贯性**：解说词须帮观众理解时间线；原片 `timestamp` 可倒叙/跳跃，由 `_id` 播放顺序与文案承接
 
 ### 创作原则：
 1. **只输出JSON内容**，不要任何说明性文字
@@ -380,9 +396,11 @@ ${segment_count_hint}
 - [ ] 第 1 段 OST=1，为全片最爆燃原声，无「宝子们」及解说词
 - [ ] 第 2 段 OST=0，`narration` 以「宝子们，我们开始看${drama_name}。」开头
 - [ ] 最后一段含「宝子们，我们下期再见！」
-- [ ] 解说与原声成片时长约 3:7
+- [ ] 成片总时长约 ${target_output_minutes_min}–${target_output_minutes_max} 分钟
+- [ ] 解说与原声成片时长约 ${narration_percent}:${original_audio_percent}
 - [ ] 每条 OST=1 的 `picture` 已用双引号包裹且非空
-- [ ] 各段 `timestamp` 结束时间对齐字幕/time_range 结束点
+- [ ] **每条 `timestamp` 结束时间 > 开始时间，无任何零时长段**
+- [ ] OST=1 每段时长约 ${ost1_duration_min}–${ost1_duration_max} 秒；OST=0 每段 ≥${narration_chars_min} 字
 
 ### 参考解说风格示例：
 - **第 2 段开场**："宝子们，我们开始看罚罪2第1集。故事，得从头讲起。"

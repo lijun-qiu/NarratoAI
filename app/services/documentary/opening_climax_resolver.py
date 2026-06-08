@@ -1204,3 +1204,137 @@ def apply_opening_climax_fix(
         f"({resolved.source})，替换原 timestamp={first.get('timestamp')!r}"
     )
     return ordered
+
+
+_REPLAY_PICTURE_PREFIX = "【复现】"
+_OPENING_REPLAY_PRE_WINDOW_MS = 30_000
+_OPENING_REPLAY_START_TOLERANCE_MS = 5_000
+_OPENING_REPLAY_TIMESTAMP_TOLERANCE_MS = 2_000
+
+
+def _opening_timestamps_match(
+    left: str,
+    right: str,
+    *,
+    tolerance_ms: int = _OPENING_REPLAY_TIMESTAMP_TOLERANCE_MS,
+) -> bool:
+    try:
+        left_start, left_end = parse_timestamp_range(left)
+        right_start, right_end = parse_timestamp_range(right)
+    except Exception:
+        return False
+    return (
+        abs(left_start - right_start) <= tolerance_ms
+        and abs(left_end - right_end) <= tolerance_ms
+    )
+
+
+def _opening_replay_already_present(
+    items: list[dict[str, Any]],
+    opening_timestamp: str,
+) -> bool:
+    for item in items[1:]:
+        if int(item.get("OST", 0)) != 1:
+            continue
+        if _opening_timestamps_match(
+            str(item.get("timestamp") or ""),
+            opening_timestamp,
+        ):
+            return True
+    return False
+
+
+def _find_chronological_replay_insert_index(
+    items: list[dict[str, Any]],
+    opening_start_ms: int,
+) -> int:
+    """在播放顺序中定位「正叙走到开篇高潮原片时刻」的插入点。"""
+    threshold_ms = opening_start_ms - _OPENING_REPLAY_START_TOLERANCE_MS
+    pre_window_ms = opening_start_ms - _OPENING_REPLAY_PRE_WINDOW_MS
+
+    for idx in range(1, len(items)):
+        timestamp = str(items[idx].get("timestamp") or "")
+        if not timestamp:
+            continue
+        try:
+            start_ms, end_ms = parse_timestamp_range(timestamp)
+        except Exception:
+            continue
+
+        if start_ms >= threshold_ms:
+            return idx
+
+        if (
+            start_ms >= pre_window_ms
+            and end_ms >= opening_start_ms - 60_000
+            and end_ms <= opening_start_ms + _OPENING_REPLAY_START_TOLERANCE_MS
+        ):
+            return idx + 1
+
+    return max(1, len(items) - 1)
+
+
+def _build_opening_climax_replay_item(opening: dict[str, Any]) -> dict[str, Any]:
+    replay = {
+        key: value
+        for key, value in opening.items()
+        if not str(key).startswith("_")
+    }
+    picture = str(replay.get("picture") or "").strip().strip('"')
+    if picture and not picture.startswith(_REPLAY_PICTURE_PREFIX):
+        replay["picture"] = f"{_REPLAY_PICTURE_PREFIX}{picture}"
+    replay["OST"] = 1
+    narration = str(replay.get("narration") or "").strip()
+    if not narration or narration == "播放原片":
+        replay["narration"] = "播放原片"
+    replay["_opening_climax_replay"] = True
+    return replay
+
+
+def _renumber_script_item_ids(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    for index, item in enumerate(items, start=1):
+        item["_id"] = index
+    return items
+
+
+def apply_opening_climax_chronological_replay(
+    items: list[dict[str, Any]],
+    *,
+    settings: Optional[dict[str, Any]] = None,
+    enabled: bool = True,
+) -> list[dict[str, Any]]:
+    """正叙时间线走到第 1 段开篇高潮时，再插入同一片段的 OST=1 复现。"""
+    if not enabled or len(items) < 2:
+        return items
+
+    cfg = settings or {}
+    if not cfg.get("enable_opening_climax_chronological_replay", True):
+        return items
+
+    ordered = sorted(items, key=lambda item: int(item.get("_id") or 0))
+    opening = ordered[0]
+    if int(opening.get("OST", 0)) != 1:
+        return items
+
+    opening_timestamp = str(opening.get("timestamp") or "").strip()
+    if not opening_timestamp:
+        return items
+
+    if _opening_replay_already_present(ordered, opening_timestamp):
+        logger.info("开篇高潮已在正叙相应位置复现，跳过插入")
+        return ordered
+
+    try:
+        opening_start_ms, _ = parse_timestamp_range(opening_timestamp)
+    except Exception:
+        return ordered
+
+    insert_idx = _find_chronological_replay_insert_index(ordered, opening_start_ms)
+    replay = _build_opening_climax_replay_item(opening)
+    updated = ordered[:insert_idx] + [replay] + ordered[insert_idx:]
+    updated = _renumber_script_item_ids(updated)
+    logger.info(
+        f"已在正叙位置插入开篇高潮复现（原 timestamp={opening_timestamp!r}，"
+        f"插入于播放顺序第 {insert_idx + 1} 段前）"
+    )
+    return updated

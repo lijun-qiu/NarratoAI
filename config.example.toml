@@ -233,17 +233,20 @@ opening_hook_template = "宝子们，今天咱们一起追《{work_name}》。"
 closing_hook_template = "本集的核心冲突、留下的悬念和下一集的火药桶，就先帮大家梳理到这儿。宝子们，觉得讲清楚了点个赞，咱们下期再见。"
 
 [short_drama]
-# 短剧解说：解说与原声约 3:7；脚本生成 temperature 建议 0.3–0.5
+# 短剧解说：解说与原声成片时长约 3:7；脚本生成 temperature 建议 0.3–0.5
 narration_percent = 30
 original_audio_percent = 70
+narration_ratio_tolerance = 0.10
 narration_script_temperature = 0.4
+# 成片总时长目标（分钟）
+target_output_minutes_min = 8
+target_output_minutes_max = 13
+# 单段最小时长（秒）
 ost1_duration_min = 8
 ost1_duration_max = 18
+ost0_duration_min = 5
 max_consecutive_ost1 = 4
-ost0_segment_min = 8
-ost0_segment_max = 14
-ost1_segment_max = 24
-narration_chars_min = 40
+narration_chars_min = 20
 narration_chars_max = 120
 # 原声段 picture 旁白烧录（双引号包裹，28 号黑色）
 enable_picture_narration = true
@@ -353,6 +356,8 @@ picture_wrap_double_quotes = true
     fazu2_opening_climax_hint = "胡小跃楼顶跳楼牺牲名场面（夜色楼顶纵身跃下），原声金句优先「天就快亮了。」（时间戳从字幕原样复制）。禁止用中段抓捕/争吵（如「你跟我说这是狗贩子」）顶替第 1 段；此类放正叙 OST=1。"
     # V2：第1段纯原声；第2段「宝子们」+转场句；结尾可在 WebUI 修改
     enable_opening_closing_hook = true
+    # 正叙走到第 1 段开篇高潮原片时刻时，自动再插入同一片段 OST=1（【复现】）
+    enable_opening_climax_chronological_replay = true
     opening_hook_template = ""
     # 仅第 1 集开头高潮末尾使用；第 2 集起由模型按当集名场面自拟转场
     transition_hook_template = "故事，得从头讲起。"
@@ -367,9 +372,22 @@ picture_wrap_double_quotes = true
     append_custom_prompt = ""
     require_subtitle_for_script = true
     subtitle_analysis_max_frame_chars = 20000
+    # 短剧联合构思：timeline_uniform=全片均匀采样；head=仅保留片头（旧行为）
+    subtitle_analysis_frame_sampling = "timeline_uniform"
     subtitle_analysis_max_subtitle_chars = 12000
     subtitle_analysis_min_chars = 500
     subtitle_analysis_max_tokens = 4096
+    # 短剧联合构思专用（篇幅更长、校验更严）
+    subtitle_analysis_short_drama_min_chars = 2000
+    subtitle_analysis_short_drama_max_tokens = 8192
+    subtitle_analysis_frame_lexicon_chars = 4000
+    # 短剧联合构思：注入剧集人物关系对照（主题含「罚罪」时自动加载 fazu2_relationships.md）
+    enable_subtitle_analysis_drama_knowledge = true
+    subtitle_analysis_drama_knowledge_max_chars = 10000
+    # 抽帧视觉分析：同样注入人物关系对照（默认关；联合构思仍可单独开启）
+    enable_frame_analysis_drama_knowledge = false
+    frame_analysis_drama_knowledge_max_chars = 5000
+    # subtitle_analysis_drama_knowledge_file = "app/data/drama_knowledge/fazu2_relationships.md"
 
 ##########################################
 # 完美字幕（影视解说：解说 + 原声双轨）

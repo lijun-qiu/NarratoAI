@@ -378,7 +378,7 @@ def merge_materials(
     subtitle_enabled = options.get('subtitle_enabled', True)
     watermark_text = str(options.get('watermark_text') or '').strip()
     picture_narration_path = options.get('picture_narration_path')
-    picture_narration_enabled = options.get('enable_picture_narration', False)
+    picture_narration_enabled = options.get('enable_picture_narration', True)
     picture_narration_font_size = options.get('picture_narration_font_size', 44)
     picture_narration_color = options.get('picture_narration_color', '#FFE066')
     original_subtitle_color = options.get('original_subtitle_color', '#FFE066')

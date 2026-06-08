@@ -54,9 +54,11 @@ class DocumentaryFrameAnalysisService(DocumentaryFrameExtractionService):
         analysis_json_path: str | None = None,
         material_source_video_path: str = "",
         reuse_frame_analysis: bool = True,
+        plot_blueprint: str | None = None,
     ) -> list[dict]:
         progress = progress_callback or (lambda _p, _m: None)
         doc_settings = documentary_settings or get_documentary_settings()
+        blueprint_only = bool((plot_blueprint or "").strip())
 
         resolved_analysis_path = resolve_frame_analysis_path_for_documentary(
             video_path,
@@ -64,41 +66,60 @@ class DocumentaryFrameAnalysisService(DocumentaryFrameExtractionService):
             explicit_path=analysis_json_path,
             reuse=reuse_frame_analysis,
         )
-        if resolved_analysis_path:
-            progress(70, "复用已有抽帧分析，跳过视觉模型...")
-            logger.info(f"复用抽帧分析: {resolved_analysis_path}")
-            analysis_json_path = resolved_analysis_path
-            source = (material_source_video_path or "").strip()
-            if source and source != (video_path or "").strip():
-                logger.info(
-                    f"成片视频与素材来源不同，抽帧分析来自: {source}"
-                )
-        else:
+        analysis_json_path = resolved_analysis_path or ""
+
+        if blueprint_only:
+            if analysis_json_path:
+                progress(70, "可选：复用抽帧分析辅助生成...")
+                logger.info(f"构思方案模式：附加抽帧分析 {analysis_json_path}")
+            else:
+                progress(70, "依据构思方案生成脚本（无需抽帧分析）...")
+                logger.info("已有剧情构思方案，跳过抽帧分析 JSON 依赖")
+        elif not analysis_json_path:
             raise ValueError(
                 "未找到可用的抽帧分析 JSON。请先在「抽帧分析」中点击「抽帧并分析」，"
                 "或上传/复用已有分析文件后再生成脚本。"
                 "若成片为无字幕版本，请在 WebUI 指定「抽帧/字幕来源视频」。"
             )
+        else:
+            progress(70, "复用已有抽帧分析，跳过视觉模型...")
+            logger.info(f"复用抽帧分析: {analysis_json_path}")
+            source = (material_source_video_path or "").strip()
+            if source and source != (video_path or "").strip():
+                logger.info(
+                    f"成片视频与素材来源不同，抽帧分析来自: {source}"
+                )
 
-        progress(78, "正在整理抽帧结果...")
-        analysis_markdown = self._prepare_frame_markdown(
-            analysis_json_path,
-            documentary_settings=doc_settings,
-            force_compact=True,
-        )
-        markdown_output = self._prepare_frame_markdown(
-            analysis_json_path,
-            documentary_settings=doc_settings,
-        )
-        if not (markdown_output or "").strip():
-            raise ValueError(
-                "抽帧分析结果为空。请重新执行「抽帧并分析」，确保视觉模型正常输出。"
+        markdown_output = ""
+        analysis_markdown = ""
+        if analysis_json_path:
+            progress(78, "正在整理抽帧结果...")
+            analysis_markdown = self._prepare_frame_markdown(
+                analysis_json_path,
+                documentary_settings=doc_settings,
+                force_compact=True,
             )
+            markdown_output = self._prepare_frame_markdown(
+                analysis_json_path,
+                documentary_settings=doc_settings,
+            )
+            if not (markdown_output or "").strip() and not blueprint_only:
+                raise ValueError(
+                    "抽帧分析结果为空。请重新执行「抽帧并分析」，确保视觉模型正常输出。"
+                )
+        elif not blueprint_only:
+            raise ValueError(
+                "未找到可用的抽帧分析 JSON。请先在「抽帧分析」中点击「抽帧并分析」，"
+                "或上传/复用已有分析文件后再生成脚本。"
+            )
+        else:
+            progress(78, "跳过抽帧 Markdown，以构思方案为主依据...")
         source_duration_sec = self._get_video_duration_sec(video_path)
 
         if (
             is_fazu2_compact_settings(doc_settings)
             and doc_settings.get("require_subtitle_for_script", True)
+            and not blueprint_only
             and not (subtitle_content or "").strip()
         ):
             raise ValueError(
@@ -107,38 +128,56 @@ class DocumentaryFrameAnalysisService(DocumentaryFrameExtractionService):
             )
 
         subtitle_analysis = ""
-        if (
-            doc_settings.get("enable_subtitle_enrichment", True)
-            and (subtitle_content or "").strip()
-        ):
-            progress(79, "正在充分分析字幕并对照抽帧（脚本蓝图）...")
-            append_for_analysis = resolve_append_custom_prompt(
-                append_custom_prompt, doc_settings
-            )
-            if append_for_analysis:
-                logger.info("追加提示词已置于字幕×抽帧蓝图 prompt 首位")
-            subtitle_analysis = analyze_subtitle_with_frames(
-                subtitle_content=subtitle_content,
-                frame_markdown=analysis_markdown,
-                video_theme=video_theme,
-                append_custom_prompt=append_custom_prompt,
-                progress_callback=lambda msg: progress(79, msg),
-                documentary_settings=doc_settings,
-            )
+        if plot_blueprint is None:
+            if (
+                doc_settings.get("enable_subtitle_enrichment", True)
+                and (subtitle_content or "").strip()
+            ):
+                progress(79, "正在充分分析字幕并对照抽帧（脚本蓝图）...")
+                append_for_analysis = resolve_append_custom_prompt(
+                    append_custom_prompt, doc_settings
+                )
+                if append_for_analysis:
+                    logger.info("追加提示词已置于字幕×抽帧蓝图 prompt 首位")
+                subtitle_analysis = analyze_subtitle_with_frames(
+                    subtitle_content=subtitle_content,
+                    frame_markdown=analysis_markdown,
+                    video_theme=video_theme,
+                    append_custom_prompt=append_custom_prompt,
+                    progress_callback=lambda msg: progress(79, msg),
+                    documentary_settings=doc_settings,
+                    frame_json_path=analysis_json_path or None,
+                )
+                min_analysis_chars = max(
+                    200,
+                    int(doc_settings.get("subtitle_analysis_min_chars", 500) or 500),
+                )
+                if (
+                    is_fazu2_compact_settings(doc_settings)
+                    and doc_settings.get("require_subtitle_for_script", True)
+                    and len(subtitle_analysis.strip()) < min_analysis_chars
+                ):
+                    raise ValueError(
+                        f"字幕×抽帧对照分析过短（{len(subtitle_analysis.strip())} 字），"
+                        f"至少需要 {min_analysis_chars} 字。"
+                        "请确认已「确认使用」完整 SRT（非空文件），并检查文本模型 API；"
+                        "若字幕/抽帧摘要输入过短，请重新上传素材后重试。"
+                    )
+        else:
+            subtitle_analysis = (plot_blueprint or "").strip()
+            if subtitle_analysis:
+                progress(79, "复用已确认的剧情构思方案，正在生成脚本...")
             min_analysis_chars = max(
                 200,
                 int(doc_settings.get("subtitle_analysis_min_chars", 500) or 500),
             )
             if (
                 is_fazu2_compact_settings(doc_settings)
-                and doc_settings.get("require_subtitle_for_script", True)
-                and len(subtitle_analysis.strip()) < min_analysis_chars
+                and len(subtitle_analysis) < min_analysis_chars
             ):
                 raise ValueError(
-                    f"字幕×抽帧对照分析过短（{len(subtitle_analysis.strip())} 字），"
-                    f"至少需要 {min_analysis_chars} 字。"
-                    "请确认已「确认使用」完整 SRT（非空文件），并检查文本模型 API；"
-                    "若字幕/抽帧摘要输入过短，请重新上传素材后重试。"
+                    f"剧情构思方案过短（{len(subtitle_analysis)} 字），"
+                    f"至少需要 {min_analysis_chars} 字。请完善构思方案。"
                 )
 
         progress(80, "正在依据分析结果生成 JSON 脚本...")
@@ -176,6 +215,69 @@ class DocumentaryFrameAnalysisService(DocumentaryFrameExtractionService):
         )
         progress(100, "脚本生成完成")
         return final_script
+
+    async def generate_plot_blueprint(
+        self,
+        *,
+        video_path: str,
+        video_theme: str = "",
+        append_custom_prompt: str = "",
+        progress_callback: Callable[[float, str], None] | None = None,
+        documentary_settings: dict | None = None,
+        subtitle_content: str = "",
+        analysis_json_path: str | None = None,
+        material_source_video_path: str = "",
+        reuse_frame_analysis: bool = True,
+    ) -> str:
+        """抽帧画面 + SRT 字幕联合分析，产出供写脚本的「完美剧情构思方案」Markdown。"""
+        progress = progress_callback or (lambda _p, _m: None)
+        doc_settings = documentary_settings or get_documentary_settings()
+
+        resolved_analysis_path = resolve_frame_analysis_path_for_documentary(
+            video_path,
+            material_source_video_path=material_source_video_path,
+            explicit_path=analysis_json_path,
+            reuse=reuse_frame_analysis,
+        )
+        if not resolved_analysis_path:
+            raise ValueError(
+                "未找到可用的抽帧分析 JSON。请先在「抽帧分析」中点击「抽帧并分析」，"
+                "或上传/复用已有分析文件。"
+            )
+        analysis_json_path = resolved_analysis_path
+
+        progress(20, "正在整理抽帧结果...")
+        analysis_markdown = self._prepare_frame_markdown(
+            analysis_json_path,
+            documentary_settings=doc_settings,
+            force_compact=True,
+        )
+        if not (analysis_markdown or "").strip():
+            raise ValueError("抽帧分析结果为空，请重新执行「抽帧并分析」。")
+
+        progress(40, "正在分析字幕并对照抽帧构思剧情方案...")
+        append_for_analysis = resolve_append_custom_prompt(
+            append_custom_prompt, doc_settings
+        )
+        if append_for_analysis:
+            logger.info("追加提示词已置于抽帧×剧情蓝图 prompt 首位")
+        subtitle_analysis = analyze_subtitle_with_frames(
+            subtitle_content=subtitle_content,
+            frame_markdown=analysis_markdown,
+            video_theme=video_theme,
+            append_custom_prompt=append_custom_prompt,
+            progress_callback=lambda msg: progress(60, msg),
+            documentary_settings=doc_settings,
+            frame_json_path=analysis_json_path,
+            for_plot_blueprint=True,
+            source_duration_sec=self._get_video_duration_sec(video_path),
+        )
+        if len((subtitle_analysis or "").strip()) < 200:
+            raise ValueError(
+                "字幕×抽帧×剧情构思为空或过短，请检查文本模型 API 与素材。"
+            )
+        progress(100, "剧情构思方案生成完成")
+        return subtitle_analysis.strip()
 
     def _prepare_frame_markdown(
         self,
@@ -284,6 +386,8 @@ class DocumentaryFrameAnalysisService(DocumentaryFrameExtractionService):
         if not documentary_settings.get("enable_full_timeline_coverage", True):
             return items
         if not source_duration_sec or source_duration_sec <= 0:
+            return items
+        if not (markdown_output or "").strip():
             return items
 
         filled = fill_timeline_coverage_gaps(
@@ -583,10 +687,17 @@ class DocumentaryFrameAnalysisService(DocumentaryFrameExtractionService):
         )
         sections.extend(subtitle_sections)
 
-        sections.append(
-            "## 抽帧画面分析（画面参考 · 截取时间对齐参考；timestamp 仍以字幕为准）\n"
-            f"{markdown_output.rstrip()}"
-        )
+        if (markdown_output or "").strip():
+            sections.append(
+                "## 抽帧画面分析（画面参考 · 截取时间对齐参考；timestamp 仍以字幕/构思方案为准）\n"
+                f"{markdown_output.rstrip()}"
+            )
+        elif (subtitle_analysis or "").strip():
+            sections.append(
+                "## 说明\n"
+                "本次脚本以「剧情构思方案」为主依据生成，未附加抽帧 Markdown。"
+                "timestamp、人名与台词以构思方案中的时间线为准。"
+            )
 
         context_lines: list[str] = []
         if (video_theme or "").strip():

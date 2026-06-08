@@ -138,7 +138,7 @@ def _render_compact_export_section(active_path: str) -> None:
             "精简版会去掉 raw_response、关键帧路径、批次内重复数据，保留脚本生成与字幕校准所需内容。"
         )
         preset_labels = {
-            "minimal_scene": "极精简（六核心字段 + time_range + subtitle，无 batches）",
+            "minimal_scene": "极精简（六核心字段 + subtitle_entries + subtitle，无 batches）",
             "minimal": "最小（scene_segments 全字段，适合脚本生成）",
             "script": "脚本（场景片段 + 批次摘要 + 批次索引）",
             "calibration": "校准（含逐帧观察，适合字幕校准）",

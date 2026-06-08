@@ -88,7 +88,8 @@ class VideoProcessor:
 
     def extract_frames_by_interval(self, output_dir: str, interval_seconds: float = 5.0,
                                   use_hw_accel: bool = True,
-                                  max_duration_seconds: float | None = None) -> List[int]:
+                                  max_duration_seconds: float | None = None,
+                                  start_time_seconds: float | None = None) -> List[int]:
         """
         按指定时间间隔提取视频帧
 
@@ -106,8 +107,10 @@ class VideoProcessor:
             os.makedirs(output_dir)
 
         # 计算起始时间和帧提取点
-        start_time = 0
-        end_time = self._resolve_extraction_end_time(max_duration_seconds)
+        start_time, end_time = self._resolve_extraction_window(
+            start_time_seconds,
+            max_duration_seconds,
+        )
         extraction_times = []
 
         current_time = start_time
@@ -192,6 +195,7 @@ class VideoProcessor:
         interval_seconds: float = 5.0,
         *,
         max_duration_seconds: float | None = None,
+        start_time_seconds: float | None = None,
     ) -> List[str]:
         """
         先尝试单次 ffmpeg 快路径抽帧，失败时回退到高兼容方案。
@@ -206,6 +210,7 @@ class VideoProcessor:
                 output_dir,
                 interval_seconds=interval_seconds,
                 max_duration_seconds=max_duration_seconds,
+                start_time_seconds=start_time_seconds,
             )
         except Exception as exc:
             logger.warning(f"快路径抽帧失败，回退到兼容模式: {exc}")
@@ -214,13 +219,24 @@ class VideoProcessor:
                 output_dir,
                 interval_seconds=interval_seconds,
                 max_duration_seconds=max_duration_seconds,
+                start_time_seconds=start_time_seconds,
             )
             return self._collect_extracted_frame_paths(output_dir)
 
-    def _resolve_extraction_end_time(self, max_duration_seconds: float | None) -> float:
+    def _resolve_extraction_window(
+        self,
+        start_time_seconds: float | None,
+        max_duration_seconds: float | None,
+    ) -> tuple[float, float]:
+        start = max(0.0, float(start_time_seconds or 0))
         if max_duration_seconds is None or max_duration_seconds <= 0:
-            return self.duration
-        return min(self.duration, float(max_duration_seconds))
+            return start, self.duration
+        end = min(self.duration, start + float(max_duration_seconds))
+        return start, end
+
+    def _resolve_extraction_end_time(self, max_duration_seconds: float | None) -> float:
+        _, end_time = self._resolve_extraction_window(0.0, max_duration_seconds)
+        return end_time
 
     def _extract_frames_fast_path(
         self,
@@ -228,6 +244,7 @@ class VideoProcessor:
         interval_seconds: float = 5.0,
         *,
         max_duration_seconds: float | None = None,
+        start_time_seconds: float | None = None,
     ) -> List[str]:
         """
         使用单次 ffmpeg 命令按固定间隔抽帧，随后重命名为既有 keyframe 约定格式。
@@ -237,14 +254,16 @@ class VideoProcessor:
 
         os.makedirs(output_dir, exist_ok=True)
         raw_pattern = os.path.join(output_dir, "fastframe_%06d.jpg")
+        start_offset = max(0.0, float(start_time_seconds or 0))
         cmd = [
             "ffmpeg",
             "-hide_banner",
             "-loglevel",
             "error",
-            "-i",
-            self.video_path,
         ]
+        if start_offset > 0:
+            cmd.extend(["-ss", str(start_offset)])
+        cmd.extend(["-i", self.video_path])
         if max_duration_seconds is not None and max_duration_seconds > 0:
             cmd.extend(["-t", str(max_duration_seconds)])
         cmd.extend(
@@ -271,7 +290,7 @@ class VideoProcessor:
 
         renamed_files: List[str] = []
         for index, filename in enumerate(raw_files):
-            timestamp = index * interval_seconds
+            timestamp = start_offset + index * interval_seconds
             frame_number = int(timestamp * self.fps)
             token = self._format_timestamp_token(timestamp)
             source_path = os.path.join(output_dir, filename)
@@ -619,6 +638,7 @@ class VideoProcessor:
         interval_seconds: float = 5.0,
         *,
         max_duration_seconds: float | None = None,
+        start_time_seconds: float | None = None,
     ) -> List[int]:
         """
         使用超级兼容性方案按指定时间间隔提取视频帧
@@ -636,8 +656,10 @@ class VideoProcessor:
             os.makedirs(output_dir)
 
         # 计算起始时间和帧提取点
-        start_time = 0
-        end_time = self._resolve_extraction_end_time(max_duration_seconds)
+        start_time, end_time = self._resolve_extraction_window(
+            start_time_seconds,
+            max_duration_seconds,
+        )
         extraction_times = []
 
         current_time = start_time

@@ -271,6 +271,32 @@ class DocumentaryFrameAnalysisServiceTests(unittest.TestCase):
         self.assertEqual(2, len(batch.frame_observations))
         self.assertEqual("", batch.overall_activity_summary)
 
+    def test_parse_batch_overrides_model_timestamp_with_keyframe_filename(self):
+        service = DocumentaryFrameAnalysisService()
+        raw_response = """
+{
+  "frame_observations": [
+    {"timestamp": "00:01:01,000", "observation": "[特写] 车内，秦枫(男)侧脸"},
+    {"timestamp": "00:01:02,000", "observation": "[中景] 车内，秦枫(男)侧脸"}
+  ],
+  "overall_activity_summary": "车顶追逐"
+}
+""".strip()
+
+        batch = service._parse_batch_response(
+            batch_index=0,
+            raw_response=raw_response,
+            frame_paths=[
+                "/tmp/keyframe_009030_000501000.jpg",
+                "/tmp/keyframe_009060_000502000.jpg",
+            ],
+            time_range="00:05:01,000-00:05:02,000",
+        )
+
+        self.assertEqual("success", batch.status)
+        self.assertEqual("00:05:01,000", batch.frame_observations[0]["timestamp"])
+        self.assertEqual("00:05:02,000", batch.frame_observations[1]["timestamp"])
+
     def test_cache_key_changes_when_interval_changes(self):
         service = DocumentaryFrameAnalysisService()
 
@@ -389,7 +415,7 @@ class DocumentaryFrameAnalysisServiceTests(unittest.TestCase):
         }
         self.assertEqual(2, service.count_failed_batches(artifact))
 
-    def test_coerce_batch_payload_accepts_script_clip_array(self):
+    def test_rejects_narration_script_clip_array(self):
         service = DocumentaryFrameAnalysisService()
         raw = """[
   {
@@ -401,13 +427,12 @@ class DocumentaryFrameAnalysisServiceTests(unittest.TestCase):
   }
 ]"""
         payload_raw = service._load_batch_payload_json(raw)
+        self.assertTrue(service._is_narration_script_clip_payload(payload_raw))
         payload = service._coerce_batch_payload(
             payload_raw,
             time_range="00:11:00,000-00:11:09,000",
         )
-        self.assertIn("scene_segments", payload)
-        self.assertEqual(1, len(payload["scene_segments"]))
-        self.assertEqual("00:11:03,060-00:11:09,380", payload["scene_segments"][0]["timestamp"])
+        self.assertEqual({}, payload)
 
         batch = service._parse_batch_response(
             batch_index=66,
@@ -418,9 +443,10 @@ class DocumentaryFrameAnalysisServiceTests(unittest.TestCase):
             ],
             time_range="00:11:00,000-00:11:09,000",
         )
-        self.assertEqual("success", batch.status)
-        self.assertEqual(1, len(batch.scene_segments))
-        self.assertEqual(2, len(batch.frame_observations))
+        self.assertEqual("failed", batch.status)
+        self.assertIn("narration script", batch.error_message.lower())
+
+    def test_batch_dict_to_result(self):
         service = DocumentaryFrameAnalysisService()
         batch = service._batch_dict_to_result(
             {
@@ -777,8 +803,8 @@ class DocumentaryFrameGenderHintTests(unittest.TestCase):
             time_range="00:00:00,000-00:00:06,000",
         )
         self.assertIn("无法从字幕确认身份时", prompt)
-        self.assertIn("老叶与伟业并肩", prompt)
-        self.assertIn("勿把与之对话的上级/长辈称为伟业", prompt)
+        self.assertIn("只允许写**已上传头像名单内**", prompt)
+        self.assertIn("禁止写名单外旧称（如伟业、老叶", prompt)
 
     def test_batch_prompt_default_skips_drama_knowledge_for_fazu_theme(self):
         service = DocumentaryFrameAnalysisService()
@@ -1953,14 +1979,106 @@ class FrameCharacterNamingTests(unittest.TestCase):
     def test_sanitize_segment_character_names(self):
         from app.services.documentary.frame_character_naming import sanitize_segment_character_names
 
-        segment = {"characters": ["秦枫", "刘天也"], "subtitle_entries": [{"text": "秦枫你好"}]}
+        segment = {"characters": ["秦枫", "刘天也"]}
         removed = sanitize_segment_character_names(
             segment,
-            evidence_text="秦枫你好",
+            reliable_faces={"秦枫"},
             reference_names={"秦枫", "刘天也"},
         )
         self.assertEqual(["秦枫"], segment["characters"])
         self.assertEqual(["刘天也"], removed)
+
+    def test_strip_legacy_hallucinated_name_weiye(self):
+        from app.services.documentary.frame_character_naming import (
+            apply_face_gated_names_to_artifact,
+            strip_unreliable_names_in_text,
+        )
+
+        text = strip_unreliable_names_in_text(
+            "叶天佑(男)与伟业(男)相对而立，伟业伫立聆听",
+            reliable_faces={"叶天佑"},
+            ref_names={"叶天佑", "楚青桐", "秦枫"},
+        )
+        self.assertNotIn("伟业", text)
+        self.assertIn("叶天佑(男)", text)
+
+        artifact = {
+            "character_references": [{"name": "叶天佑"}, {"name": "楚青桐"}],
+            "scene_segments": [
+                {
+                    "batch_index": 0,
+                    "action": "伟业(男)伫立，叶天佑(男)说话",
+                    "observation": "楼顶天台，叶天佑(男)与伟业(男)对话",
+                }
+            ],
+            "frame_observations": [
+                {
+                    "batch_index": 0,
+                    "observation": "叶天佑(男)与伟业(男)相对而立",
+                }
+            ],
+            "batches": [
+                {
+                    "batch_index": 0,
+                    "overall_activity_summary": "叶天佑(男)与伟业(男)对话",
+                    "frame_observations": [
+                        {"observation": "叶天佑(男)与伟业(男)相对而立"},
+                    ],
+                    "scene_segments": [{"action": "伟业(男)伫立"}],
+                }
+            ],
+        }
+        apply_face_gated_names_to_artifact(artifact)
+        self.assertNotIn("伟业", artifact["scene_segments"][0]["action"])
+        self.assertNotIn("伟业", artifact["batches"][0]["overall_activity_summary"])
+
+    def test_validate_face_naming_rejects_generic_labels_when_refs_attached(self):
+        from app.services.documentary.frame_character_naming import (
+            validate_face_naming_when_references_attached,
+        )
+
+        err = validate_face_naming_when_references_attached(
+            frame_observations=[
+                {"timestamp": "00:00:04,000", "observation": "[中景] 询问室，年轻警官(男)站立俯视"},
+            ],
+            scene_segments=[],
+            character_references=[{"name": "秦枫"}, {"name": "叶天佑"}],
+            reference_images_attached=True,
+        )
+        self.assertIn("per-frame", err.lower())
+
+        ok = validate_face_naming_when_references_attached(
+            frame_observations=[
+                {"timestamp": "00:00:04,000", "observation": "[中景] 询问室，叶天佑(男)站立俯视秦枫(男)"},
+            ],
+            scene_segments=[],
+            character_references=[{"name": "秦枫"}, {"name": "叶天佑"}],
+            reference_images_attached=True,
+        )
+        self.assertEqual("", ok)
+
+        mixed_err = validate_face_naming_when_references_attached(
+            frame_observations=[
+                {"timestamp": "00:00:00,000", "observation": "[特写] 秦枫(男)低头"},
+                {"timestamp": "00:00:04,000", "observation": "[中景] 年轻警官(男)站立"},
+            ],
+            scene_segments=[],
+            character_references=[{"name": "秦枫"}, {"name": "叶天佑"}],
+            reference_images_attached=True,
+        )
+        self.assertIn("00:00:04,000", mixed_err)
+
+    def test_strip_preserves_temporary_role_labels(self):
+        from app.services.documentary.frame_character_naming import strip_unreliable_names_in_text
+
+        text = strip_unreliable_names_in_text(
+            "便衣男警察(男)训斥年轻男子(男)，警服男警官(男)站立",
+            reliable_faces=set(),
+            ref_names={"秦枫", "叶天佑"},
+        )
+        self.assertIn("便衣男警察(男)", text)
+        self.assertIn("年轻男子(男)", text)
+        self.assertNotIn("未名人员", text)
 
 
 class FrameExtractionTestModeTests(unittest.TestCase):
@@ -1969,6 +2087,36 @@ class FrameExtractionTestModeTests(unittest.TestCase):
 
         path = default_test_analysis_path_for_video(r"D:\素材\6月4日.mp4", max_duration_seconds=5)
         self.assertTrue(path.endswith("6月4日_frame_analysis_test_5s.json"))
+
+        path_from = default_test_analysis_path_for_video(
+            r"D:\素材\6月4日.mp4",
+            max_duration_seconds=5,
+            start_time_seconds=30,
+        )
+        self.assertTrue(path_from.endswith("6月4日_frame_analysis_test_from30s_5s.json"))
+
+    def test_filter_keyframes_by_window(self):
+        from app.services.documentary.frame_extraction_service import DocumentaryFrameExtractionService
+
+        frames = [
+            "/tmp/keyframe_000000_000000000.jpg",
+            "/tmp/keyframe_000075_000003000.jpg",
+            "/tmp/keyframe_000150_000006000.jpg",
+            "/tmp/keyframe_000225_000009000.jpg",
+        ]
+        filtered = DocumentaryFrameExtractionService._filter_keyframes_by_window(
+            frames,
+            start_time_seconds=0.0,
+            max_duration_seconds=5.0,
+        )
+        self.assertEqual(frames[:2], filtered)
+
+        window_filtered = DocumentaryFrameExtractionService._filter_keyframes_by_window(
+            frames,
+            start_time_seconds=3.0,
+            max_duration_seconds=5.0,
+        )
+        self.assertEqual(frames[1:3], window_filtered)
 
     def test_filter_keyframes_by_max_duration(self):
         from app.services.documentary.frame_extraction_service import DocumentaryFrameExtractionService
@@ -1991,6 +2139,82 @@ class FrameExtractionTestModeTests(unittest.TestCase):
             5.0,
             DocumentaryFrameExtractionService._resolve_max_duration_seconds(5, test_mode=True),
         )
+
+
+    def test_subtitle_alias_not_applied_during_frame_extraction(self):
+        from app.services.documentary.frame_character_naming import (
+            apply_subtitle_alias_normalization_to_artifact,
+        )
+
+        artifact = {
+            "drama_id": "罚罪2",
+            "character_references": [{"name": "叶天佑"}, {"name": "楚青桐"}],
+            "scene_segments": [
+                {
+                    "batch_index": 0,
+                    "action": "老叶(男)与未名人员(男)对话",
+                    "subtitle": "老叶；你都到厅级了",
+                }
+            ],
+            "batches": [],
+            "frame_observations": [],
+        }
+        apply_subtitle_alias_normalization_to_artifact(artifact)
+        action = artifact["scene_segments"][0]["action"]
+        self.assertIn("老叶(男)", action)
+        self.assertNotIn("叶天佑(男)", action)
+
+    def test_obvious_relationship_supplement_when_both_named(self):
+        from app.services.documentary.frame_character_naming import (
+            apply_obvious_character_relationships_to_artifact,
+        )
+
+        artifact = {
+            "drama_id": "罚罪2",
+            "character_references": [{"name": "叶天佑"}, {"name": "秦枫"}],
+            "scene_segments": [
+                {
+                    "batch_index": 0,
+                    "action": "叶天佑(男)与秦枫(男)在天台交谈",
+                    "observation": "阴天楼顶，两名男子对话",
+                }
+            ],
+            "batches": [],
+            "frame_observations": [
+                {"batch_index": 0, "observation": "[远景] 楼顶，叶天佑(男)与秦枫(男)对话"},
+                {"batch_index": 0, "observation": "[中景] 楼顶，叶天佑(男)侧脸"},
+                {"batch_index": 0, "observation": "[中景] 楼顶，秦枫(男)侧脸"},
+            ],
+        }
+        apply_obvious_character_relationships_to_artifact(artifact)
+        segment = artifact["scene_segments"][0]
+        relations = segment.get("character_relationships") or []
+        self.assertTrue(any(item.get("type") == "师徒" for item in relations))
+        self.assertIn("师徒", segment.get("observation", ""))
+
+    def test_no_relationship_inference_from_rank_dialogue(self):
+        from app.services.documentary.frame_character_naming import (
+            apply_obvious_character_relationships_to_artifact,
+        )
+
+        artifact = {
+            "drama_id": "罚罪2",
+            "scene_segments": [
+                {
+                    "batch_index": 0,
+                    "action": "叶天佑(男)与未名人员(男)对话",
+                    "observation": "楼顶对话",
+                    "subtitle": "老叶；你都到厅级了",
+                }
+            ],
+            "batches": [],
+            "frame_observations": [],
+        }
+        apply_obvious_character_relationships_to_artifact(artifact)
+        segment = artifact["scene_segments"][0]
+        self.assertNotIn("楚青桐", segment.get("action", ""))
+        self.assertNotIn("楚青桐", segment.get("observation", ""))
+        self.assertFalse(segment.get("character_relationships"))
 
 
 class DramaCharacterRegistryTests(unittest.TestCase):
@@ -2175,14 +2399,35 @@ class DramaCharacterRegistryTests(unittest.TestCase):
     def test_should_attach_reference_images_first_batch_only(self):
         from app.services.documentary.frame_reference_images import (
             ATTACH_MODE_FIRST_BATCH,
+            resolve_reference_collage_mode,
             should_attach_reference_images,
         )
 
         settings = {"frame_reference_token_saver": True}
         self.assertTrue(should_attach_reference_images(0, settings))
         self.assertFalse(should_attach_reference_images(1, settings))
+        # 拼图/少量头像：每批附上参照图以便逐脸对照
+        self.assertTrue(
+            should_attach_reference_images(1, settings, head_count=11, use_collage=True)
+        )
+        self.assertTrue(
+            should_attach_reference_images(2, settings, head_count=3, use_collage=False)
+        )
         settings_off = {"frame_reference_token_saver": False, "frame_reference_attach_mode": ATTACH_MODE_FIRST_BATCH}
-        self.assertFalse(should_attach_reference_images(1, settings_off))
+        self.assertFalse(should_attach_reference_images(1, settings_off, head_count=11, use_collage=False))
+
+        self.assertTrue(resolve_reference_collage_mode({"frame_reference_token_saver": True}, head_count=11))
+        self.assertFalse(
+            resolve_reference_collage_mode(
+                {"frame_reference_token_saver": True, "frame_reference_force_individual_heads": True},
+                head_count=11,
+            )
+        )
+        self.assertFalse(resolve_reference_collage_mode({}, head_count=1))
+        self.assertTrue(resolve_reference_collage_mode({}, head_count=4))
+        self.assertFalse(
+            resolve_reference_collage_mode({"frame_reference_use_collage": False}, head_count=4)
+        )
 
         from app.services.drama_character_registry import resolve_active_relationship_diagram_path
 

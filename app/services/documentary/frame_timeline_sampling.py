@@ -389,7 +389,7 @@ DEFAULT_MAX_SEGMENT_DURATION_MS = 30_000
 
 _SCENE_LABEL_FROM_TEXT_RE = re.compile(
     r"([\u4e00-\u9fff]{2,10}(?:"
-    r"天台|广场|办公室|审讯室|走廊|车内|仓库|灵堂|祠堂|厂区|停车场|"
+    r"天台|广场|办公室|审讯室|走廊|车内|车顶|仓库|灵堂|祠堂|厂区|停车场|"
     r"案发现场|养殖场|渔村|村庄|室内|室外|古树下|航拍|电梯|楼梯间|"
     r"卧室|客厅|餐厅|医院|学校|码头|海港|养殖场"
     r"))"
@@ -829,8 +829,14 @@ def resolve_segment_display_fields(
     emotion = str(segment.get("emotion") or "").strip() or str(ctx.get("emotion") or "").strip()
     observation = str(segment.get("observation") or "").strip()
     if not observation:
-        parts = [value for value in (segment.get("action"), emotion, key_visual) if str(value or "").strip()]
-        observation = "；".join(str(part).strip() for part in parts)
+        seen: set[str] = set()
+        parts: list[str] = []
+        for value in (segment.get("action"), emotion, key_visual):
+            text = str(value or "").strip()
+            if text and text not in seen:
+                seen.add(text)
+                parts.append(text)
+        observation = "；".join(parts)
     return {
         "scene": scene,
         "key_visual": key_visual,

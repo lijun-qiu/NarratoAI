@@ -28,7 +28,7 @@ from app.services.documentary.subtitle_calibration_pipeline import (
     requires_subtitle_before_frame_analysis,
 )
 from app.services.subtitle_video_pairing import find_paired_subtitle_path, load_subtitle_content, resolve_subtitle_path_for_video
-from app.services.srt_utils import clip_entries_to_duration, entries_to_srt, parse_srt
+from app.services.srt_utils import clip_entries_to_time_window, entries_to_srt, parse_srt
 
 
 def _normalize_progress_value(progress: float | int) -> int:
@@ -51,14 +51,21 @@ def _resolve_subtitle_content(video_path: str) -> str:
     return session_content
 
 
-def _clip_subtitle_content(content: str, max_duration_seconds: float) -> str:
+def _clip_subtitle_content(
+    content: str,
+    max_duration_seconds: float,
+    *,
+    start_time_seconds: float = 0.0,
+) -> str:
     cleaned = (content or "").strip()
     if not cleaned or max_duration_seconds <= 0:
         return cleaned
     entries = parse_srt(cleaned)
     if not entries:
         return cleaned
-    clipped = clip_entries_to_duration(entries, int(max_duration_seconds * 1000))
+    start_ms = int(max(0.0, start_time_seconds) * 1000)
+    end_ms = start_ms + int(max_duration_seconds * 1000)
+    clipped = clip_entries_to_time_window(entries, start_ms, end_ms)
     return entries_to_srt(clipped).strip()
 
 
@@ -68,6 +75,7 @@ def extract_frame_analysis_docu(
     compact: bool = False,
     test_mode: bool = False,
     test_duration_seconds: float | None = None,
+    test_start_seconds: float | None = None,
 ):
     """抽帧并用视觉模型分析，产出 JSON 供后续脚本生成复用。"""
     progress_bar = st.progress(0)
@@ -85,6 +93,7 @@ def extract_frame_analysis_docu(
     keyframe_count = 0
     part_paths: list[str] = []
     test_duration = float(test_duration_seconds if test_duration_seconds is not None else 5.0)
+    test_start = float(test_start_seconds if test_start_seconds is not None else 0.0)
 
     try:
         label = "测试抽帧" if test_mode else "抽帧"
@@ -164,13 +173,42 @@ def extract_frame_analysis_docu(
                 if test_duration_seconds is not None
                 else st.session_state.get("doc_frame_test_duration_seconds", test_duration)
             )
+            test_start = float(
+                test_start_seconds
+                if test_start_seconds is not None
+                else st.session_state.get("doc_frame_test_start_seconds", test_start)
+            )
             if test_mode:
-                subtitle_content = _clip_subtitle_content(subtitle_content, test_duration)
+                subtitle_content = _clip_subtitle_content(
+                    subtitle_content,
+                    test_duration,
+                    start_time_seconds=test_start,
+                )
+                doc_settings["frame_reference_force_individual_heads"] = True
+                doc_settings["frame_reference_max_edge"] = max(
+                    int(doc_settings.get("frame_reference_max_edge", 384) or 384),
+                    512,
+                )
 
             default_interval = doc_settings.get("frame_interval_input") or config.frames.get(
                 "frame_interval_input", 3
             )
             frame_interval_input = st.session_state.get("frame_interval_input") or default_interval
+            if test_mode and test_duration > 0:
+                target_frames = max(4, min(8, int(test_duration) + 1))
+                capped_interval = max(1.0, float(test_duration) / target_frames)
+                if float(frame_interval_input) > capped_interval:
+                    frame_interval_input = capped_interval
+                    logger.info(
+                        f"测试抽帧：间隔由 {st.session_state.get('frame_interval_input')}s "
+                        f"自动收紧为 {capped_interval:g}s（{test_duration:g}s 内约 {target_frames} 帧）"
+                    )
+            ref_count = len(character_references or [])
+            if test_mode and ref_count > 6:
+                st.warning(
+                    f"测试抽帧已勾选 **{ref_count}** 张参照头像，建议仅保留本场人物（如叶天佑、楚青桐）"
+                    " 2–4 张，否则识别率与 token 都会变差。"
+                )
             vision_batch_size = st.session_state.get("vision_batch_size") or config.frames.get(
                 "vision_batch_size", 10
             )
@@ -200,6 +238,7 @@ def extract_frame_analysis_docu(
                     frame_drama_knowledge_text_enabled=enable_knowledge_text,
                     frame_relationship_diagram_enabled=enable_relationship_diagram,
                     max_duration_seconds=test_duration if test_mode else None,
+                    start_time_seconds=test_start if test_mode else None,
                     test_mode=test_mode,
                 )
             )
@@ -230,7 +269,16 @@ def extract_frame_analysis_docu(
             f"{prefix}: `{os.path.basename(analysis_path)}`（{keyframe_count} 帧）"
         )
         if test_mode:
-            success_msg += f"\n\n仅分析前 **{test_duration:g}** 秒，不会覆盖完整版 `{os.path.basename(DocumentaryFrameExtractionService.default_analysis_path_for_video(params.video_origin_path))}`。"
+            if test_start > 0:
+                success_msg += (
+                    f"\n\n仅分析 **{test_start:g}s–{test_start + test_duration:g}s** 片段，"
+                    f"不会覆盖完整版 `{os.path.basename(DocumentaryFrameExtractionService.default_analysis_path_for_video(params.video_origin_path))}`。"
+                )
+            else:
+                success_msg += (
+                    f"\n\n仅分析前 **{test_duration:g}** 秒，"
+                    f"不会覆盖完整版 `{os.path.basename(DocumentaryFrameExtractionService.default_analysis_path_for_video(params.video_origin_path))}`。"
+                )
         if part_paths:
             success_msg += f"\n\n另存 **{len(part_paths)}** 份切割文件："
             success_msg += "\n".join(f"- `{os.path.basename(path)}`" for path in part_paths)

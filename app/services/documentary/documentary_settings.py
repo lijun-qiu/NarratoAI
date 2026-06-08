@@ -77,6 +77,7 @@ DOCUMENTARY_DEFAULTS: Dict[str, Any] = {
     "frame_reference_attach_mode": "first_batch",
     "frame_reference_max_edge": 384,
     "frame_reference_use_collage": True,
+    "frame_reference_individual_max_heads": 6,
     # 抽帧视觉分析：默认不注入剧集人物关系知识库（避免脑补全剧名场面）
     "enable_frame_analysis_drama_knowledge": False,
     # 抽帧 scene_segments 硬性规则：仅可见画面、同批同景合并、跨场景重叠剔除
@@ -429,9 +430,9 @@ def build_fazu2_frame_character_gender_reference() -> str:
     if not refs:
         return ""
     return (
-        "剧情人物性别参考（仅在与字幕/画面对上姓名后用来核对，**画面可见性别优先**）："
+        "剧情人物性别参考（须在**头像/定妆照面孔匹配成功并写入姓名后**用来核对性别，**画面可见性别优先**）："
         f"{', '.join(refs)}。"
-        "例：字幕出现胡小跃时若画面为男性刑警，characters 须标「胡小跃(男)」，勿写成女警/她。"
+        "未完成面孔匹配前勿写规范姓名；匹配成功后须标「姓名(男/女)」，勿写成女警/她。"
     )
 
 
@@ -453,12 +454,16 @@ def build_frame_visible_content_hint(
     return (
         f"**仅可见画面（硬性）**：scene_segments 只能描述本批次 {count_text} 张图片中实际可见的内容；"
         "禁止编造未出现在画面中的地点、人物、闪回、航拍、牺牲、追车、仓库突袭等「印象名场面」。"
-        "若连续帧为同一地点、同一组人物对话，**本批次只输出 1 条** scene_segment，合并 timestamp 覆盖该对话时段；"
+        "**仅**连续同地点、同动作链（如整段天台对话）可合并为 1 条 segment；"
+        "若本批含地点/动作阶段变化（停车场→车顶→地面奔跑等），**必须**输出多条 scene_segments；"
         f"单条 segment 时长不得超过约 {max_seg_sec} 秒，跨场景须拆成多条；"
-        "**scene 必填**（如「楼顶天台」「审讯室」），禁止留空；"
+        "**scene 必填**（如「楼顶天台」「废弃停车场」「车顶」），禁止留空；"
+        "车内/车顶/车外须据可见结构区分，夜间特写无内饰时勿默认写车内；"
         "须填写 shot_scale / lighting_time / edit_role，方便后期选 OST=1 与 picture；"
         "同一批次内 timestamp 不得重叠；不同地点/不同场景不得拆成多条重叠时间段。"
-        "人名仅在本批次硬字幕或 SRT 对白摘录中出现过时可写，否则用「未名人员(男/女)」。"
+        "人名写入：**仅**本批画面清晰可见且与定妆照/头像精准匹配 → 写规范姓名；"
+        f"硬字幕/SRT **不得**猜人；无法匹配 → 「{FRAME_UNKNOWN_CHARACTER_MALE}」「{FRAME_UNKNOWN_CHARACTER_FEMALE}」。"
+        "勾选头像不是默认全员在场；每一姓名须对应本批某帧面孔与参照图一致。"
     )
 
 
@@ -466,19 +471,21 @@ def build_frame_character_naming_hint(settings: Optional[Dict[str, Any]] = None)
     """视觉分析阶段：人名须有据，无据用未名人员+性别。"""
     cfg = settings or get_documentary_settings()
     hints: list[str] = [
-        "人名/称呼写入顺序：**本批硬字幕/SRT/subtitle_entries** > **本批可见面孔与定妆照匹配** > 关系表谐音校正；",
-        "关系表/关系图**不能**作为「猜谁是画面里的人」的依据；",
-        "subtitle_entries 每条 text 即为**原片字幕原文**（含 ASR 错字如「小月」也须原样出现在摘录侧，画面描述侧对照关系表写「胡小跃」）；",
-        "摘录中的**全名、小名、昵称、关系称呼**（老叶、小跃、师傅、文妈等）须与字幕原文一致；",
-        f"无法从本批字幕或可见面孔确认身份时，用「{FRAME_UNKNOWN_CHARACTER_MALE}」「{FRAME_UNKNOWN_CHARACTER_FEMALE}」，"
+        "人名/称呼写入：**仅**本批可见面孔与定妆照/头像精准匹配时可写规范姓名；",
+        "硬字幕/SRT/subtitle_entries 中的姓名、称呼（老叶、二师兄、叶局等）**不得**用于推断画面人物；",
+        "关系表/关系图**不能**作为猜人依据；",
+        "**两人姓名均已由面孔匹配写入**时，可补明显师徒/父子/上下级等关系词；",
+        "subtitle_entries 须**原样**摘录对白原文（含 ASR 错字）；无面孔匹配时写带特征的暂称或未名人员；",
+        "后帧头像匹配成功后，前序帧仅当**同一身形+同一服装**可确认同一人时才回溯写规范名，否则保留暂称；",
+        f"无法完成头像匹配时，用「{FRAME_UNKNOWN_CHARACTER_MALE}」「{FRAME_UNKNOWN_CHARACTER_FEMALE}」，"
         f"**禁止**用「领导」「警员」「男子A」等泛称作姓名；",
-        "「伟业」是局长人物专属名，勿把与之对话的上级/长辈称为伟业；",
-        "硬字幕/SRT 出现「老叶」时写「老叶(男)」，与「伟业(男)」区分两人。",
+        "只允许写**已上传头像名单内**、且本批面孔匹配成功的规范姓名；"
+        "禁止写名单外旧称（如伟业、老叶等历史解说剧本人名）。",
     ]
     if is_fazu2_compact_settings(cfg):
         hints.append(
-            "observation 示例：「楼顶天台，老叶与伟业并肩，阴天冷色调」"
-            f"（两人均有字幕依据时）；若仅知性别不知名：「楼顶天台，{FRAME_UNKNOWN_CHARACTER_MALE}与伟业并肩，阴天冷色调」。"
+            f"observation 示例：「楼顶天台，叶天佑(男)与{FRAME_UNKNOWN_CHARACTER_MALE}并肩，阴天冷色调」"
+            "（叶天佑须面孔匹配；另一人无法匹配时用未名人员或带服装特征的暂称）。"
         )
     return " ".join(hints)
 
@@ -491,7 +498,8 @@ def build_frame_gender_hint(settings: Optional[Dict[str, Any]] = None) -> str:
         "勿凭姓名谐音、剧情印象或字幕语气臆测；",
         "characters 使用「姓名(男)」「姓名(女)」"
         f"「{FRAME_UNKNOWN_CHARACTER_MALE}」「{FRAME_UNKNOWN_CHARACTER_FEMALE}」「姓名(不明)」格式；"
-        f"有字幕真名写姓名(性别)，无真名写{FRAME_UNKNOWN_CHARACTER_MALE}/{FRAME_UNKNOWN_CHARACTER_FEMALE}；",
+        f"有面孔匹配写姓名(性别)，无匹配写{FRAME_UNKNOWN_CHARACTER_MALE}/{FRAME_UNKNOWN_CHARACTER_FEMALE}；"
+        "**禁止**凭字幕中的称呼写规范姓名；",
         "frame_observations 的 observation 须写出可见人物（真名或未名人员+性别）与场景光线；",
         "action/key_visual 描述人物时也须带性别（如「男刑警胡小跃」「未名人员(男)与老叶并肩」）；",
         "同一批次内同一人物的性别须前后一致；仅见背影/侧脸无法确认时标「不明」，勿猜测。",

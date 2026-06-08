@@ -33,13 +33,16 @@ def default_test_analysis_path_for_video(
     video_path: str,
     *,
     max_duration_seconds: float = 5.0,
+    start_time_seconds: float = 0.0,
 ) -> str:
     stem = sanitize_video_stem(video_path)
     duration_tag = int(max(1, round(float(max_duration_seconds))))
-    return os.path.join(
-        analysis_artifact_dir(),
-        f"{stem}_frame_analysis_test_{duration_tag}s.json",
-    )
+    start_tag = int(max(0, round(float(start_time_seconds))))
+    if start_tag > 0:
+        filename = f"{stem}_frame_analysis_test_from{start_tag}s_{duration_tag}s.json"
+    else:
+        filename = f"{stem}_frame_analysis_test_{duration_tag}s.json"
+    return os.path.join(analysis_artifact_dir(), filename)
 
 
 def normalize_video_path(video_path: str) -> str:

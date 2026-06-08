@@ -411,9 +411,14 @@ def build_batch_vision_reference_prompt_section(
 
     if refs:
         if character_collage and len(refs) >= 2:
-            names = "、".join(str(item.get("name") or "").strip() for item in refs if item.get("name"))
+            numbered = "、".join(
+                f"#{index + 1}{str(item.get('name') or '').strip()}"
+                for index, item in enumerate(refs)
+                if item.get("name")
+            )
             lines.append(
-                f"**图 #{image_index}**：人物定妆照拼图（从左到右依次为 **{names}**），用于识别关键帧面孔；"
+                f"**图 #{image_index}**：人物定妆照拼图（从左到右依次为 {numbered}），"
+                "须逐脸对照关键帧写规范姓名；"
             )
             image_index += 1
         else:
@@ -427,9 +432,9 @@ def build_batch_vision_reference_prompt_section(
     lines.extend(
         [
             f"从第 **{prefix_count + 1}** 张起共 **{video_frame_count}** 张为本批次视频关键帧。",
-            "识别到与参照一致且**本批画面可见**的面孔时，才可写规范姓名；",
-            "仍须与本批硬字幕/SRT 不冲突；无法匹配时用「未名人员(男/女)」。",
-            "**禁止**因关系表/定妆照列表而默认全员在场。",
+            "关键帧中**脸/侧脸清晰**且与定妆照一致 → **必须**写规范姓名 `姓名(男/女)`，禁止便衣男/年轻男子/警员等代称；",
+            "仅脸不可辨、背对、远景模糊或确实无法匹配时，才用未名人员或带服装特征的暂称；",
+            "**禁止**因关系表/定妆照列表而默认全员在场；**禁止**凭字幕称呼猜人。",
         ]
     )
     return "\n".join(lines)

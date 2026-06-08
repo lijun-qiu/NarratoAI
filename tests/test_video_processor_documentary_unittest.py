@@ -24,7 +24,7 @@ class VideoProcessorDocumentaryTests(unittest.TestCase):
         result = processor.extract_frames_by_interval_with_fallback("/tmp/out", interval_seconds=3.0)
 
         self.assertEqual(["a.jpg"], result)
-        fast_path.assert_called_once_with("/tmp/out", interval_seconds=3.0, max_duration_seconds=None)
+        fast_path.assert_called_once_with("/tmp/out", interval_seconds=3.0, max_duration_seconds=None, start_time_seconds=None)
 
     def test_extract_frames_by_interval_falls_back_to_ultra_compatible(self):
         processor = VideoProcessor.__new__(VideoProcessor)
@@ -49,8 +49,8 @@ class VideoProcessorDocumentaryTests(unittest.TestCase):
                 result = processor.extract_frames_by_interval_with_fallback(output_dir, interval_seconds=3.0)
 
         self.assertEqual([expected_frame_path], result)
-        fast_path.assert_called_once_with(output_dir, interval_seconds=3.0, max_duration_seconds=None)
-        fallback.assert_called_once_with(processor, output_dir, interval_seconds=3.0, max_duration_seconds=None)
+        fast_path.assert_called_once_with(output_dir, interval_seconds=3.0, max_duration_seconds=None, start_time_seconds=None)
+        fallback.assert_called_once_with(processor, output_dir, interval_seconds=3.0, max_duration_seconds=None, start_time_seconds=None)
 
     def test_extract_frames_by_interval_rejects_non_positive_interval(self):
         processor = VideoProcessor.__new__(VideoProcessor)
@@ -94,5 +94,5 @@ class VideoProcessorDocumentaryTests(unittest.TestCase):
 
             self.assertEqual([expected_keyframe], result)
             self.assertFalse(os.path.exists(stale_fastframe))
-            fast_path.assert_called_once_with(output_dir, interval_seconds=3.0, max_duration_seconds=None)
-            fallback.assert_called_once_with(processor, output_dir, interval_seconds=3.0, max_duration_seconds=None)
+            fast_path.assert_called_once_with(output_dir, interval_seconds=3.0, max_duration_seconds=None, start_time_seconds=None)
+            fallback.assert_called_once_with(processor, output_dir, interval_seconds=3.0, max_duration_seconds=None, start_time_seconds=None)

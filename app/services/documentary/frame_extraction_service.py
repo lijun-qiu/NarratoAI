@@ -30,6 +30,10 @@ from app.services.documentary.frame_extraction_rules import (
     build_frame_extraction_prompt_body,
     enrich_scene_segment_from_editor_fields,
 )
+from app.services.documentary.frame_timeline_refinement import (
+    build_scene_segments_from_frame_observations,
+    refine_batch_from_frame_observations,
+)
 from app.services.documentary.frame_timeline_sampling import (
     infer_scene_label_from_segment,
     normalize_scene_segments,
@@ -39,9 +43,16 @@ from app.services.documentary.documentary_subtitle_enrichment import (
     attach_subtitles_to_frame_analysis_artifact,
     subtitle_excerpt_for_time_range,
 )
+from app.services.documentary.frame_dialogue_alignment import (
+    apply_dialogue_alignment_to_artifact,
+    build_frame_dialogue_speaker_rules,
+)
 from app.services.documentary.frame_character_naming import (
-    apply_subtitle_gated_names_to_artifact,
+    apply_face_gated_names_to_artifact,
+    apply_obvious_character_relationships_to_artifact,
+    build_frame_face_match_batch_hint,
     build_frame_naming_priority_rules,
+    validate_face_naming_when_references_attached,
 )
 from app.services.drama_character_registry import (
     build_batch_vision_reference_prompt_section,
@@ -52,6 +63,7 @@ from app.services.drama_character_registry import (
 from app.services.short_drama_drama_knowledge import (
     apply_name_corrections_to_frame_analysis_artifact,
     build_frame_analysis_drama_knowledge_section,
+    build_frame_obvious_relationship_hint,
 )
 from app.config.llm_gateway_router import describe_llm_route, resolve_llm_credentials
 from app.services.documentary.vision_model_rotation import (
@@ -100,10 +112,12 @@ class DocumentaryFrameExtractionService:
         frame_drama_knowledge_text_enabled: bool = False,
         frame_relationship_diagram_enabled: bool = False,
         max_duration_seconds: float | None = None,
+        start_time_seconds: float | None = None,
         test_mode: bool = False,
     ) -> dict[str, Any]:
         progress = progress_callback or (lambda _p, _m: None)
         resolved_max_duration = self._resolve_max_duration_seconds(max_duration_seconds, test_mode=test_mode)
+        resolved_start_time = self._resolve_start_time_seconds(start_time_seconds, test_mode=test_mode)
         resolved_relationship = (
             resolve_media_path(relationship_diagram_path)
             if frame_relationship_diagram_enabled
@@ -145,9 +159,17 @@ class DocumentaryFrameExtractionService:
             video_path,
             frame_interval_seconds,
             max_duration_seconds=resolved_max_duration,
+            start_time_seconds=resolved_start_time,
         )
         if resolved_max_duration:
-            progress(25, f"关键帧准备完成，共 {len(keyframe_files)} 帧（测试：前 {resolved_max_duration:g} 秒）")
+            if resolved_start_time > 0:
+                progress(
+                    25,
+                    f"关键帧准备完成，共 {len(keyframe_files)} 帧"
+                    f"（测试：{resolved_start_time:g}s–{resolved_start_time + resolved_max_duration:g}s）",
+                )
+            else:
+                progress(25, f"关键帧准备完成，共 {len(keyframe_files)} 帧（测试：前 {resolved_max_duration:g} 秒）")
         else:
             progress(25, f"关键帧准备完成，共 {len(keyframe_files)} 帧")
 
@@ -204,12 +226,14 @@ class DocumentaryFrameExtractionService:
             frame_relationship_diagram_enabled=frame_relationship_diagram_enabled,
             test_mode=test_mode,
             test_max_duration_seconds=resolved_max_duration,
+            test_start_time_seconds=resolved_start_time,
         )
         output_path = None
         if test_mode and resolved_max_duration:
             output_path = self.default_test_analysis_path_for_video(
                 video_path,
                 max_duration_seconds=resolved_max_duration,
+                start_time_seconds=resolved_start_time,
             )
         analysis_json_path = self._save_analysis_artifact(
             artifact,
@@ -700,6 +724,8 @@ class DocumentaryFrameExtractionService:
                     frame_paths=frame_paths,
                     time_range=time_range,
                     vision_model_used=model_used,
+                    character_references=active_refs,
+                    reference_images_attached=ref_image_count > 0,
                 )
             except Exception as exc:
                 return self._build_failed_batch_result(
@@ -771,12 +797,27 @@ class DocumentaryFrameExtractionService:
             parsed = 5.0
         return max(1.0, parsed)
 
+    @staticmethod
+    def _resolve_start_time_seconds(
+        start_time_seconds: float | int | None,
+        *,
+        test_mode: bool = False,
+    ) -> float:
+        if not test_mode:
+            return 0.0
+        try:
+            parsed = float(start_time_seconds if start_time_seconds is not None else 0.0)
+        except (TypeError, ValueError):
+            parsed = 0.0
+        return max(0.0, parsed)
+
     def _load_or_extract_keyframes(
         self,
         video_path: str,
         frame_interval_seconds: float,
         *,
         max_duration_seconds: float | None = None,
+        start_time_seconds: float = 0.0,
     ) -> list[str]:
         keyframes_root = os.path.join(utils.temp_dir(), "keyframes")
         os.makedirs(keyframes_root, exist_ok=True)
@@ -784,13 +825,18 @@ class DocumentaryFrameExtractionService:
             video_path,
             frame_interval_seconds,
             max_duration_seconds=max_duration_seconds,
+            start_time_seconds=start_time_seconds,
         )
         cache_dir = os.path.join(keyframes_root, cache_key)
         os.makedirs(cache_dir, exist_ok=True)
 
         cached_files = self._collect_keyframe_paths(cache_dir)
         if cached_files:
-            cached_files = self._filter_keyframes_by_max_duration(cached_files, max_duration_seconds)
+            cached_files = self._filter_keyframes_by_window(
+                cached_files,
+                start_time_seconds=start_time_seconds,
+                max_duration_seconds=max_duration_seconds,
+            )
             logger.info(f"使用已缓存关键帧: {cache_dir}, 共 {len(cached_files)} 帧")
             return cached_files
 
@@ -799,11 +845,16 @@ class DocumentaryFrameExtractionService:
             output_dir=cache_dir,
             interval_seconds=frame_interval_seconds,
             max_duration_seconds=max_duration_seconds,
+            start_time_seconds=start_time_seconds,
         )
         keyframe_files = sorted(str(path) for path in extracted if str(path).endswith(".jpg"))
         if not keyframe_files:
             keyframe_files = self._collect_keyframe_paths(cache_dir)
-        keyframe_files = self._filter_keyframes_by_max_duration(keyframe_files, max_duration_seconds)
+        keyframe_files = self._filter_keyframes_by_window(
+            keyframe_files,
+            start_time_seconds=start_time_seconds,
+            max_duration_seconds=max_duration_seconds,
+        )
         if not keyframe_files:
             raise RuntimeError("未提取到任何关键帧")
 
@@ -816,6 +867,7 @@ class DocumentaryFrameExtractionService:
         frame_interval_seconds: float,
         *,
         max_duration_seconds: float | None = None,
+        start_time_seconds: float = 0.0,
     ) -> str:
         try:
             video_mtime = os.path.getmtime(video_path)
@@ -828,8 +880,9 @@ class DocumentaryFrameExtractionService:
                 str(video_path),
                 str(video_mtime),
                 str(frame_interval_seconds),
+                str(start_time_seconds or ""),
                 str(max_duration_seconds or ""),
-                "documentary-keyframes-v2",
+                "documentary-keyframes-v3",
             ]
         )
         return f"{legacy_prefix}_{utils.md5(payload)}"
@@ -847,19 +900,43 @@ class DocumentaryFrameExtractionService:
         return hours * 3600 + minutes * 60 + seconds + milliseconds / 1000.0
 
     @classmethod
+    def _filter_keyframes_by_window(
+        cls,
+        keyframe_files: list[str],
+        *,
+        start_time_seconds: float | None = None,
+        max_duration_seconds: float | None = None,
+    ) -> list[str]:
+        start = max(0.0, float(start_time_seconds or 0))
+        end: float | None
+        if max_duration_seconds and max_duration_seconds > 0:
+            end = start + float(max_duration_seconds)
+        else:
+            end = None
+
+        filtered: list[str] = []
+        for path in keyframe_files:
+            timestamp = cls._keyframe_timestamp_seconds(path)
+            if timestamp is None:
+                continue
+            if timestamp < start:
+                continue
+            if end is not None and timestamp >= end:
+                continue
+            filtered.append(path)
+        return filtered
+
+    @classmethod
     def _filter_keyframes_by_max_duration(
         cls,
         keyframe_files: list[str],
         max_duration_seconds: float | None,
     ) -> list[str]:
-        if not max_duration_seconds or max_duration_seconds <= 0:
-            return list(keyframe_files)
-        filtered: list[str] = []
-        for path in keyframe_files:
-            timestamp = cls._keyframe_timestamp_seconds(path)
-            if timestamp is None or timestamp < max_duration_seconds:
-                filtered.append(path)
-        return filtered
+        return cls._filter_keyframes_by_window(
+            keyframe_files,
+            start_time_seconds=0.0,
+            max_duration_seconds=max_duration_seconds,
+        )
 
     @staticmethod
     def _collect_keyframe_paths(cache_dir: str) -> list[str]:
@@ -1001,6 +1078,8 @@ class DocumentaryFrameExtractionService:
                     frame_paths=frame_paths,
                     time_range=time_range,
                     vision_model_used=model_used,
+                    character_references=active_refs,
+                    reference_images_attached=ref_image_count > 0,
                 )
             except Exception as exc:
                 return self._build_failed_batch_result(
@@ -1050,7 +1129,10 @@ class DocumentaryFrameExtractionService:
             documentary_settings=cfg,
         )
         extra_lines: list[str] = []
-        use_collage = bool(cfg.get("frame_reference_use_collage", True)) and len(character_references or []) >= 2
+        from app.services.documentary.frame_reference_images import resolve_reference_collage_mode
+
+        resolved_refs = character_references or []
+        use_collage = resolve_reference_collage_mode(cfg, head_count=len(resolved_refs))
         ref_section = ""
         if reference_carryover_prompt.strip():
             extra_lines.append(reference_carryover_prompt.strip())
@@ -1076,6 +1158,12 @@ class DocumentaryFrameExtractionService:
             is_carryover_batch=bool(reference_carryover_prompt.strip()),
         )
         extra_lines.append(priority_rules)
+        dialogue_hint = build_frame_dialogue_speaker_rules()
+        if dialogue_hint.strip():
+            extra_lines.append(dialogue_hint.strip())
+        face_match_hint = build_frame_face_match_batch_hint(character_references, frame_count=frame_count)
+        if face_match_hint.strip():
+            extra_lines.append(face_match_hint.strip())
         visible_hint = build_frame_visible_content_hint(cfg, frame_count=frame_count)
         if visible_hint:
             extra_lines.append(visible_hint)
@@ -1083,6 +1171,11 @@ class DocumentaryFrameExtractionService:
         drama_block, _ = build_frame_analysis_drama_knowledge_section(theme_text, cfg)
         if drama_block.strip():
             extra_lines.append(drama_block.strip())
+        relationship_hint = build_frame_obvious_relationship_hint(
+            (drama_label or video_theme or "").strip()
+        )
+        if relationship_hint.strip():
+            extra_lines.append(relationship_hint.strip())
         naming_hint = build_frame_character_naming_hint(cfg)
         if naming_hint:
             extra_lines.append(naming_hint)
@@ -1105,8 +1198,9 @@ class DocumentaryFrameExtractionService:
                     f"出现的小名/昵称/关系称呼如老叶、小跃、师傅等须原样使用）：{dialogue}"
                 )
         extra_lines.append(
-            "scene_segments 若含 subtitle_entries（每项 start/end/text），其中 text 即为**原片字幕逐条原文**，"
-            "与硬字幕同等效力；写 observation/action 时人名须与这些 text 或硬字幕一致，勿改写 subtitle_entries。"
+            "scene_segments 若含 subtitle_entries（每项 start/end/text），其中 text 为**原片字幕逐条原文**；"
+            "action/characters 中的人名须与 subtitle 一致，或由本批可见面孔与定妆照匹配后写规范姓名；"
+            "二者可同时成立（如字幕「老叶」+ 拼图识别叶天佑与楚青桐）；勿改写 subtitle_entries 原文。"
         )
         if (video_theme or "").strip():
             extra_lines.append(f"视频主题：{video_theme.strip()}")
@@ -1185,6 +1279,7 @@ class DocumentaryFrameExtractionService:
         frame_relationship_diagram_enabled: bool = False,
         test_mode: bool = False,
         test_max_duration_seconds: float | None = None,
+        test_start_time_seconds: float = 0.0,
     ) -> dict[str, Any]:
         sorted_batches = self._sort_batch_results(batch_results)
 
@@ -1258,6 +1353,8 @@ class DocumentaryFrameExtractionService:
             artifact["test_mode"] = True
             if test_max_duration_seconds:
                 artifact["test_max_duration_seconds"] = float(test_max_duration_seconds)
+            if test_start_time_seconds > 0:
+                artifact["test_start_time_seconds"] = float(test_start_time_seconds)
         resolved_relationship = resolve_media_path(relationship_diagram_path)
         if resolved_relationship:
             artifact["relationship_diagram_path"] = os.path.relpath(
@@ -1331,7 +1428,9 @@ class DocumentaryFrameExtractionService:
                 batch_index = int(batch.get("batch_index", 0))
                 batch["scene_segments"] = segments_by_batch.get(batch_index, [])
         apply_name_corrections_to_frame_analysis_artifact(artifact)
-        apply_subtitle_gated_names_to_artifact(artifact)
+        apply_face_gated_names_to_artifact(artifact)
+        apply_dialogue_alignment_to_artifact(artifact)
+        apply_obvious_character_relationships_to_artifact(artifact)
 
     @staticmethod
     def analysis_artifact_dir() -> str:
@@ -1347,10 +1446,12 @@ class DocumentaryFrameExtractionService:
         video_path: str,
         *,
         max_duration_seconds: float = 5.0,
+        start_time_seconds: float = 0.0,
     ) -> str:
         return pairing_default_test_analysis_path_for_video(
             video_path,
             max_duration_seconds=max_duration_seconds,
+            start_time_seconds=start_time_seconds,
         )
 
     @classmethod
@@ -1702,9 +1803,18 @@ class DocumentaryFrameExtractionService:
         *,
         time_range: str,
         overall_summary: str,
+        batch_index: int = 0,
     ) -> list[dict[str, Any]]:
         if not frame_observations:
             return []
+
+        built = build_scene_segments_from_frame_observations(
+            frame_observations,
+            batch_index=batch_index,
+            time_range=time_range,
+        )
+        if built:
+            return [self._normalize_scene_segment(item) for item in built]
 
         observations = [
             str(frame.get("observation") or "").strip()
@@ -1801,17 +1911,39 @@ class DocumentaryFrameExtractionService:
                         continue
             raise
 
+    @staticmethod
+    def _is_narration_script_clip_payload(payload: Any) -> bool:
+        """视觉模型误返回解说脚本 JSON（非抽帧 frame_observations）。"""
+
+        def _looks_like_script_clip(item: dict[str, Any]) -> bool:
+            if item.get("frame_observations") or item.get("scene_segments"):
+                return False
+            has_picture = bool(str(item.get("picture") or "").strip())
+            has_narration = bool(str(item.get("narration") or "").strip())
+            has_script_keys = any(key in item for key in ("_id", "OST", "original_line"))
+            return has_picture and has_narration and has_script_keys
+
+        if isinstance(payload, dict):
+            return _looks_like_script_clip(payload)
+        if isinstance(payload, list):
+            clips = [item for item in payload if isinstance(item, dict)]
+            return bool(clips) and all(_looks_like_script_clip(item) for item in clips)
+        return False
+
     def _coerce_batch_payload(
         self,
         payload: Any,
         *,
         time_range: str,
     ) -> dict[str, Any]:
-        """将视觉模型多种 JSON 形态规范为 scene_segments + frame_observations 结构。"""
+        """将视觉模型 JSON 规范为 scene_segments + frame_observations 结构。"""
+        if self._is_narration_script_clip_payload(payload):
+            return {}
+
         if isinstance(payload, dict):
             if payload.get("scene_segments") or payload.get("frame_observations"):
                 return payload
-            if any(payload.get(key) for key in ("timestamp", "action", "scene", "picture", "narration")):
+            if any(payload.get(key) for key in ("timestamp", "action", "scene")):
                 segment = self._normalize_scene_segment(payload)
                 if not segment.get("timestamp"):
                     segment["timestamp"] = time_range
@@ -1829,29 +1961,11 @@ class DocumentaryFrameExtractionService:
         for item in payload:
             if not isinstance(item, dict):
                 continue
-            if any(item.get(key) for key in ("scene", "action", "key_visual", "characters")):
+            if any(item.get(key) for key in ("scene", "action", "key_visual", "characters", "observation")):
                 segment = self._normalize_scene_segment(item)
                 if not segment.get("timestamp"):
                     segment["timestamp"] = time_range
                 segments.append(segment)
-                continue
-            picture = str(item.get("picture") or "").strip()
-            narration = str(item.get("narration") or "").strip()
-            if picture or narration or item.get("timestamp"):
-                segments.append(
-                    self._normalize_scene_segment(
-                        {
-                            "timestamp": item.get("timestamp") or time_range,
-                            "scene": "",
-                            "characters": [],
-                            "action": picture or narration[:200],
-                            "emotion": "",
-                            "key_visual": picture,
-                            "audio_cue": "原声对白" if item.get("OST") == 1 else "",
-                            "importance": "中",
-                        }
-                    )
-                )
 
         if not segments:
             return {}
@@ -1871,9 +1985,22 @@ class DocumentaryFrameExtractionService:
         frame_paths: list[str],
         time_range: str,
         vision_model_used: str = "",
+        character_references: list[dict[str, str]] | None = None,
+        reference_images_attached: bool = False,
     ) -> FrameBatchResult:
         try:
             payload_raw = self._load_batch_payload_json(raw_response)
+            if self._is_narration_script_clip_payload(payload_raw):
+                return self._build_failed_batch_result(
+                    batch_index=batch_index,
+                    raw_response=raw_response,
+                    error_message=(
+                        "Batch response is narration script JSON (_id/picture/narration/OST), "
+                        "not frame analysis (frame_observations + scene_segments required)"
+                    ),
+                    frame_paths=frame_paths,
+                    time_range=time_range,
+                )
             payload = self._coerce_batch_payload(payload_raw, time_range=time_range)
             if not isinstance(payload, dict) or not payload:
                 return self._build_failed_batch_result(
@@ -1932,8 +2059,8 @@ class DocumentaryFrameExtractionService:
                     timestamp = ""
                     burned_in_subtitle = ""
                     has_burned_in_subtitle = False
-                if not timestamp:
-                    timestamp = self._timestamp_from_keyframe_name(frame_path)
+                # 时间码以关键帧文件名为准，避免模型在测试片段中从 00:00:00 重计
+                timestamp = self._timestamp_from_keyframe_name(frame_path)
                 frame_observations.append(
                     {
                         "frame_path": frame_path,
@@ -1962,7 +2089,16 @@ class DocumentaryFrameExtractionService:
                 frame_observations,
                 time_range=time_range,
                 overall_summary=summary,
+                batch_index=batch_index,
             )
+
+        scene_segments, frame_observations, summary = refine_batch_from_frame_observations(
+            scene_segments,
+            frame_observations,
+            batch_index=batch_index,
+            time_range=time_range,
+            overall_summary=summary,
+        )
 
         warn_frame_analysis_gender_mismatch(
             scene_segments=scene_segments,
@@ -1970,6 +2106,22 @@ class DocumentaryFrameExtractionService:
             batch_index=batch_index,
             time_range=time_range,
         )
+
+        naming_error = validate_face_naming_when_references_attached(
+            frame_observations=frame_observations,
+            scene_segments=scene_segments,
+            character_references=character_references,
+            reference_images_attached=reference_images_attached,
+        )
+        if naming_error:
+            return self._build_failed_batch_result(
+                batch_index=batch_index,
+                raw_response=raw_response,
+                error_message=naming_error,
+                frame_paths=frame_paths,
+                time_range=time_range,
+                vision_model_used=vision_model_used,
+            )
 
         return FrameBatchResult(
             batch_index=batch_index,

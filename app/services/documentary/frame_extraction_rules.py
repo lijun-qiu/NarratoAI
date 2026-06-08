@@ -75,10 +75,12 @@ def build_frame_reading_workflow_rules(*, frame_count: int) -> str:
 
 1. **先逐帧扫读**全部 {frame_count} 张图：记录景别变化、人物出入画、光线是否跳变、是否有硬字幕
 2. **再归纳 scene_segments**：仅当「地点 / 主场景 / 主事件 / 光线」发生实质变化时才新开一条
-3. **同批同景合并**：连续帧同一地点、同一组人物、同一动作链 → **1 条** segment
+3. **同批同景合并**：连续帧**同一地点、同一动作链**（如整段天台对话）→ 可合并为 1 条 segment
+3b. **动作段必拆**：地点变化（停车场↔车顶↔地面）、景别从定场切到追逐、人物从车上到地面奔跑 → **必须**拆成多条 segment，禁止整批压成 1 条
 4. **跨景必拆**：硬切、转场、换场、时间跳跃 → 必须拆成多条，timestamp 不得重叠
 5. **声画思维**：想象解说员下一镜需要什么——定场、反应、动作、空镜、高潮各就各位
-6. **禁止脑补**：画面未出现的人、地点、事件、航拍、牺牲、追车一律不写"""
+6. **禁止脑补**：画面未出现的人、地点、事件、航拍、牺牲、追车一律不写
+7. **禁止**输出解说脚本 JSON（`_id` / `picture` / `narration` / `OST` 数组）；必须输出含 `frame_observations` 与 `scene_segments` 的抽帧分析 JSON"""
 
 
 def build_frame_scene_segment_spec(*, max_seg_sec: int) -> str:
@@ -99,14 +101,40 @@ def build_frame_scene_segment_spec(*, max_seg_sec: int) -> str:
 - key_visual 须含 **至少两项**：光线 + 景别或构图（例：「夜间暖灯近景，浅景深，人物占画面左侧三分线」）"""
 
 
+def build_frame_timeline_narrative_rules() -> str:
+    return """## 时间轴叙事（硬性 · 读 JSON 须能还原「发生了什么」）
+
+- **frame_observations** 是逐秒账本：每一帧写清 **[景别] 地点，人物+动作**；读 sequential 列表应能还原事件顺序
+- **scene_segments** 是剪辑段落：按地点/动作阶段拆分，每条 timestamp 须落在本批真实时间轴内
+- **overall_activity_summary** 须按时间顺序写事件链（用 → 连接），例：
+  「本批次：5:00 停车场车辆行驶 → 5:01–5:03 车顶秦枫趴伏 → 5:04 车辆甩尾 → 5:07 秦枫持枪奔跑」
+- 禁止用一条笼统 segment 覆盖整批多种动作（如车顶追逐 + 地面奔跑 + 车辆甩尾）"""
+
+
+def build_frame_spatial_accuracy_rules() -> str:
+    return """## 空间位置描述（硬性 · 车内/车顶易错）
+
+- **车内 / 车顶 / 车外 / 车旁**须据可见结构判断，**禁止**夜间特写默认写「车内」：
+  - **车顶**：可见天空/远景、车身顶面钣金、人物趴/伏/立于车顶、仅有金属顶与护栏、无座椅方向盘
+  - **车内**：可见座椅、方向盘、A柱内饰、内后视镜、车窗框从**内侧**看出去
+  - **车外/车旁**：人物在地面或车体侧面，可见完整车身侧面/轮胎/停车场地面
+- 夜间背景全黑时：若人物贴近车身顶面、呈趴伏/抓握姿态、**无内饰元素** → 写「**车顶**」或「车体上方」，勿写车内
+- **拿不准**时写「靠近车辆，位置待辨」或「车顶/车内待辨」，勿臆测
+- 同批次相邻帧若已有「停车场/车辆行驶/甩尾」，中间人物特写优先判为**车顶或车外**动作镜，与前后景保持一致
+- 追逐/追捕中「趴车/跳车/车顶对峙」与「车内对话/驾驶」是不同 scene，**不得**合并成一条 segment"""
+
+
 def build_frame_observation_spec(*, frame_count: int) -> str:
     return f"""## frame_observations 逐帧规范（必须 {frame_count} 条 · 与输入帧一一对应）
 
-每条对应一帧，按时间顺序输出，**不得遗漏**：
-- **timestamp**：该帧时间 `HH:MM:SS,mmm`（取自文件名或批次时间轴）
+每条对应**一帧**，按时间顺序输出，**不得遗漏**；**每一帧独立分析**，禁止整批复制同一句：
+- **timestamp**：该帧时间 `HH:MM:SS,mmm`（**须与输入帧文件名时间码一致**，勿从 00:00:00 重计）
 - **observation**：15–40 字，格式建议「[景别] 地点，可见人物(性别)+动作，光线关键词」
+  - **人名**：本帧每张可见脸须**独立**对照定妆照；匹配 → 写 `姓名(男/女)`；脸不可辨/背对 → 写未名人员或暂称
   - 例：「[特写] 审讯室，胡小跃(男)拍桌，顶光硬阴影」
-- 若本帧有硬字幕：填写 burned_in_subtitle / has_burned_in_subtitle（见硬字幕规则）
+  - 例：「[特写] 车顶，秦枫(男)趴伏抓边，夜/室外/冷调」
+- 若本帧有硬字幕：另填 JSON 字段 `burned_in_subtitle` / `has_burned_in_subtitle`（**不要**写进 observation 字符串里）
+- **硬字幕 ≠ 本帧说话人**：仅复制文字；谁说话须看本帧嘴型/手势，反应镜/聆听镜勿标「开口说话」
 - 逐帧只写**这一帧**可见内容；相邻帧若画面相同，仍须分别描述细微变化（表情、手势、字幕出现）"""
 
 
@@ -127,27 +155,42 @@ def build_frame_extraction_json_skeleton(
     burned = burned_in_subtitle_example or ""
     return f"""## 输出 JSON 结构（只返回 JSON，不要 markdown 包裹）
 
+**禁止**输出解说脚本片段（`_id`、`picture`、`narration`、`OST` 数组）。必须是下方抽帧结构，且 `frame_observations` 条数 = {frame_count}。
+
 ```json
 {{
   "scene_segments": [
     {{
-      "timestamp": "00:00:01,940-00:00:09,940",
-      "scene": "楼顶天台",
-      "observation": "阴天，两名男子并肩立于天台边缘交谈，气氛严肃压抑",
-      "action": "叶天佑(男)与未名人员(男)面向城市远景站立对话",
-      "emotion": "严肃、压抑",
-      "key_visual": "阴天冷色调中景，对称构图，云层低垂与城市远景",
+      "timestamp": "00:05:00,000-00:05:03,000",
+      "scene": "废弃停车场车顶",
+      "observation": "夜间，秦枫(男)趴伏于行驶中的车顶，神情紧张",
+      "action": "秦枫(男)抓握车顶边缘，车辆高速行驶",
+      "emotion": "紧张",
+      "key_visual": "夜/室外/冷调，特写，动态模糊",
+      "shot_scale": "特写",
+      "lighting_time": "夜/室外/冷调",
+      "edit_role": "动作",
+      "audio_cue": "风噪与引擎",
+      "importance": "高"
+    }},
+    {{
+      "timestamp": "00:05:04,000-00:05:09,000",
+      "scene": "废弃停车场",
+      "observation": "车辆甩尾后，秦枫(男)持枪在停车场内奔跑追捕",
+      "action": "秦枫(男)持枪奔跑，后方警员跟随",
+      "emotion": "紧迫",
+      "key_visual": "夜/室外/冷调，中景，低角度跟拍",
       "shot_scale": "中景",
-      "lighting_time": "日/室外/冷调",
-      "edit_role": "对话",
-      "audio_cue": "对白交锋",
-      "importance": "中"
+      "lighting_time": "夜/室外/冷调",
+      "edit_role": "动作",
+      "importance": "高"
     }}
   ],
   "frame_observations": [
-    {{"timestamp": "00:00:00,000", "observation": "[全景] 楼顶天台，两人入画，阴天冷调{burned}"}}
+    {{"timestamp": "00:05:00,000", "observation": "[远景] 废弃停车场，汽车行驶，夜间暗调{burned}"}},
+    {{"timestamp": "00:05:02,000", "observation": "[特写] 车顶，秦枫(男)侧脸，神色凝重{burned}"}}
   ],
-  "overall_activity_summary": "本批次：天台双人密谈，由全景推至中近景，气氛持续压抑"
+  "overall_activity_summary": "本批次：5:00 停车场车辆行驶 → 5:01–5:03 车顶秦枫趴伏 → 5:04 车辆甩尾 → 5:07 秦枫持枪奔跑"
 }}
 ```
 
@@ -165,10 +208,15 @@ def build_frame_extraction_prompt_body(
     """组装视觉模型主 prompt（不含批次字幕摘录等动态补充）。"""
     cfg = settings or get_documentary_settings()
     max_seg_sec = resolve_frame_max_segment_duration_sec(cfg)
+    from app.services.documentary.frame_dialogue_alignment import build_frame_dialogue_speaker_rules
+
     sections = [
         build_frame_editor_role_preamble(),
         build_frame_reading_workflow_rules(frame_count=frame_count),
         build_frame_timestamp_rules(),
+        build_frame_timeline_narrative_rules(),
+        build_frame_spatial_accuracy_rules(),
+        build_frame_dialogue_speaker_rules(),
         build_frame_scene_segment_spec(max_seg_sec=max_seg_sec),
         build_frame_observation_spec(frame_count=frame_count),
         build_frame_extraction_json_skeleton(

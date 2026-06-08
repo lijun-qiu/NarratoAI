@@ -498,6 +498,33 @@ def clip_entries_to_duration(entries: list[SrtEntry], max_duration_ms: int) -> l
     return clipped
 
 
+def clip_entries_to_time_window(
+    entries: list[SrtEntry],
+    start_ms: int,
+    end_ms: int,
+) -> list[SrtEntry]:
+    """截取 [start_ms, end_ms) 窗口内的字幕，并将时间轴归零到窗口起点。"""
+    if not entries or end_ms <= start_ms:
+        return []
+    clipped: list[SrtEntry] = []
+    for entry in entries:
+        if entry.end_ms <= start_ms or entry.start_ms >= end_ms:
+            continue
+        rel_start = max(entry.start_ms, start_ms) - start_ms
+        rel_end = min(entry.end_ms, end_ms) - start_ms
+        if rel_end <= rel_start:
+            continue
+        clipped.append(
+            SrtEntry(
+                start_ms=rel_start,
+                end_ms=rel_end,
+                text=entry.text,
+                label=entry.label,
+            )
+        )
+    return clipped
+
+
 def extend_entries_to_speech_end(
     entries: list[SrtEntry],
     speech_duration_ms: int,

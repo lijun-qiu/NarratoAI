@@ -734,33 +734,46 @@ def _render_frame_analysis_controls(
         render_output_split_control(key="doc_output_split_parts")
 
     test_duration_key = "doc_frame_test_duration_seconds"
+    test_start_key = "doc_frame_test_start_seconds"
     if test_duration_key not in st.session_state:
         st.session_state[test_duration_key] = 5.0
-    test_cols = st.columns([2, 1])
+    if test_start_key not in st.session_state:
+        st.session_state[test_start_key] = 0.0
+    test_cols = st.columns([2, 2, 1])
     with test_cols[0]:
+        st.number_input(
+            "测试起始时间（秒）",
+            min_value=0.0,
+            max_value=7200.0,
+            step=1.0,
+            key=test_start_key,
+            help="测试抽帧从该时间点开始，例如楼顶对话可从 30s 起测 5 秒",
+        )
+    with test_cols[1]:
         st.number_input(
             "测试时长（秒）",
             min_value=1.0,
             max_value=120.0,
             step=1.0,
             key=test_duration_key,
-            help="测试抽帧仅处理片头指定秒数，用于快速验证参数/头像/关系表，节省 token",
+            help="测试抽帧仅处理指定秒数；会自动收紧抽帧间隔（约 1s）并分张发送定妆照",
         )
-    with test_cols[1]:
+    with test_cols[2]:
         st.caption(" ")
         st.caption(" ")
         if st.button(
-            "测试抽帧（仅前 N 秒）",
+            "测试抽帧",
             key="doc_extract_frame_analysis_test_btn",
             use_container_width=True,
             disabled=not can_extract,
-            help="结果保存为 *_frame_analysis_test_5s.json，不覆盖完整版 JSON",
+            help="结果保存为 *_frame_analysis_test_*.json，不覆盖完整版 JSON",
         ):
             extract_frame_analysis_docu(
                 params,
                 compact=compact,
                 test_mode=True,
                 test_duration_seconds=float(st.session_state.get(test_duration_key, 5.0)),
+                test_start_seconds=float(st.session_state.get(test_start_key, 0.0)),
             )
 
     action_cols = st.columns(2)

@@ -7,10 +7,16 @@ from __future__ import annotations
 
 import os
 import re
+from dataclasses import dataclass
 from functools import lru_cache
 from typing import Any
 
 from loguru import logger
+
+from app.services.documentary.documentary_settings import (
+    FRAME_UNKNOWN_CHARACTER_FEMALE,
+    FRAME_UNKNOWN_CHARACTER_MALE,
+)
 
 _PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
 
@@ -52,6 +58,79 @@ PLOT_BLUEPRINT_NAME_ALIAS_GROUPS: tuple[tuple[str, tuple[str, ...]], ...] = (
     ("彭含章", ("彭姐",)),
     ("文琴", ("文妈",)),
 )
+
+
+@dataclass(frozen=True)
+class ObviousCharacterRelation:
+    """两人姓名均已写入时可补充的固定关系（不可用于猜第三人）。"""
+
+    a: str
+    b: str
+    label: str
+    triggers: tuple[str, ...] = ()
+
+    def pair_key(self) -> frozenset[str]:
+        return frozenset({self.a, self.b})
+
+
+# 《罚罪2》明显关系：仅当 action/observation 中已同时出现两人姓名时才可补充
+FAZU2_OBVIOUS_CHARACTER_RELATIONS: tuple[ObviousCharacterRelation, ...] = (
+    ObviousCharacterRelation("叶天佑", "秦枫", "师徒"),
+    ObviousCharacterRelation("叶天佑", "胡小跃", "师徒"),
+    ObviousCharacterRelation("叶天佑", "麦洪超", "师徒"),
+    ObviousCharacterRelation("胡小跃", "秦枫", "师兄弟"),
+    ObviousCharacterRelation("胡小跃", "麦洪超", "师兄弟"),
+    ObviousCharacterRelation("秦枫", "麦洪超", "师兄弟"),
+    ObviousCharacterRelation("文琴", "刘天也", "母子"),
+    ObviousCharacterRelation("文琴", "秦枫", "养母子"),
+    ObviousCharacterRelation("文琴", "文江燕", "母女"),
+    ObviousCharacterRelation("秦立志", "秦枫", "父子"),
+    ObviousCharacterRelation("刘天也", "文江燕", "兄妹"),
+    ObviousCharacterRelation("秦枫", "文江燕", "兄妹"),
+    ObviousCharacterRelation("秦枫", "刘天也", "养兄弟"),
+    ObviousCharacterRelation("赵鹏", "赵子怡", "兄妹"),
+    ObviousCharacterRelation("赵子怡", "刘天也", "夫妻"),
+    ObviousCharacterRelation("楚青桐", "叶天佑", "上下级", ("厅", "省厅", "副厅长", "上级", "领导")),
+    ObviousCharacterRelation("楚青桐", "叶天佑", "至交"),
+    ObviousCharacterRelation("叶天佑", "严明", "上下级"),
+    ObviousCharacterRelation("叶天佑", "彭含章", "上下级"),
+    ObviousCharacterRelation("叶天佑", "钟雁宁", "上下级"),
+    ObviousCharacterRelation("胡小跃", "汪涛", "上下级"),
+    ObviousCharacterRelation("胡小跃", "杨振刚", "上下级"),
+    ObviousCharacterRelation("秦枫", "汪涛", "上下级"),
+    ObviousCharacterRelation("秦枫", "杨振刚", "上下级"),
+)
+
+_FAZU2_DRAMA_IDS = frozenset({"罚罪2", "罚罪", "fazu"})
+
+
+def resolve_obvious_character_relations(drama_id: str) -> tuple[ObviousCharacterRelation, ...]:
+    if (drama_id or "").strip().lower() in {item.lower() for item in _FAZU2_DRAMA_IDS} or (
+        drama_id or ""
+    ).strip() in _FAZU2_DRAMA_IDS:
+        return FAZU2_OBVIOUS_CHARACTER_RELATIONS
+    return ()
+
+
+def build_frame_obvious_relationship_hint(drama_id: str = "") -> str:
+    """抽帧 prompt：已写入姓名的两人之间可补明显关系。"""
+    relations = resolve_obvious_character_relations(drama_id)
+    if not relations:
+        return ""
+    samples = "；".join(
+        f"{item.a}↔{item.b}（{item.label}）"
+        for item in relations[:8]
+    )
+    return "\n".join(
+        [
+            "## 人物关系补充（仅两人姓名已写入时）",
+            "当 observation/action 中**已同时出现**两名角色的规范姓名（**均来自本批定妆照/头像面孔匹配**）时，"
+            "可对照关系表在描述中补写明显关系词（师徒/父子/母子/兄妹/上下级/夫妻等）；"
+            "**禁止**凭硬字幕/SRT 称呼（二师兄、老叶等）、对白职级词或关系表名单推断人名。",
+            f"常见固定关系示例：{samples}…",
+            "subtitle_entries 原文仍须保持字幕原样，关系词只写在 observation/action 侧。",
+        ]
+    )
 
 
 def _resolve_knowledge_path(theme: str, settings: dict[str, Any] | None) -> str:
@@ -194,11 +273,12 @@ def build_frame_analysis_drama_knowledge_section(
     work = (theme or "本剧").strip()
     header = f"""## 剧集人物关系对照（抽帧 · {work} · **仅作校正，不可猜人**）
 
-本节用于**校正**已出现在本批字幕/硬字幕/画面中的人物身份，**不是**出场名单：
-- **先**看本批硬字幕/SRT/subtitle_entries，**再**用本节校正谐音与关系（秦峰→秦枫，老叶→叶天佑）
-- **禁止**因对照表里有某角色，就把该名字写到本批未在字幕/画面中出现的人身上
-- 仅字幕或硬字幕出现姓名时才写真名；面孔无法确认时用「未名人员(男/女)」
-- **禁止**：胡小月/小月→须写胡小跃；秦峰→秦枫；罗伯→罗博
+本节用于**校正**本批已完成**头像/定妆照面孔匹配**的人名写法，**不是**出场名单：
+- **唯一写名途径**：本批画面中脸与头像/定妆照一致（≥1 帧匹配）→ 写规范姓名；或后帧匹配后，前序**同一身形+同一服装**可确认同一人时回溯写名
+- **硬字幕/SRT** 仅摘录对白；**禁止**凭称呼猜人，也**禁止**整批便衣统一替换
+- 面孔无法匹配任一头像 → 「{FRAME_UNKNOWN_CHARACTER_MALE}」「{FRAME_UNKNOWN_CHARACTER_FEMALE}」或便衣/警员等可见描述
+- **两人姓名均已由面孔匹配写入**时，可补明显关系（师徒/父子/上下级等）
+- **谐音校正**（仅对已写入姓名）：胡小月/小月→胡小跃；秦峰→秦枫；罗伯→罗博
 - **勿混**：叶天佑/老叶（局长）≠ 伟业；秦枫≠刘天也；文江燕是刘天也亲妹妹"""
     return _build_drama_knowledge_block(
         theme=theme,

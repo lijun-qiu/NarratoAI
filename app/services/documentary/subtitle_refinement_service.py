@@ -71,6 +71,7 @@ def _build_batch_frame_context(batch: dict[str, Any]) -> str:
 
     observations = batch.get("frame_observations") or batch.get("observations") or []
     batch_segments = batch.get("scene_segments") or []
+    segment_subtitle_lines: list[str] = []
     if batch_segments:
         lines.append("场景片段（结构化）：")
         for segment in batch_segments[:12]:
@@ -81,13 +82,16 @@ def _build_batch_frame_context(batch: dict[str, Any]) -> str:
             action = str(segment.get("action") or "").strip()
             key_visual = str(segment.get("key_visual") or "").strip()
             importance = str(segment.get("importance") or "").strip()
+            subtitle = str(segment.get("subtitle") or "").strip()
             summary_parts = [part for part in (scene, action, key_visual, importance) if part]
             if timestamp or summary_parts:
                 lines.append(f"- {timestamp}: {' | '.join(summary_parts)}")
+            if subtitle:
+                segment_subtitle_lines.append(f"- {timestamp}: {subtitle}")
 
+    burned_lines: list[str] = []
+    observation_lines: list[str] = []
     if observations:
-        burned_lines: list[str] = []
-        observation_lines: list[str] = []
         for obs in observations[:20]:
             if not isinstance(obs, dict):
                 continue
@@ -98,12 +102,15 @@ def _build_batch_frame_context(batch: dict[str, Any]) -> str:
             observation = str(obs.get("observation") or "").strip()
             if observation:
                 observation_lines.append(f"- {timestamp}: {observation}")
-        if burned_lines:
-            lines.append("画面硬字幕（校对错字依据，优先于下方观察）：")
-            lines.extend(burned_lines)
-        if observation_lines:
-            lines.append("画面观察（辅助理解，勿据此整句改写原字幕）：")
-            lines.extend(observation_lines)
+    if burned_lines:
+        lines.append("画面硬字幕（校对错字依据，优先于下方观察）：")
+        lines.extend(burned_lines)
+    elif segment_subtitle_lines:
+        lines.append("片段硬字幕汇总（校对错字依据）：")
+        lines.extend(segment_subtitle_lines)
+    if observation_lines:
+        lines.append("画面观察（辅助理解，勿据此整句改写原字幕）：")
+        lines.extend(observation_lines)
     return "\n".join(lines)
 
 

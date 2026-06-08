@@ -114,6 +114,31 @@ class HardSubtitleOcrServiceTest(unittest.TestCase):
         self.assertEqual(1, len(hits))
         self.assertEqual("硬字幕", hits[0].text)
 
+    def test_extract_ocr_hits_from_compact_artifact_without_frame_path(self):
+        artifact = {
+            "video_path": "/tmp/demo.mp4",
+            "frame_interval_seconds": 2.0,
+            "frame_observations": [
+                {
+                    "timestamp": "00:00:03,020",
+                    "burned_in_subtitle": "我说句没觉悟的话啊",
+                    "has_burned_in_subtitle": True,
+                    "batch_index": 0,
+                },
+                {
+                    "timestamp": "00:00:06,540",
+                    "burned_in_subtitle": "干嘛非要要求回去当局长",
+                    "has_burned_in_subtitle": True,
+                    "batch_index": 0,
+                },
+            ],
+        }
+        hits = extract_ocr_hits_from_artifact(artifact)
+        self.assertEqual(2, len(hits))
+        self.assertEqual("我说句没觉悟的话啊", hits[0].text)
+        self.assertEqual(3020, hits[0].timestamp_ms)
+        self.assertEqual("", hits[0].frame_path)
+
     @patch("app.services.documentary.hard_subtitle_ocr_service._run_async_safely")
     def test_calibrate_writes_ocr_refined_file(self, mock_run_async):
         mock_run_async.return_value = [

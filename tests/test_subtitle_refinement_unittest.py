@@ -28,6 +28,23 @@ class SubtitleRefinementServiceTest(unittest.TestCase):
         self.assertEqual(1, len(matched))
         self.assertEqual(0, matched[0][0])
 
+    def test_build_batch_frame_context_uses_segment_subtitle_fallback(self):
+        context = _build_batch_frame_context(
+            {
+                "time_range": "00:00:00,000-00:00:05,000",
+                "scene_segments": [
+                    {
+                        "timestamp": "00:00:01,000-00:00:03,000",
+                        "scene": "楼顶",
+                        "subtitle": "硬字幕汇总文本",
+                    },
+                ],
+                "frame_observations": [],
+            }
+        )
+        self.assertIn("片段硬字幕汇总", context)
+        self.assertIn("硬字幕汇总文本", context)
+
     def test_build_batch_frame_context(self):
         context = _build_batch_frame_context(
             {

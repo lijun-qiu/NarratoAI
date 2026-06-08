@@ -36,7 +36,7 @@ PROVIDER_FUN_ASR = "fun_asr"
 PROVIDER_WHISPER = "whisper_api"
 PROVIDER_GEMINI = "gemini_asr"
 
-ALL_PROVIDERS = [PROVIDER_FUN_ASR, PROVIDER_WHISPER, PROVIDER_GEMINI]
+ALL_PROVIDERS = [PROVIDER_GEMINI, PROVIDER_FUN_ASR, PROVIDER_WHISPER]
 
 PROVIDER_LABELS = {
     PROVIDER_FUN_ASR: "阿里百炼 Fun-ASR",
@@ -51,7 +51,7 @@ def get_transcription_settings() -> dict[str, Any]:
     section = config.transcription if hasattr(config, "transcription") else {}
     defaults: dict[str, Any] = {
         "enable_fallback": True,
-        "fallback_order": [PROVIDER_FUN_ASR, PROVIDER_WHISPER, PROVIDER_GEMINI],
+        "fallback_order": [PROVIDER_GEMINI, PROVIDER_FUN_ASR, PROVIDER_WHISPER],
         "max_chars": 20,
         "max_duration": 3.5,
         "preprocess_audio": True,
@@ -257,7 +257,8 @@ def transcribe_media_to_entries(
     if not chain:
         raise MediaTranscriptionError(
             "未配置可用转录 API。"
-            "请至少配置 fun_asr（阿里百炼，推荐），或支持 /audio/transcriptions 的 whisper_asr。"
+            "请至少配置 gemini_asr（Gemini 兼容 API，推荐）、fun_asr（阿里百炼），"
+            "或支持 /audio/transcriptions 的 whisper_asr。"
         )
 
     chars = int(max_chars if max_chars is not None else settings.get("max_chars", 20))

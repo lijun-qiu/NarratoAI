@@ -276,15 +276,6 @@ def _collect_top_level_observations(artifact: dict[str, Any]) -> list[dict[str, 
 def rebuild_batches_from_artifact(artifact: dict[str, Any]) -> list[dict[str, Any]]:
     """从精简或完整 artifact 重建可用于字幕校准的 batches。"""
     existing = artifact.get("batches")
-    if isinstance(existing, list) and existing:
-        enriched = []
-        for batch in existing:
-            if not isinstance(batch, dict):
-                continue
-            if batch.get("scene_segments") or batch.get("frame_observations") or batch.get("observations"):
-                enriched.append(batch)
-        if enriched:
-            return sorted(enriched, key=lambda item: int(item.get("batch_index", 0)))
 
     segments_by_batch: dict[int, list[dict[str, Any]]] = {}
     observations_by_batch: dict[int, list[dict[str, Any]]] = {}
@@ -301,6 +292,14 @@ def rebuild_batches_from_artifact(artifact: dict[str, Any]) -> list[dict[str, An
             if time_range:
                 time_range_by_batch[batch_index] = time_range
             status_by_batch[batch_index] = str(batch.get("status") or "success")
+            summary = str(
+                batch.get("overall_activity_summary")
+                or batch.get("summary")
+                or batch.get("fallback_summary")
+                or ""
+            ).strip()
+            if summary and batch_index not in summaries_by_batch:
+                summaries_by_batch[batch_index] = summary
 
     for segment in _collect_top_level_segments(artifact):
         batch_index = int(segment.get("batch_index", 0))

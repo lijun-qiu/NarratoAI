@@ -429,7 +429,7 @@ picture_wrap_double_quotes = true
 
 [transcription]
     enable_fallback = true
-    fallback_order = ["fun_asr", "whisper_api", "gemini_asr"]
+    fallback_order = ["gemini_asr", "fun_asr", "whisper_api"]
     max_chars = 20
     max_duration = 3.5
     preprocess_audio = true

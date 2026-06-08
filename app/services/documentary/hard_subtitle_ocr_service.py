@@ -83,13 +83,89 @@ def _timestamp_from_keyframe_name(filename: str) -> str:
     return f"{hours:02d}:{minutes:02d}:{seconds:02d},{milliseconds:03d}"
 
 
+def _append_observation_record(
+    records: list[dict[str, Any]],
+    observation: dict[str, Any],
+    *,
+    default_frame_path: str = "",
+) -> None:
+    timestamp = str(observation.get("timestamp") or "").strip()
+    frame_path = str(observation.get("frame_path") or default_frame_path).strip()
+    if not frame_path and not timestamp:
+        return
+    records.append(
+        {
+            "frame_path": frame_path,
+            "timestamp": timestamp,
+            "burned_in_subtitle": str(observation.get("burned_in_subtitle") or "").strip(),
+            "has_burned_in_subtitle": bool(observation.get("has_burned_in_subtitle")),
+        }
+    )
+
+
+def _build_keyframe_index_from_artifact(artifact: dict[str, Any]) -> list[tuple[int, str]]:
+    video_path = str(artifact.get("video_path") or "").strip()
+    if not video_path or not os.path.isfile(video_path):
+        return []
+    try:
+        frame_interval_seconds = float(artifact.get("frame_interval_seconds") or 0)
+    except (TypeError, ValueError):
+        frame_interval_seconds = 0.0
+    if frame_interval_seconds <= 0:
+        return []
+
+    from app.services.documentary.frame_extraction_service import DocumentaryFrameExtractionService
+
+    service = DocumentaryFrameExtractionService()
+    keyframes_root = os.path.join(utils.temp_dir(), "keyframes")
+    cache_key = service._build_keyframe_cache_key(video_path, frame_interval_seconds)
+    cache_dir = os.path.join(keyframes_root, cache_key)
+    paths = service._collect_keyframe_paths(cache_dir)
+    index: list[tuple[int, str]] = []
+    for path in paths:
+        timestamp = _timestamp_from_keyframe_name(path)
+        index.append((_timestamp_to_ms(timestamp), path))
+    index.sort(key=lambda item: item[0])
+    return index
+
+
+def _nearest_keyframe_path(
+    timestamp_ms: int,
+    keyframe_index: list[tuple[int, str]],
+    *,
+    max_delta_ms: int,
+) -> str:
+    if not keyframe_index:
+        return ""
+    best_path = ""
+    best_delta = max_delta_ms + 1
+    for frame_ms, frame_path in keyframe_index:
+        delta = abs(frame_ms - timestamp_ms)
+        if delta < best_delta:
+            best_delta = delta
+            best_path = frame_path
+    return best_path if best_delta <= max_delta_ms else ""
+
+
+def _keyframe_match_tolerance_ms(artifact: dict[str, Any]) -> int:
+    try:
+        interval_ms = int(float(artifact.get("frame_interval_seconds") or 0) * 1000)
+    except (TypeError, ValueError):
+        interval_ms = 0
+    if interval_ms <= 0:
+        return 1500
+    return max(1500, interval_ms // 2 + 500)
+
+
 def _iter_frame_records_from_artifact(
     artifact: dict[str, Any],
     *,
     require_existing_files: bool = False,
 ) -> list[dict[str, Any]]:
     records: list[dict[str, Any]] = []
-    seen_paths: set[str] = set()
+    seen_keys: set[str] = set()
+    keyframe_index: list[tuple[int, str]] | None = None
+    match_tolerance_ms = _keyframe_match_tolerance_ms(artifact)
 
     batches = artifact.get("batches")
     if isinstance(batches, list):
@@ -98,51 +174,55 @@ def _iter_frame_records_from_artifact(
                 continue
             observations = batch.get("frame_observations") or batch.get("observations") or []
             frame_paths = batch.get("frame_paths") or []
-            if isinstance(frame_paths, list):
+            if isinstance(frame_paths, list) and frame_paths:
                 for index, frame_path in enumerate(frame_paths):
                     if not isinstance(frame_path, str) or not frame_path:
                         continue
                     obs: dict[str, Any] = {}
                     if index < len(observations) and isinstance(observations[index], dict):
                         obs = observations[index]
-                    timestamp = str(obs.get("timestamp") or "").strip()
-                    records.append(
+                    _append_observation_record(
+                        records,
                         {
+                            **obs,
                             "frame_path": frame_path,
-                            "timestamp": timestamp,
-                            "burned_in_subtitle": str(obs.get("burned_in_subtitle") or "").strip(),
-                            "has_burned_in_subtitle": bool(obs.get("has_burned_in_subtitle")),
-                        }
+                            "timestamp": str(obs.get("timestamp") or "").strip(),
+                        },
                     )
+            elif isinstance(observations, list):
+                for obs in observations:
+                    if isinstance(obs, dict):
+                        _append_observation_record(records, obs)
 
     flat_observations = artifact.get("frame_observations")
     if isinstance(flat_observations, list):
         for obs in flat_observations:
-            if not isinstance(obs, dict):
-                continue
-            frame_path = str(obs.get("frame_path") or "").strip()
-            if frame_path:
-                records.append(
-                    {
-                        "frame_path": frame_path,
-                        "timestamp": str(obs.get("timestamp") or "").strip(),
-                        "burned_in_subtitle": str(obs.get("burned_in_subtitle") or "").strip(),
-                        "has_burned_in_subtitle": bool(obs.get("has_burned_in_subtitle")),
-                    }
-                )
+            if isinstance(obs, dict):
+                _append_observation_record(records, obs)
 
     sorted_records: list[dict[str, Any]] = []
     for record in records:
         frame_path = str(record.get("frame_path") or "").strip()
-        if not frame_path or frame_path in seen_paths:
-            continue
-        if require_existing_files and not os.path.isfile(frame_path):
-            continue
-        seen_paths.add(frame_path)
         timestamp = str(record.get("timestamp") or "").strip()
-        if not timestamp:
+        if not timestamp and frame_path:
             timestamp = _timestamp_from_keyframe_name(frame_path)
-        timestamp_ms = _timestamp_to_ms(timestamp)
+        timestamp_ms = _timestamp_to_ms(timestamp) if timestamp else 0
+
+        if not frame_path and timestamp_ms and require_existing_files:
+            if keyframe_index is None:
+                keyframe_index = _build_keyframe_index_from_artifact(artifact)
+            frame_path = _nearest_keyframe_path(
+                timestamp_ms,
+                keyframe_index,
+                max_delta_ms=match_tolerance_ms,
+            )
+
+        dedup_key = frame_path if frame_path else f"ts:{timestamp_ms}"
+        if dedup_key in seen_keys:
+            continue
+        if require_existing_files and (not frame_path or not os.path.isfile(frame_path)):
+            continue
+        seen_keys.add(dedup_key)
         burned_text = str(record.get("burned_in_subtitle") or "").strip()
         has_burned = bool(record.get("has_burned_in_subtitle"))
         if burned_text and not has_burned:
@@ -453,7 +533,10 @@ def calibrate_subtitle_with_hard_subtitle_ocr(
     if subtitle_hit_count == 0 and allow_vision_ocr_fallback:
         frames = _collect_ocr_frames(artifact)
         if not frames:
-            raise ValueError("抽帧分析中未找到可用关键帧路径（frame_path），请先完成抽帧分析")
+            raise ValueError(
+                "抽帧分析中未找到可用关键帧路径（frame_path）。"
+                "请先完成抽帧分析，或确认关键帧缓存仍存在（与 video_path、frame_interval_seconds 一致）。"
+            )
 
         if progress_callback:
             progress_callback(f"正在 OCR {len(frames)} 帧硬字幕区域...")

@@ -49,7 +49,7 @@ def render_fun_asr_transcription(tr, *, show_output_split: bool = True):
 
     st.caption(
         "上传本地音频/视频生成 SRT。大文件会自动提取并压缩音频后再转写。"
-        "若使用 api.4022543.xyz 等 LLM 网关，Whisper/Gemini 转写可能不可用，请优先选 Fun-ASR。"
+        "默认使用 Gemini 兼容 API；若网关不支持语音转写，可改选 Fun-ASR 或开启自动切换。"
     )
 
     from app.services.media_transcription import (
@@ -114,23 +114,25 @@ def render_fun_asr_transcription(tr, *, show_output_split: bool = True):
     if uploaded_media is not None:
         st.info(f"将优先转录上传文件: {uploaded_media.name}")
 
+    provider_options = ["auto", PROVIDER_GEMINI, PROVIDER_FUN_ASR, PROVIDER_WHISPER]
     provider_choice = st.radio(
         "转录方式",
-        options=["auto", PROVIDER_FUN_ASR, PROVIDER_WHISPER, PROVIDER_GEMINI],
+        options=provider_options,
         format_func=lambda x: {
-            "auto": "自动（按顺序尝试已配置的 API）",
+            "auto": "自动（按顺序尝试已配置的 API，默认 Gemini 优先）",
             PROVIDER_FUN_ASR: PROVIDER_LABELS[PROVIDER_FUN_ASR],
             PROVIDER_WHISPER: PROVIDER_LABELS[PROVIDER_WHISPER],
             PROVIDER_GEMINI: PROVIDER_LABELS[PROVIDER_GEMINI],
         }.get(x, x),
         horizontal=True,
+        index=provider_options.index(PROVIDER_GEMINI),
         key="transcription_provider_choice",
     )
 
     st.markdown(
         "API Key 说明：Fun-ASR → "
         "[阿里百炼](https://bailian.console.aliyun.com/?tab=model#/api-key)；"
-        "Whisper / Gemini → OpenAI 兼容网关（如 api.openai.com 或自建代理）"
+        "Whisper / Gemini → OpenAI 兼容网关（默认 Gemini，如 api.openai.com 或自建代理）"
     )
 
     if show_output_split:

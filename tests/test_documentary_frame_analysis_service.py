@@ -541,6 +541,63 @@ class DocumentaryFrameAnalysisCompactTests(unittest.TestCase):
         self.assertEqual(1, len(batches[0]["frame_observations"]))
         self.assertNotIn("frame_path", batches[0]["frame_observations"][0])
 
+    def test_rebuild_batches_merges_top_level_observations_when_batch_has_scene_segments(self):
+        from app.services.documentary.frame_analysis_compact import rebuild_batches_from_artifact
+
+        artifact = {
+            "scene_segments": [
+                {
+                    "batch_index": 0,
+                    "timestamp": "00:00:01,000-00:00:03,000",
+                    "scene": "楼顶",
+                    "subtitle": "硬字幕A",
+                }
+            ],
+            "frame_observations": [
+                {
+                    "batch_index": 0,
+                    "timestamp": "00:00:01,940",
+                    "burned_in_subtitle": "硬字幕B",
+                    "has_burned_in_subtitle": True,
+                },
+                {
+                    "batch_index": 1,
+                    "timestamp": "00:00:20,220",
+                    "burned_in_subtitle": "硬字幕C",
+                    "has_burned_in_subtitle": True,
+                },
+            ],
+            "batches": [
+                {
+                    "batch_index": 0,
+                    "time_range": "00:00:00,000-00:00:18,000",
+                    "status": "success",
+                    "scene_segments": [
+                        {
+                            "timestamp": "00:00:01,000-00:00:03,000",
+                            "scene": "楼顶",
+                            "subtitle": "硬字幕A",
+                        }
+                    ],
+                    "overall_activity_summary": "批次0摘要",
+                },
+                {
+                    "batch_index": 1,
+                    "time_range": "00:00:20,000-00:00:38,000",
+                    "status": "success",
+                    "scene_segments": [],
+                    "overall_activity_summary": "批次1摘要",
+                },
+            ],
+        }
+        batches = rebuild_batches_from_artifact(artifact)
+        self.assertEqual(2, len(batches))
+        self.assertEqual(1, len(batches[0]["frame_observations"]))
+        self.assertEqual("硬字幕B", batches[0]["frame_observations"][0]["burned_in_subtitle"])
+        self.assertEqual(1, len(batches[1]["frame_observations"]))
+        self.assertEqual("硬字幕C", batches[1]["frame_observations"][0]["burned_in_subtitle"])
+        self.assertEqual("批次1摘要", batches[1]["overall_activity_summary"])
+
     def test_save_compact_analysis_artifact(self):
         artifact = self._sample_artifact()
         with TemporaryDirectory() as tmpdir:

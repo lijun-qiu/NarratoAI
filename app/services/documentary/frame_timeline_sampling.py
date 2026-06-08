@@ -92,6 +92,9 @@ def format_scene_segment(
         ("动作", "action"),
         ("情绪", "emotion"),
         ("关键视觉", "key_visual"),
+        ("景别", "shot_scale"),
+        ("光线", "lighting_time"),
+        ("剪辑用途", "edit_role"),
         ("音效/原声", "audio_cue"),
         ("重要度", "importance"),
     ):
@@ -107,14 +110,19 @@ def format_scene_segment(
     return "\n".join(lines) + "\n\n"
 
 
-def collect_scene_segments_from_analysis(data: dict) -> list[dict]:
+def collect_scene_segments_from_analysis(
+    data: dict,
+    *,
+    settings: dict | None = None,
+) -> list[dict]:
     if not isinstance(data, dict):
         return []
 
     top_level = data.get("scene_segments")
     if isinstance(top_level, list) and top_level:
         return normalize_scene_segments(
-            [segment for segment in top_level if isinstance(segment, dict)]
+            [segment for segment in top_level if isinstance(segment, dict)],
+            settings=settings,
         )
 
     segments: list[dict] = []
@@ -151,7 +159,7 @@ def collect_scene_segments_from_analysis(data: dict) -> list[dict]:
                 "observation": str(summary).strip(),
             }
         )
-    return normalize_scene_segments(segments)
+    return normalize_scene_segments(segments, settings=settings)
 
 
 def _segment_time_bounds(segment: dict) -> tuple[int, int]:
@@ -379,6 +387,59 @@ def _merge_characters(first: Any, second: Any) -> list[str] | Any:
 
 DEFAULT_MAX_SEGMENT_DURATION_MS = 30_000
 
+_SCENE_LABEL_FROM_TEXT_RE = re.compile(
+    r"([\u4e00-\u9fff]{2,10}(?:"
+    r"天台|广场|办公室|审讯室|走廊|车内|仓库|灵堂|祠堂|厂区|停车场|"
+    r"案发现场|养殖场|渔村|村庄|室内|室外|古树下|航拍|电梯|楼梯间|"
+    r"卧室|客厅|餐厅|医院|学校|码头|海港|养殖场"
+    r"))"
+)
+
+
+def resolve_frame_max_segment_duration_ms(settings: dict | None = None) -> int:
+    """抽帧 scene_segment 单条最大时长（毫秒），供归一化拆分。"""
+    from app.services.documentary.documentary_settings import get_documentary_settings
+
+    cfg = settings or get_documentary_settings()
+    sec = float(cfg.get("frame_max_segment_duration_sec", 30) or 30)
+    return max(5_000, int(sec * 1000))
+
+
+def infer_scene_label_from_segment(segment: dict) -> str:
+    """从 observation/action/key_visual 推断 scene 标签（模型漏填 scene 时补全）。"""
+    scene = _single_scene_label(str(segment.get("scene") or ""))
+    if scene:
+        return scene
+    for key in ("observation", "key_visual", "action"):
+        text = str(segment.get(key) or "").strip()
+        if not text:
+            continue
+        match = _SCENE_LABEL_FROM_TEXT_RE.search(text)
+        if match:
+            return match.group(1).strip()
+        lead = re.match(r"^([\u4e00-\u9fff]{2,8})[，,]", text)
+        if lead:
+            candidate = lead.group(1).strip()
+            skip_tokens = ("画面", "镜头", "特写", "两名", "一名", "男子", "女子", "警方", "公安")
+            if not any(token in candidate for token in skip_tokens):
+                return candidate
+    return ""
+
+
+def ensure_segment_scene_labels(segments: list[dict]) -> list[dict]:
+    """补全缺失 scene，避免空 scene 触发错误合并/剔除。"""
+    updated: list[dict] = []
+    for segment in segments:
+        if not isinstance(segment, dict):
+            continue
+        payload = dict(segment)
+        if not _single_scene_label(str(payload.get("scene") or "")):
+            inferred = infer_scene_label_from_segment(payload)
+            if inferred:
+                payload["scene"] = inferred
+        updated.append(payload)
+    return updated
+
 
 def _split_field_parts(text: str, *, strip_transitions: bool = False) -> list[str]:
     parts = [part.strip() for part in str(text or "").split("；") if part.strip()]
@@ -418,7 +479,7 @@ def _segments_share_same_scene(first: dict, second: dict) -> bool:
     scene_first = _single_scene_label(str(first.get("scene") or ""))
     scene_second = _single_scene_label(str(second.get("scene") or ""))
     if not scene_first or not scene_second:
-        return True
+        return False
     return scene_first == scene_second
 
 
@@ -483,7 +544,10 @@ def merge_same_scene_within_batch(segments: list[dict]) -> list[dict]:
     for batch_index in sorted(by_batch.keys()):
         by_scene: dict[str, list[dict]] = {}
         for segment in by_batch[batch_index]:
-            label = _single_scene_label(str(segment.get("scene") or "")) or "__empty__"
+            label = _single_scene_label(str(segment.get("scene") or ""))
+            if not label:
+                merged_all.append(dict(segment))
+                continue
             by_scene.setdefault(label, []).append(segment)
         for group in by_scene.values():
             merged_all.append(_merge_segment_group(group))
@@ -521,7 +585,9 @@ def prune_cross_scene_overlaps(
             if _segment_overlap_ratio(bounds_i, bounds_j) < overlap_ratio:
                 continue
             scene_j = _single_scene_label(str(ordered[j].get("scene") or ""))
-            if scene_i and scene_j and scene_i == scene_j:
+            if not scene_i or not scene_j:
+                continue
+            if scene_i == scene_j:
                 continue
             if _segment_dedup_score(ordered[i]) >= _segment_dedup_score(ordered[j]):
                 removed.add(j)
@@ -609,7 +675,10 @@ def _split_bloated_segment(
         payload["timestamp"] = (
             f"{_ms_to_timestamp_label(seg_start)}-{_ms_to_timestamp_label(seg_end)}"
         )
-        payload["scene"] = scene_chain[index] if index < len(scene_chain) else scene_chain[-1]
+        if scene_chain:
+            payload["scene"] = (
+                scene_chain[index] if index < len(scene_chain) else scene_chain[-1]
+            )
 
         for field, parts in (
             ("observation", observation_parts),
@@ -705,12 +774,18 @@ def dedupe_scene_segments(
 def normalize_scene_segments(
     segments: list[dict],
     *,
-    max_duration_ms: int = DEFAULT_MAX_SEGMENT_DURATION_MS,
+    max_duration_ms: int | None = None,
     strict_scene_rules: bool = True,
     cross_scene_overlap_prune_ratio: float = 0.5,
+    settings: dict | None = None,
 ) -> list[dict]:
     """去重后拆分：每个 segment 对应单一连续场景；可选硬性合并/剔除重叠冲突。"""
-    normalized = dedupe_scene_segments(segments)
+    if max_duration_ms is None:
+        max_duration_ms = resolve_frame_max_segment_duration_ms(settings)
+    normalized = ensure_segment_scene_labels(
+        [segment for segment in segments if isinstance(segment, dict)]
+    )
+    normalized = dedupe_scene_segments(normalized)
     if strict_scene_rules:
         normalized = merge_same_scene_within_batch(normalized)
         normalized = prune_cross_scene_overlaps(
@@ -721,13 +796,7 @@ def normalize_scene_segments(
         normalized,
         max_duration_ms=max_duration_ms,
     )
-    if strict_scene_rules:
-        split = merge_same_scene_within_batch(split)
-        split = prune_cross_scene_overlaps(
-            split,
-            overlap_ratio=cross_scene_overlap_prune_ratio,
-        )
-    return split
+    return dedupe_scene_segments(split)
 
 
 def update_segment_environment_context(

@@ -78,6 +78,8 @@ def validate_plot_blueprint(
     source_duration_ms: int | None = None,
     frame_max_ms: int | None = None,
     frame_min_ms: int = 0,
+    srt_max_ms: int | None = None,
+    srt_min_ms: int = 0,
     settings: dict[str, Any] | None = None,
     lexicon: dict | None = None,
     drama_known_names: set[str] | None = None,
@@ -120,6 +122,14 @@ def validate_plot_blueprint(
     elif not hard_cap_ms or hard_cap_ms <= 0:
         hard_cap_ms = None
 
+    dialogue_cap_ms = hard_cap_ms
+    if srt_max_ms and srt_max_ms > 0:
+        dialogue_cap_ms = (
+            min(srt_max_ms, hard_cap_ms)
+            if hard_cap_ms and hard_cap_ms > 0
+            else srt_max_ms
+        )
+
     if hard_cap_ms:
         cap_label = _format_ms_label(hard_cap_ms)
         for start, end in collect_all_clip_ranges(content):
@@ -149,6 +159,38 @@ def validate_plot_blueprint(
             if point_ms > hard_cap_ms + 500:
                 issues.append(
                     f"时间点 {single} 超出原片/抽帧上限 {cap_label}"
+                )
+
+    if dialogue_cap_ms and srt_max_ms and srt_max_ms > 0:
+        srt_cap_label = _format_ms_label(dialogue_cap_ms)
+        for header in (
+            "## 建议保留原声 OST=1",
+            "## OST=1 金句清单",
+            "## 开头高潮方案",
+        ):
+            section = _extract_section(content, header)
+            for start, end in _CLIP_TS_RANGE_RE.findall(section):
+                try:
+                    end_ms = _ts_to_ms(end)
+                except Exception:
+                    continue
+                if end_ms > dialogue_cap_ms + 500:
+                    issues.append(
+                        f"对白时间戳 {start}-{end} 超出 SRT 上限 {srt_cap_label}"
+                    )
+        narrative = _extract_section(content, "## 成片叙事顺序方案")
+        for start, end in _CLIP_TS_RANGE_RE.findall(narrative):
+            block_start = max(0, narrative.find(start))
+            block = narrative[block_start : block_start + 240]
+            if "OST=1" not in block and "OST = 1" not in block:
+                continue
+            try:
+                end_ms = _ts_to_ms(end)
+            except Exception:
+                continue
+            if end_ms > dialogue_cap_ms + 500:
+                issues.append(
+                    f"成片 OST=1 时间戳 {start}-{end} 超出 SRT 上限 {srt_cap_label}"
                 )
 
     cfg = settings or {}

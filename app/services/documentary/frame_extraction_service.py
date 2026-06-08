@@ -12,6 +12,7 @@ from app.services.documentary.frame_analysis_models import FrameBatchResult
 from app.services.documentary.frame_analysis_pairing import (
     analysis_artifact_dir as pairing_analysis_artifact_dir,
     default_analysis_path_for_video as pairing_default_analysis_path_for_video,
+    default_test_analysis_path_for_video as pairing_default_test_analysis_path_for_video,
     is_valid_analysis_artifact as pairing_is_valid_analysis_artifact,
     load_analysis_artifact as pairing_load_analysis_artifact,
     resolve_reusable_analysis_path as pairing_resolve_reusable_analysis_path,
@@ -25,10 +26,28 @@ from app.services.documentary.documentary_settings import (
     warn_frame_analysis_gender_mismatch,
 )
 from app.services.documentary.frame_analysis_compact import slim_scene_segment_for_artifact
-from app.services.documentary.frame_timeline_sampling import normalize_scene_segments
+from app.services.documentary.frame_extraction_rules import (
+    build_frame_extraction_prompt_body,
+    enrich_scene_segment_from_editor_fields,
+)
+from app.services.documentary.frame_timeline_sampling import (
+    infer_scene_label_from_segment,
+    normalize_scene_segments,
+    resolve_frame_max_segment_duration_ms,
+)
 from app.services.documentary.documentary_subtitle_enrichment import (
     attach_subtitles_to_frame_analysis_artifact,
     subtitle_excerpt_for_time_range,
+)
+from app.services.documentary.frame_character_naming import (
+    apply_subtitle_gated_names_to_artifact,
+    build_frame_naming_priority_rules,
+)
+from app.services.drama_character_registry import (
+    build_batch_vision_reference_prompt_section,
+    merge_frame_analysis_settings_for_drama,
+    project_root,
+    resolve_media_path,
 )
 from app.services.short_drama_drama_knowledge import (
     apply_name_corrections_to_frame_analysis_artifact,
@@ -43,57 +62,10 @@ from app.utils import utils, video_processor
 
 
 class DocumentaryFrameExtractionService:
-    PROMPT_TEMPLATE = """
-我提供了 {frame_count} 张视频帧，它们按时间顺序排列，代表一个连续的视频片段。
-请综合这些帧，识别本批次**实际可见**的场景（同一地点、同一组人物、连续动作须合并为一条），输出结构化 JSON。
-
-**仅可见画面（硬性）**：
-- 只描述这 {frame_count} 张图片里看得见的内容；禁止编造画面未出现的地点、闪回、航拍、追车、牺牲等
-- 若整批画面为同一场景对话，只输出 **1 条** scene_segment
-- 禁止凭剧情印象或外部知识填充「名场面」
-
-**timestamp 规则（硬性）**：
-- 格式必须为 `HH:MM:SS,mmm-HH:MM:SS,mmm`（起止时间，逗号分隔毫秒）
-- 必须与本批次提供的字幕对白时间尽量对齐，用于后期剪辑定位
-- 每条 segment 的 timestamp 应覆盖该场景在批次内的实际时间，不要编造批次外的时间
-- 同一批次内各 segment 的 timestamp **不得重叠**
-
-**scene_segments 每条必填字段（仅输出以下 6 项，不要额外键）**：
-- timestamp: 时间范围字符串
-- scene: 场景名称（如「办公室」「楼顶天台」）
-- observation: 本场景一句话画面观察（人物+动作+氛围，30–80 字；勿复述对白）
-- action: 人物在做什么（须含可见性别；无字幕依据时用「未名人员(男/女)」）
-- emotion: 画面情绪（紧张、愤怒、悲伤、绝望等）
-- key_visual: 光线/色调/构图等特殊视觉（如「阴天冷色调，云层低垂，城市远景」）
-
-人物姓名与性别请写入 action / observation，不要单独输出 characters 数组。
-
-JSON 必须包含以下键：
-- scene_segments: 数组，至少 1 条，结构见上
-- frame_observations: 数组，长度必须为 {frame_count}（每帧一条，用于逐帧 OCR 对照）
-- overall_activity_summary: 字符串，描述整个批次主要活动
-
-示例结构：
-{{
-  "scene_segments": [
-    {{
-      "timestamp": "00:00:01,940-00:00:09,940",
-      "scene": "室外天台",
-      "observation": "阴天，两名男子并肩站立交谈，气氛严肃",
-      "action": "未名人员(男)与未名人员(男)在天台边缘对话",
-      "emotion": "严肃、压抑",
-      "key_visual": "阴天冷色调，城市建筑远景，云层低垂"
-    }}
-  ],
-  "frame_observations": [
-    {{"timestamp": "00:00:00,000", "observation": "室外天台，两名男子并肩，阴天冷色调"{burned_in_subtitle_example}}}
-  ],
-  "overall_activity_summary": "本批次主要活动总结"
-}}
-
-请务必不要遗漏视频帧：frame_observations 必须包含 {frame_count} 个元素。
-请只返回 JSON 字符串，不要附加解释文字。
-""".strip()
+    PROMPT_TEMPLATE = (
+        "我提供了 {frame_count} 张视频帧，按时间顺序排列，代表一个连续的视频片段。\n"
+        "{editor_prompt_body}"
+    ).strip()
 
     BURNED_IN_SUBTITLE_PROMPT_SUFFIX = """
 同时，请识别每帧画面**底部烧录硬字幕**（烧录在画面上的对白文字，非画面描述）：
@@ -122,9 +94,28 @@ JSON 必须包含以下键：
         max_concurrency: int | None = None,
         documentary_settings: dict | None = None,
         subtitle_content: str = "",
+        drama_id: str = "",
+        character_references: list[dict[str, str]] | None = None,
+        relationship_diagram_path: str = "",
+        frame_drama_knowledge_text_enabled: bool = False,
+        frame_relationship_diagram_enabled: bool = False,
+        max_duration_seconds: float | None = None,
+        test_mode: bool = False,
     ) -> dict[str, Any]:
         progress = progress_callback or (lambda _p, _m: None)
-        doc_settings = documentary_settings or get_documentary_settings()
+        resolved_max_duration = self._resolve_max_duration_seconds(max_duration_seconds, test_mode=test_mode)
+        resolved_relationship = (
+            resolve_media_path(relationship_diagram_path)
+            if frame_relationship_diagram_enabled
+            else ""
+        )
+        doc_settings = merge_frame_analysis_settings_for_drama(
+            documentary_settings or get_documentary_settings(),
+            drama_id,
+            enable_knowledge_text=frame_drama_knowledge_text_enabled,
+        )
+        character_references = character_references if character_references is not None else []
+        relationship_diagram_path = resolved_relationship
 
         if not video_path or not os.path.exists(video_path):
             raise FileNotFoundError(f"视频文件不存在: {video_path}")
@@ -150,8 +141,15 @@ JSON 必须包含以下键：
         logger.info(f"视觉模型 {model_name} → {describe_llm_route(model_name, role='vision')}")
 
         progress(10, "正在提取关键帧...")
-        keyframe_files = self._load_or_extract_keyframes(video_path, frame_interval_seconds)
-        progress(25, f"关键帧准备完成，共 {len(keyframe_files)} 帧")
+        keyframe_files = self._load_or_extract_keyframes(
+            video_path,
+            frame_interval_seconds,
+            max_duration_seconds=resolved_max_duration,
+        )
+        if resolved_max_duration:
+            progress(25, f"关键帧准备完成，共 {len(keyframe_files)} 帧（测试：前 {resolved_max_duration:g} 秒）")
+        else:
+            progress(25, f"关键帧准备完成，共 {len(keyframe_files)} 帧")
 
         progress(30, "正在初始化视觉分析器...")
         model_chain = resolve_vision_model_chain(
@@ -181,6 +179,8 @@ JSON 必须包含以下键：
             progress_callback=progress,
             documentary_settings=doc_settings,
             subtitle_content=subtitle_content,
+            character_references=character_references,
+            relationship_diagram_path=relationship_diagram_path,
         )
 
         progress(65, "正在整理分析结果...")
@@ -197,8 +197,25 @@ JSON 必须包含以下键：
             max_concurrency=concurrency,
             subtitle_content=subtitle_content,
             documentary_settings=doc_settings,
+            drama_id=drama_id,
+            character_references=character_references,
+            relationship_diagram_path=relationship_diagram_path,
+            frame_drama_knowledge_text_enabled=frame_drama_knowledge_text_enabled,
+            frame_relationship_diagram_enabled=frame_relationship_diagram_enabled,
+            test_mode=test_mode,
+            test_max_duration_seconds=resolved_max_duration,
         )
-        analysis_json_path = self._save_analysis_artifact(artifact, video_path=video_path)
+        output_path = None
+        if test_mode and resolved_max_duration:
+            output_path = self.default_test_analysis_path_for_video(
+                video_path,
+                max_duration_seconds=resolved_max_duration,
+            )
+        analysis_json_path = self._save_analysis_artifact(
+            artifact,
+            video_path=video_path,
+            output_path=output_path,
+        )
         video_clip_json = self._build_video_clip_json(sorted_batches, doc_settings)
 
         progress(75, "逐帧分析完成")
@@ -224,6 +241,11 @@ JSON 必须包含以下键：
         max_concurrency: int | None = None,
         documentary_settings: dict | None = None,
         subtitle_content: str = "",
+        drama_id: str = "",
+        character_references: list[dict[str, str]] | None = None,
+        relationship_diagram_path: str = "",
+        frame_drama_knowledge_text_enabled: bool = False,
+        frame_relationship_diagram_enabled: bool = False,
     ) -> dict[str, Any]:
         """仅重跑 artifact 中 status=failed 的批次，并写回原 JSON。"""
         progress = progress_callback or (lambda _p, _m: None)
@@ -231,6 +253,29 @@ JSON 必须包含以下键：
             raise FileNotFoundError(f"抽帧分析文件不存在: {analysis_json_path}")
 
         artifact = pairing_load_analysis_artifact(analysis_json_path)
+        resolved_drama_id = (drama_id or str(artifact.get("drama_id") or "")).strip()
+        enable_knowledge_text = frame_drama_knowledge_text_enabled
+        rel_enabled = frame_relationship_diagram_enabled
+        resolved_relationship = ""
+        if rel_enabled:
+            resolved_relationship = (
+                resolve_media_path(relationship_diagram_path)
+                or resolve_media_path(str(artifact.get("relationship_diagram_path") or ""))
+            )
+        doc_settings = merge_frame_analysis_settings_for_drama(
+            documentary_settings or get_documentary_settings(),
+            resolved_drama_id,
+            enable_knowledge_text=enable_knowledge_text,
+        )
+        if character_references is None:
+            stored_refs = artifact.get("character_references")
+            character_references = (
+                [item for item in stored_refs if isinstance(item, dict)]
+                if isinstance(stored_refs, list)
+                else []
+            )
+        else:
+            character_references = list(character_references)
         batch_dicts = [b for b in (artifact.get("batches") or []) if isinstance(b, dict)]
         if not batch_dicts:
             raise ValueError("抽帧分析缺少 batches，无法重跑失败批次")
@@ -307,7 +352,6 @@ JSON 必须包含以下键：
                 "或确保 artifact 中 frame_paths 指向的缓存目录仍存在。"
             )
 
-        doc_settings = documentary_settings or get_documentary_settings()
         progress(20, f"正在重跑 {len(retry_items)} 个批次...")
         retry_results = await self._analyze_batch_items(
             rotation=rotation,
@@ -318,6 +362,8 @@ JSON 必须包含以下键：
             progress_callback=progress,
             documentary_settings=doc_settings,
             subtitle_content=subtitle_content,
+            character_references=character_references,
+            relationship_diagram_path=resolved_relationship,
         )
 
         merged_by_index: dict[int, FrameBatchResult] = {
@@ -334,7 +380,6 @@ JSON 必须包含以下键：
                 still_failed += 1
 
         merged_results = [merged_by_index[index] for index in sorted(merged_by_index.keys())]
-        doc_settings = documentary_settings or get_documentary_settings()
         progress(85, "正在合并并重写分析 JSON...")
         new_artifact = self._build_analysis_artifact(
             merged_results,
@@ -348,6 +393,11 @@ JSON 必须包含以下键：
             max_concurrency=concurrency,
             subtitle_content=subtitle_content,
             documentary_settings=doc_settings,
+            drama_id=resolved_drama_id,
+            character_references=character_references,
+            relationship_diagram_path=resolved_relationship,
+            frame_drama_knowledge_text_enabled=enable_knowledge_text,
+            frame_relationship_diagram_enabled=rel_enabled,
         )
         new_artifact["generated_at"] = datetime.now().isoformat()
         new_artifact["last_retry_at"] = new_artifact["generated_at"]
@@ -423,10 +473,16 @@ JSON 必须包含以下键：
         from app.services.documentary.documentary_subtitle_enrichment import (
             attach_burned_in_subtitles_to_artifact,
         )
-        from app.services.documentary.frame_analysis_compact import compress_analysis_artifact
+        from app.services.documentary.frame_analysis_compact import (
+            compress_analysis_artifact,
+            normalize_analysis_artifact_storage,
+        )
 
         attach_burned_in_subtitles_to_artifact(artifact, settings=cfg)
-        return compress_analysis_artifact(artifact, settings=cfg)
+        normalize_analysis_artifact_storage(artifact, settings=cfg)
+        if cfg.get("compress_frame_analysis_on_save", False):
+            compress_analysis_artifact(artifact, settings=cfg, strip_debug=True)
+        return artifact
 
     @staticmethod
     def refresh_subtitles_in_analysis_file(
@@ -575,8 +631,12 @@ JSON 必须包含以下键：
         progress_callback: Callable[[float, str], None],
         documentary_settings: dict | None = None,
         subtitle_content: str = "",
+        character_references: list[dict[str, str]] | None = None,
+        relationship_diagram_path: str = "",
     ) -> list[FrameBatchResult]:
         doc_settings = documentary_settings or get_documentary_settings()
+        resolved_refs = self._resolve_character_references(character_references)
+        resolved_relationship = resolve_media_path(relationship_diagram_path)
         semaphore = asyncio.Semaphore(max(1, max_concurrency))
         total = len(items)
         done = 0
@@ -584,6 +644,13 @@ JSON 必须包含以下键：
 
         async def run_single(batch_index: int, frame_paths: list[str], time_range: str) -> FrameBatchResult:
             nonlocal done
+            vision_images, active_refs, carryover, ref_image_count = self._compose_batch_vision_inputs(
+                frame_paths,
+                batch_index=batch_index,
+                relationship_diagram_path=resolved_relationship,
+                character_references=resolved_refs,
+                documentary_settings=doc_settings,
+            )
             prompt = self._build_batch_prompt(
                 frame_count=len(frame_paths),
                 video_theme=video_theme,
@@ -591,13 +658,18 @@ JSON 必须包含以下键：
                 documentary_settings=doc_settings,
                 time_range=time_range,
                 subtitle_content=subtitle_content,
+                character_references=active_refs,
+                relationship_diagram_path=resolved_relationship,
+                drama_label=str(doc_settings.get("default_video_theme") or video_theme or ""),
+                reference_carryover_prompt=carryover,
+                reference_image_count=ref_image_count,
             )
             try:
                 async with semaphore:
                     raw_results, model_used, error_message = await rotation.analyze_images(
-                        images=frame_paths,
+                        images=vision_images,
                         prompt=prompt,
-                        batch_size=max(1, len(frame_paths)),
+                        batch_size=max(1, len(vision_images)),
                         max_concurrency=1,
                     )
                 if rotation.pending_switch_message:
@@ -685,15 +757,40 @@ JSON 必须包含以下键：
             parsed = 1
         return max(1, parsed)
 
-    def _load_or_extract_keyframes(self, video_path: str, frame_interval_seconds: float) -> list[str]:
+    @staticmethod
+    def _resolve_max_duration_seconds(
+        max_duration_seconds: float | int | None,
+        *,
+        test_mode: bool = False,
+    ) -> float | None:
+        if not test_mode:
+            return None
+        try:
+            parsed = float(max_duration_seconds if max_duration_seconds is not None else 5.0)
+        except (TypeError, ValueError):
+            parsed = 5.0
+        return max(1.0, parsed)
+
+    def _load_or_extract_keyframes(
+        self,
+        video_path: str,
+        frame_interval_seconds: float,
+        *,
+        max_duration_seconds: float | None = None,
+    ) -> list[str]:
         keyframes_root = os.path.join(utils.temp_dir(), "keyframes")
         os.makedirs(keyframes_root, exist_ok=True)
-        cache_key = self._build_keyframe_cache_key(video_path, frame_interval_seconds)
+        cache_key = self._build_keyframe_cache_key(
+            video_path,
+            frame_interval_seconds,
+            max_duration_seconds=max_duration_seconds,
+        )
         cache_dir = os.path.join(keyframes_root, cache_key)
         os.makedirs(cache_dir, exist_ok=True)
 
         cached_files = self._collect_keyframe_paths(cache_dir)
         if cached_files:
+            cached_files = self._filter_keyframes_by_max_duration(cached_files, max_duration_seconds)
             logger.info(f"使用已缓存关键帧: {cache_dir}, 共 {len(cached_files)} 帧")
             return cached_files
 
@@ -701,17 +798,25 @@ JSON 必须包含以下键：
         extracted = processor.extract_frames_by_interval_with_fallback(
             output_dir=cache_dir,
             interval_seconds=frame_interval_seconds,
+            max_duration_seconds=max_duration_seconds,
         )
         keyframe_files = sorted(str(path) for path in extracted if str(path).endswith(".jpg"))
         if not keyframe_files:
             keyframe_files = self._collect_keyframe_paths(cache_dir)
+        keyframe_files = self._filter_keyframes_by_max_duration(keyframe_files, max_duration_seconds)
         if not keyframe_files:
             raise RuntimeError("未提取到任何关键帧")
 
         logger.info(f"关键帧提取完成: {cache_dir}, 共 {len(keyframe_files)} 帧")
         return keyframe_files
 
-    def _build_keyframe_cache_key(self, video_path: str, frame_interval_seconds: float) -> str:
+    def _build_keyframe_cache_key(
+        self,
+        video_path: str,
+        frame_interval_seconds: float,
+        *,
+        max_duration_seconds: float | None = None,
+    ) -> str:
         try:
             video_mtime = os.path.getmtime(video_path)
         except OSError:
@@ -723,10 +828,38 @@ JSON 必须包含以下键：
                 str(video_path),
                 str(video_mtime),
                 str(frame_interval_seconds),
+                str(max_duration_seconds or ""),
                 "documentary-keyframes-v2",
             ]
         )
         return f"{legacy_prefix}_{utils.md5(payload)}"
+
+    @staticmethod
+    def _keyframe_timestamp_seconds(path: str) -> float | None:
+        match = re.search(r"keyframe_\d{6}_(\d{9})\.jpg$", os.path.basename(path))
+        if not match:
+            return None
+        token = match.group(1)
+        hours = int(token[0:2])
+        minutes = int(token[2:4])
+        seconds = int(token[4:6])
+        milliseconds = int(token[6:9])
+        return hours * 3600 + minutes * 60 + seconds + milliseconds / 1000.0
+
+    @classmethod
+    def _filter_keyframes_by_max_duration(
+        cls,
+        keyframe_files: list[str],
+        max_duration_seconds: float | None,
+    ) -> list[str]:
+        if not max_duration_seconds or max_duration_seconds <= 0:
+            return list(keyframe_files)
+        filtered: list[str] = []
+        for path in keyframe_files:
+            timestamp = cls._keyframe_timestamp_seconds(path)
+            if timestamp is None or timestamp < max_duration_seconds:
+                filtered.append(path)
+        return filtered
 
     @staticmethod
     def _collect_keyframe_paths(cache_dir: str) -> list[str]:
@@ -742,6 +875,45 @@ JSON 必须包含以下键：
     def _chunk_keyframes(keyframe_files: list[str], batch_size: int) -> list[list[str]]:
         return [keyframe_files[index : index + batch_size] for index in range(0, len(keyframe_files), batch_size)]
 
+    @staticmethod
+    def _resolve_character_references(
+        character_references: list[dict[str, str]] | None,
+    ) -> list[dict[str, str]]:
+        resolved: list[dict[str, str]] = []
+        root = project_root()
+        for item in character_references or []:
+            if not isinstance(item, dict):
+                continue
+            name = str(item.get("name") or "").strip()
+            path = str(item.get("path") or "").strip()
+            if path and not os.path.isabs(path):
+                path = os.path.join(root, path.replace("/", os.sep))
+            if name and path and os.path.isfile(path):
+                resolved.append({"name": name, "path": path})
+        return resolved
+
+    @staticmethod
+    def _compose_batch_vision_inputs(
+        frame_paths: list[str],
+        *,
+        batch_index: int = 0,
+        relationship_diagram_path: str = "",
+        character_references: list[dict[str, str]] | None = None,
+        documentary_settings: dict | None = None,
+    ) -> tuple[list[str], list[dict[str, str]], str, int]:
+        from app.services.documentary.frame_reference_images import prepare_reference_prefix_images
+
+        refs = DocumentaryFrameExtractionService._resolve_character_references(character_references)
+        prefix_paths, carryover = prepare_reference_prefix_images(
+            batch_index=batch_index,
+            relationship_diagram_path=relationship_diagram_path,
+            character_references=refs,
+            settings=documentary_settings,
+        )
+        if not prefix_paths:
+            return list(frame_paths), refs, carryover, 0
+        return prefix_paths + list(frame_paths), refs, carryover, len(prefix_paths)
+
     async def _analyze_batches(
         self,
         *,
@@ -753,8 +925,12 @@ JSON 必须包含以下键：
         progress_callback: Callable[[float, str], None],
         documentary_settings: dict | None = None,
         subtitle_content: str = "",
+        character_references: list[dict[str, str]] | None = None,
+        relationship_diagram_path: str = "",
     ) -> list[FrameBatchResult]:
         doc_settings = documentary_settings or get_documentary_settings()
+        resolved_refs = self._resolve_character_references(character_references)
+        resolved_relationship = resolve_media_path(relationship_diagram_path)
         semaphore = asyncio.Semaphore(max(1, max_concurrency))
         total = len(batches)
         done = 0
@@ -769,6 +945,13 @@ JSON 必须包含以下键：
 
         async def run_single(batch_index: int, frame_paths: list[str], time_range: str) -> FrameBatchResult:
             nonlocal done
+            vision_images, active_refs, carryover, ref_image_count = self._compose_batch_vision_inputs(
+                frame_paths,
+                batch_index=batch_index,
+                relationship_diagram_path=resolved_relationship,
+                character_references=resolved_refs,
+                documentary_settings=doc_settings,
+            )
             prompt = self._build_batch_prompt(
                 frame_count=len(frame_paths),
                 video_theme=video_theme,
@@ -776,13 +959,18 @@ JSON 必须包含以下键：
                 documentary_settings=doc_settings,
                 time_range=time_range,
                 subtitle_content=subtitle_content,
+                character_references=active_refs,
+                relationship_diagram_path=resolved_relationship,
+                drama_label=str(doc_settings.get("default_video_theme") or video_theme or ""),
+                reference_carryover_prompt=carryover,
+                reference_image_count=ref_image_count,
             )
             try:
                 async with semaphore:
                     raw_results, model_used, error_message = await rotation.analyze_images(
-                        images=frame_paths,
+                        images=vision_images,
                         prompt=prompt,
-                        batch_size=max(1, len(frame_paths)),
+                        batch_size=max(1, len(vision_images)),
                         max_concurrency=1,
                     )
                 if rotation.pending_switch_message:
@@ -849,13 +1037,45 @@ JSON 必须包含以下键：
         documentary_settings: dict | None = None,
         time_range: str = "",
         subtitle_content: str = "",
+        character_references: list[dict[str, str]] | None = None,
+        relationship_diagram_path: str = "",
+        drama_label: str = "",
+        reference_carryover_prompt: str = "",
+        reference_image_count: int = 0,
     ) -> str:
         cfg = documentary_settings or get_documentary_settings()
         prompt = self._build_analysis_prompt(
             frame_count=frame_count,
             include_burned_in_subtitle=bool(cfg.get("enable_hard_subtitle_ocr", True)),
+            documentary_settings=cfg,
         )
         extra_lines: list[str] = []
+        use_collage = bool(cfg.get("frame_reference_use_collage", True)) and len(character_references or []) >= 2
+        ref_section = ""
+        if reference_carryover_prompt.strip():
+            extra_lines.append(reference_carryover_prompt.strip())
+        else:
+            ref_section = build_batch_vision_reference_prompt_section(
+                relationship_diagram_path=relationship_diagram_path,
+                character_references=character_references or [],
+                video_frame_count=frame_count,
+                drama_label=drama_label or (video_theme or cfg.get("default_video_theme") or "").strip(),
+                character_collage=use_collage,
+                reference_image_count=reference_image_count or None,
+            )
+            if ref_section.strip():
+                extra_lines.append(ref_section.strip())
+                extra_lines.append(
+                    "定妆照仅在本批可见面孔匹配时可写规范姓名；关系图仅作谐音/关系校正，不可猜人。"
+                )
+        has_drama = bool(cfg.get("enable_frame_analysis_drama_knowledge"))
+        has_refs = bool(character_references) or bool(resolve_media_path(relationship_diagram_path))
+        priority_rules = build_frame_naming_priority_rules(
+            has_drama_knowledge=has_drama,
+            has_character_references=has_refs,
+            is_carryover_batch=bool(reference_carryover_prompt.strip()),
+        )
+        extra_lines.append(priority_rules)
         visible_hint = build_frame_visible_content_hint(cfg, frame_count=frame_count)
         if visible_hint:
             extra_lines.append(visible_hint)
@@ -958,6 +1178,13 @@ JSON 必须包含以下键：
         documentary_settings: dict | None = None,
         vision_fallback_model_names: str = "",
         vision_models_used: list[str] | None = None,
+        drama_id: str = "",
+        character_references: list[dict[str, str]] | None = None,
+        relationship_diagram_path: str = "",
+        frame_drama_knowledge_text_enabled: bool = False,
+        frame_relationship_diagram_enabled: bool = False,
+        test_mode: bool = False,
+        test_max_duration_seconds: float | None = None,
     ) -> dict[str, Any]:
         sorted_batches = self._sort_batch_results(batch_results)
 
@@ -1021,18 +1248,48 @@ JSON 必须包含以下键：
             "frame_observations": frame_observations,
             "overall_activity_summaries": overall_activity_summaries,
         }
+        if drama_id:
+            artifact["drama_id"] = drama_id
+        artifact["frame_drama_knowledge_text_enabled"] = bool(frame_drama_knowledge_text_enabled)
+        artifact["frame_relationship_diagram_enabled"] = bool(frame_relationship_diagram_enabled)
+        cfg = documentary_settings or get_documentary_settings()
+        artifact["frame_reference_token_saver"] = bool(cfg.get("frame_reference_token_saver", True))
+        if test_mode:
+            artifact["test_mode"] = True
+            if test_max_duration_seconds:
+                artifact["test_max_duration_seconds"] = float(test_max_duration_seconds)
+        resolved_relationship = resolve_media_path(relationship_diagram_path)
+        if resolved_relationship:
+            artifact["relationship_diagram_path"] = os.path.relpath(
+                resolved_relationship,
+                start=project_root(),
+            ).replace("\\", "/")
+        resolved_refs = self._resolve_character_references(character_references)
+        if resolved_refs:
+            artifact["character_references"] = [
+                {
+                    "name": item["name"],
+                    "path": os.path.relpath(item["path"], start=project_root()).replace("\\", "/")
+                    if os.path.isabs(item["path"])
+                    else item["path"],
+                }
+                for item in resolved_refs
+            ]
         self._finalize_scene_segments_in_artifact(artifact)
         attach_subtitles_to_frame_analysis_artifact(
             artifact,
             subtitle_content or "",
             settings=documentary_settings or get_documentary_settings(),
         )
-        from app.services.documentary.frame_analysis_compact import compress_analysis_artifact
-
-        compress_analysis_artifact(
-            artifact,
-            settings=documentary_settings or get_documentary_settings(),
+        cfg = documentary_settings or get_documentary_settings()
+        from app.services.documentary.frame_analysis_compact import (
+            compress_analysis_artifact,
+            normalize_analysis_artifact_storage,
         )
+
+        normalize_analysis_artifact_storage(artifact, settings=cfg)
+        if cfg.get("compress_frame_analysis_on_save", False):
+            compress_analysis_artifact(artifact, settings=cfg, strip_debug=True)
         return artifact
 
     @staticmethod
@@ -1048,7 +1305,9 @@ JSON 必须包含以下键：
         segments = artifact.get("scene_segments") or []
         if isinstance(segments, list) and segments:
             slimmed = [
-                slim_scene_segment_for_artifact(segment)
+                slim_scene_segment_for_artifact(
+                    enrich_scene_segment_from_editor_fields(segment)
+                )
                 for segment in segments
                 if isinstance(segment, dict)
             ]
@@ -1056,6 +1315,8 @@ JSON 必须包含以下键：
                 slimmed,
                 strict_scene_rules=strict_scene_rules,
                 cross_scene_overlap_prune_ratio=cross_scene_overlap_prune_ratio,
+                max_duration_ms=resolve_frame_max_segment_duration_ms(cfg),
+                settings=cfg,
             )
             artifact["scene_segments"] = normalized
 
@@ -1070,6 +1331,7 @@ JSON 必须包含以下键：
                 batch_index = int(batch.get("batch_index", 0))
                 batch["scene_segments"] = segments_by_batch.get(batch_index, [])
         apply_name_corrections_to_frame_analysis_artifact(artifact)
+        apply_subtitle_gated_names_to_artifact(artifact)
 
     @staticmethod
     def analysis_artifact_dir() -> str:
@@ -1078,6 +1340,18 @@ JSON 必须包含以下键：
     @classmethod
     def default_analysis_path_for_video(cls, video_path: str) -> str:
         return pairing_default_analysis_path_for_video(video_path)
+
+    @classmethod
+    def default_test_analysis_path_for_video(
+        cls,
+        video_path: str,
+        *,
+        max_duration_seconds: float = 5.0,
+    ) -> str:
+        return pairing_default_test_analysis_path_for_video(
+            video_path,
+            max_duration_seconds=max_duration_seconds,
+        )
 
     @classmethod
     def _is_valid_analysis_artifact(cls, payload: Any) -> bool:
@@ -1197,7 +1471,7 @@ JSON 必须包含以下键：
             names = [str(name).strip() for name in characters if str(name).strip()]
             if names:
                 parts.append("、".join(names))
-        for key in ("action", "key_visual", "emotion"):
+        for key in ("action", "key_visual", "emotion", "shot_scale", "lighting_time"):
             text = str(display.get(key) or segment.get(key) or "").strip()
             if text:
                 parts.append(text)
@@ -1297,13 +1571,25 @@ JSON 必须包含以下键：
         milliseconds = int(token[6:9])
         return f"{hours:02d}:{minutes:02d}:{seconds:02d},{milliseconds:03d}"
 
-    def _build_analysis_prompt(self, frame_count: int, *, include_burned_in_subtitle: bool = False) -> str:
+    def _build_analysis_prompt(
+        self,
+        frame_count: int,
+        *,
+        include_burned_in_subtitle: bool = False,
+        documentary_settings: dict | None = None,
+    ) -> str:
+        cfg = documentary_settings or get_documentary_settings()
         example_suffix = (
             self.BURNED_IN_SUBTITLE_JSON_EXAMPLE if include_burned_in_subtitle else ""
         )
-        prompt = self.PROMPT_TEMPLATE.format(
+        editor_body = build_frame_extraction_prompt_body(
             frame_count=frame_count,
             burned_in_subtitle_example=example_suffix,
+            settings=cfg,
+        )
+        prompt = self.PROMPT_TEMPLATE.format(
+            frame_count=frame_count,
+            editor_prompt_body=editor_body,
         )
         if include_burned_in_subtitle:
             prompt = f"{prompt}\n\n{self.BURNED_IN_SUBTITLE_PROMPT_SUFFIX}"
@@ -1382,9 +1668,21 @@ JSON 必须包含以下键：
             "action": str(entry.get("action") or "").strip(),
             "emotion": str(entry.get("emotion") or "").strip(),
             "key_visual": str(entry.get("key_visual") or "").strip(),
+            "shot_scale": str(entry.get("shot_scale") or "").strip(),
+            "lighting_time": str(entry.get("lighting_time") or "").strip(),
+            "edit_role": str(entry.get("edit_role") or "").strip(),
             "audio_cue": str(entry.get("audio_cue") or "").strip(),
             "importance": str(entry.get("importance") or "").strip(),
         }
+
+    @classmethod
+    def _ensure_scene_label(cls, entry: dict[str, Any]) -> dict[str, Any]:
+        payload = dict(entry)
+        if not str(payload.get("scene") or "").strip():
+            inferred = infer_scene_label_from_segment(payload)
+            if inferred:
+                payload["scene"] = inferred
+        return payload
 
     def _parse_scene_segments(self, payload: dict[str, Any]) -> list[dict[str, Any]]:
         raw_segments = payload.get("scene_segments")
@@ -1393,7 +1691,7 @@ JSON 必须包含以下键：
         segments: list[dict[str, Any]] = []
         for item in raw_segments:
             if isinstance(item, dict):
-                normalized = self._normalize_scene_segment(item)
+                normalized = self._ensure_scene_label(self._normalize_scene_segment(item))
                 if any(normalized.values()):
                     segments.append(normalized)
         return segments
@@ -1417,16 +1715,25 @@ JSON 必须包含以下键：
         if len(observations) > 3:
             action_text = f"{action_text}…"
 
+        observation = observations[0] if observations else action_text
+        inferred_scene = infer_scene_label_from_segment(
+            {
+                "observation": observation,
+                "action": action_text,
+                "key_visual": observation,
+            }
+        )
+
         return [
             self._normalize_scene_segment(
                 {
                     "timestamp": time_range,
-                    "scene": "",
-                    "observation": observations[0] if observations else action_text,
+                    "scene": inferred_scene,
+                    "observation": observation,
                     "characters": [],
                     "action": action_text,
                     "emotion": "",
-                    "key_visual": observations[0] if observations else "",
+                    "key_visual": observation,
                     "audio_cue": "",
                     "importance": "中",
                 }

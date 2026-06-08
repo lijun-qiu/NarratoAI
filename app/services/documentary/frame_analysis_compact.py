@@ -16,9 +16,16 @@ from app.services.documentary.documentary_subtitle_enrichment import (
     resolve_segment_subtitle_text,
     resolve_segment_time_range,
 )
+from app.services.documentary.documentary_settings import get_documentary_settings
+from app.services.documentary.frame_extraction_rules import (
+    SCENE_SEGMENT_CORE_FIELDS,
+    SCENE_SEGMENT_EDITOR_FIELDS,
+    SCENE_SEGMENT_FIELD_COMMENTS,
+)
 from app.services.documentary.frame_timeline_sampling import (
     dedupe_scene_environment_across_segments,
     normalize_scene_segments,
+    resolve_frame_max_segment_duration_ms,
 )
 from app.services.documentary.frame_analysis_pairing import (
     analysis_artifact_dir,
@@ -29,25 +36,6 @@ from app.services.documentary.frame_analysis_pairing import (
 
 COMPACT_ARTIFACT_VERSION = "documentary-frame-analysis-v3-compact"
 MINIMAL_SCENE_ARTIFACT_VERSION = "documentary-frame-analysis-v3-minimal-scene"
-
-SCENE_SEGMENT_CORE_FIELDS = (
-    "timestamp",
-    "scene",
-    "observation",
-    "action",
-    "emotion",
-    "key_visual",
-)
-
-MINIMAL_SCENE_SEGMENT_FIELDS = (
-    "timestamp",
-    "scene",
-    "observation",
-    "action",
-    "emotion",
-    "key_visual",
-    "subtitle",
-)
 
 _SCENE_SEGMENT_SUBTITLE_FIELDS = (
     "subtitle",
@@ -60,10 +48,15 @@ _SCENE_SEGMENT_SUBTITLE_FIELDS = (
 
 _SCENE_SEGMENT_FIELDS = (
     *SCENE_SEGMENT_CORE_FIELDS,
+    *SCENE_SEGMENT_EDITOR_FIELDS,
     "characters",
-    "audio_cue",
-    "importance",
     *_SCENE_SEGMENT_SUBTITLE_FIELDS,
+)
+
+MINIMAL_SCENE_SEGMENT_FIELDS = (
+    *SCENE_SEGMENT_CORE_FIELDS,
+    *SCENE_SEGMENT_EDITOR_FIELDS,
+    "subtitle",
 )
 
 _OBSERVATION_FIELDS = (
@@ -87,20 +80,17 @@ _METADATA_FIELDS = (
     "generated_at",
 )
 
-_SCENE_SEGMENT_FIELD_COMMENTS: dict[str, str] = {
-    "timestamp": "场景时间范围，格式 HH:MM:SS,mmm-HH:MM:SS,mmm，用于剪辑定位",
-    "time_range": "字幕对位剪辑范围：subtitle_entries 首条 start 至末条 end；无条目时同 timestamp",
-    "scene": "当前片段唯一场景地点（如楼顶天台、办公室；不含「切换至」链）",
-    "observation": "当前片段画面观察（单场景概括；frame_observations 为单帧描述）",
-    "action": "人物在做什么，须含可见性别",
-    "emotion": "画面情绪（紧张、悲伤、压抑等）",
-    "key_visual": "光线、色调、构图等特殊视觉信息",
-    "subtitle": "该时段内合并字幕对白（多句以；连接，已去重复标点）",
-    "subtitle_entries": "字幕逐条列表（剪辑时间片段，每项含 start / end / text）",
-    "subtitle_start": "对位字幕起始时间",
-    "subtitle_end": "对位字幕结束时间",
-    "subtitle_text_source": "字幕来源（如 srt / burned_in）",
-}
+_SCENE_SEGMENT_FIELD_COMMENTS: dict[str, str] = dict(SCENE_SEGMENT_FIELD_COMMENTS)
+_SCENE_SEGMENT_FIELD_COMMENTS.update(
+    {
+        "time_range": "字幕对位剪辑范围：subtitle_entries 首条 start 至末条 end；无条目时同 timestamp",
+        "subtitle": "该时段内合并字幕对白（多句以；连接，已去重复标点）",
+        "subtitle_entries": "字幕逐条列表（剪辑时间片段，每项含 start / end / text）",
+        "subtitle_start": "对位字幕起始时间",
+        "subtitle_end": "对位字幕结束时间",
+        "subtitle_text_source": "字幕来源（如 srt / burned_in）",
+    }
+)
 
 MINIMAL_SCENE_FIELD_COMMENTS: dict[str, str] = {
     key: _SCENE_SEGMENT_FIELD_COMMENTS[key]
@@ -162,8 +152,12 @@ def slim_scene_segment_core(segment: dict[str, Any]) -> dict[str, str]:
 
 
 def slim_scene_segment_for_artifact(segment: dict[str, Any]) -> dict[str, Any]:
-    """写入 artifact 的 scene_segment：核心六字段 + 可选 subtitle 文本。"""
+    """写入 artifact 的 scene_segment：核心六字段 + 剪辑师扩展字段 + 可选 subtitle。"""
     slim = slim_scene_segment_core(segment)
+    for key in SCENE_SEGMENT_EDITOR_FIELDS:
+        value = str(segment.get(key) or "").strip()
+        if value:
+            slim[key] = value
     for key in ("subtitle",):
         if key not in segment:
             continue
@@ -174,6 +168,8 @@ def slim_scene_segment_for_artifact(segment: dict[str, Any]) -> dict[str, Any]:
             value = resolve_segment_subtitle_text({"subtitle": value})
         if value:
             slim[key] = value
+    if "batch_index" in segment:
+        slim["batch_index"] = int(segment.get("batch_index", 0))
     return slim
 
 
@@ -250,7 +246,11 @@ def _collect_top_level_segments(artifact: dict[str, Any]) -> list[dict[str, Any]
                     payload.setdefault("batch_index", batch.get("batch_index"))
                     payload.pop("time_range", None)
                     collected.append(payload)
-    collected = normalize_scene_segments(collected)
+    collected = normalize_scene_segments(
+        collected,
+        max_duration_ms=resolve_frame_max_segment_duration_ms(get_documentary_settings()),
+        settings=get_documentary_settings(),
+    )
     partition_subtitle_entries_across_segments(collected)
     return collected
 
@@ -470,23 +470,16 @@ def compress_scene_segment_storage(segment: dict[str, Any]) -> None:
         segment.pop("subtitle", None)
 
 
-def compress_analysis_artifact(
+def normalize_analysis_artifact_storage(
     artifact: dict[str, Any],
     *,
     settings: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """
-    压缩抽帧 JSON 体积（原地修改）：
-    - 同场景环境去重
-    - 去掉 legacy subtitle_entries，仅保留 subtitle 文本
-    - 去掉 batch 调试字段与重复逐帧观察
-    - 逐帧 observation 在有 scene_segments 时可省略（保留硬字幕/对位字幕）
-    """
+    """整理 scene_segments 存储（去 legacy subtitle_entries、环境去重），不删逐帧 observation。"""
     from app.services.documentary.documentary_settings import get_documentary_settings
 
     cfg = settings or get_documentary_settings()
     dedupe_env = bool(cfg.get("dedupe_scene_environment", True))
-    strip_debug = bool(cfg.get("strip_frame_analysis_debug_fields", True))
 
     segments = artifact.get("scene_segments")
     if isinstance(segments, list) and segments:
@@ -510,37 +503,73 @@ def compress_analysis_artifact(
             batch_index = int(batch.get("batch_index", 0))
             batch["scene_segments"] = segments_by_batch.get(batch_index, [])
 
+    return artifact
+
+
+def strip_frame_analysis_debug_payload(
+    artifact: dict[str, Any],
+    *,
+    settings: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """剥离调试字段与逐帧 observation 正文（仅保留硬字幕等 slim 字段）。"""
+    from app.services.documentary.documentary_settings import get_documentary_settings
+
+    cfg = settings or get_documentary_settings()
+    if not cfg.get("strip_frame_analysis_debug_fields", True):
+        return artifact
+
     has_scene_segments = bool(
         isinstance(artifact.get("scene_segments"), list) and artifact.get("scene_segments")
     )
 
-    if strip_debug:
-        for batch in artifact.get("batches") or []:
-            if not isinstance(batch, dict):
-                continue
-            if str(batch.get("status") or "").lower() == "success":
-                batch.pop("raw_response", None)
-                batch.pop("frame_paths", None)
-            batch.pop("subtitle", None)
-            batch.pop("subtitle_entries", None)
-            batch.pop("subtitle_excerpt", None)
-            if has_scene_segments:
-                batch.pop("frame_observations", None)
-                batch.pop("observations", None)
-
+    for batch in artifact.get("batches") or []:
+        if not isinstance(batch, dict):
+            continue
+        if str(batch.get("status") or "").lower() == "success":
+            batch.pop("raw_response", None)
+            batch.pop("frame_paths", None)
+        batch.pop("subtitle", None)
+        batch.pop("subtitle_entries", None)
+        batch.pop("subtitle_excerpt", None)
         if has_scene_segments:
-            slim_observations: list[dict[str, Any]] = []
-            seen_ids: set[int] = set()
-            for observation in artifact.get("frame_observations") or []:
-                if not isinstance(observation, dict) or id(observation) in seen_ids:
-                    continue
-                seen_ids.add(id(observation))
-                slim = _slim_frame_observation(observation, keep_batch_meta=True)
-                slim.pop("observation", None)
-                if slim:
-                    slim_observations.append(slim)
-            artifact["frame_observations"] = slim_observations
+            batch.pop("frame_observations", None)
+            batch.pop("observations", None)
 
+    if has_scene_segments:
+        slim_observations: list[dict[str, Any]] = []
+        seen_ids: set[int] = set()
+        for observation in artifact.get("frame_observations") or []:
+            if not isinstance(observation, dict) or id(observation) in seen_ids:
+                continue
+            seen_ids.add(id(observation))
+            slim = _slim_frame_observation(observation, keep_batch_meta=True)
+            slim.pop("observation", None)
+            if slim:
+                slim_observations.append(slim)
+        artifact["frame_observations"] = slim_observations
+
+    return artifact
+
+
+def compress_analysis_artifact(
+    artifact: dict[str, Any],
+    *,
+    settings: dict[str, Any] | None = None,
+    strip_debug: bool | None = None,
+) -> dict[str, Any]:
+    """
+    压缩抽帧 JSON 体积（原地修改）：
+    - 同场景环境去重、去掉 legacy subtitle_entries（始终执行）
+    - 可选：去掉 batch 调试字段与逐帧 observation 正文（strip_debug）
+    """
+    from app.services.documentary.documentary_settings import get_documentary_settings
+
+    cfg = settings or get_documentary_settings()
+    normalize_analysis_artifact_storage(artifact, settings=cfg)
+    if strip_debug is None:
+        strip_debug = bool(cfg.get("strip_frame_analysis_debug_fields", True))
+    if strip_debug:
+        strip_frame_analysis_debug_payload(artifact, settings=cfg)
     return artifact
 
 

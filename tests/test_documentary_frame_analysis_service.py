@@ -1004,6 +1004,52 @@ class DocumentaryFrameSubtitleAttachmentTests(unittest.TestCase):
         self.assertNotIn("observation", frame)
         self.assertIn("subtitle", frame)
 
+    def test_compress_analysis_artifact_preserves_full_when_strip_debug_false(self):
+        from app.services.documentary.frame_analysis_compact import compress_analysis_artifact
+
+        artifact = {
+            "scene_segments": [
+                {
+                    "timestamp": "00:00:00,000-00:00:05,000",
+                    "scene": "办公室",
+                    "observation": "对话",
+                    "batch_index": 0,
+                }
+            ],
+            "batches": [
+                {
+                    "batch_index": 0,
+                    "status": "success",
+                    "time_range": "00:00:00,000-00:00:05,000",
+                    "raw_response": "debug",
+                    "frame_paths": ["/tmp/a.jpg"],
+                    "frame_observations": [
+                        {
+                            "timestamp": "00:00:02,000",
+                            "observation": "画面",
+                            "burned_in_subtitle": "对白",
+                            "has_burned_in_subtitle": True,
+                        }
+                    ],
+                }
+            ],
+            "frame_observations": [
+                {
+                    "timestamp": "00:00:02,000",
+                    "observation": "画面",
+                    "burned_in_subtitle": "对白",
+                    "has_burned_in_subtitle": True,
+                    "batch_index": 0,
+                }
+            ],
+        }
+        compress_analysis_artifact(artifact, strip_debug=False)
+        self.assertIn("raw_response", artifact["batches"][0])
+        self.assertIn("frame_paths", artifact["batches"][0])
+        self.assertIn("frame_observations", artifact["batches"][0])
+        self.assertIn("observation", artifact["frame_observations"][0])
+        self.assertEqual("对白", artifact["frame_observations"][0]["burned_in_subtitle"])
+
     def test_assign_subtitle_entries_to_segments_assigns_once(self):
         from app.services.documentary.documentary_subtitle_enrichment import (
             assign_subtitle_entries_to_segments,
@@ -1479,6 +1525,37 @@ class SceneSegmentDedupTests(unittest.TestCase):
         self.assertEqual("00:00:01,000-00:00:10,000", rooftop["timestamp"])
         self.assertIn("继续对话", rooftop["observation"])
 
+    def test_merge_same_scene_skips_empty_scene_segments(self):
+        from app.services.documentary.frame_timeline_sampling import merge_same_scene_within_batch
+
+        segments = [
+            {
+                "batch_index": 0,
+                "timestamp": "00:00:01,000-00:00:05,000",
+                "scene": "",
+                "observation": "审讯室对话",
+            },
+            {
+                "batch_index": 0,
+                "timestamp": "00:00:05,000-00:00:10,000",
+                "scene": "",
+                "observation": "走廊追逐",
+            },
+        ]
+        merged = merge_same_scene_within_batch(segments)
+        self.assertEqual(2, len(merged))
+
+    def test_infer_scene_label_from_observation(self):
+        from app.services.documentary.frame_timeline_sampling import infer_scene_label_from_segment
+
+        label = infer_scene_label_from_segment(
+            {
+                "scene": "",
+                "observation": "阴天楼顶，叶天佑与另一男子面对面站立，气氛严肃压抑",
+            }
+        )
+        self.assertEqual("阴天楼顶", label)
+
     def test_prune_cross_scene_overlaps_keeps_richest(self):
         from app.services.documentary.frame_timeline_sampling import prune_cross_scene_overlaps
 
@@ -1540,6 +1617,45 @@ class SceneSegmentDedupTests(unittest.TestCase):
         self.assertLessEqual(len(result), 2)
         scenes = {item["scene"] for item in result}
         self.assertNotIn("室内仓库", scenes & {"室内仓库", "室外夜景与住宅区"})
+
+    def test_split_bloated_segment_without_scene_does_not_crash(self):
+        from app.services.documentary.frame_timeline_sampling import split_scene_segments
+
+        segments = [
+            {
+                "batch_index": 0,
+                "timestamp": "00:00:00,000-00:00:45,000",
+                "observation": "第一段；第二段",
+                "action": "动作一；动作二",
+            },
+        ]
+        result = split_scene_segments(segments, max_duration_ms=15000)
+        self.assertGreater(len(result), 1)
+        for item in result:
+            self.assertNotIn("scene", item)
+
+    def test_normalize_scene_segments_does_not_collapse_to_two_blobs(self):
+        from app.services.documentary.frame_timeline_sampling import normalize_scene_segments
+        from app.services.documentary.frame_analysis_pairing import load_analysis_artifact
+        from pathlib import Path
+
+        sample_path = (
+            Path(__file__).resolve().parents[1]
+            / "instances/1/storage/temp/analysis/6月4日抽帧_frame_analysis.json"
+        )
+        if not sample_path.exists():
+            self.skipTest("sample frame analysis artifact missing")
+        artifact = load_analysis_artifact(str(sample_path))
+        raw = [s for s in artifact.get("scene_segments", []) if isinstance(s, dict)]
+        result = normalize_scene_segments(raw, strict_scene_rules=True)
+        self.assertGreater(len(result), 10)
+        max_duration_ms = 0
+        for segment in result:
+            from app.services.documentary.frame_timeline_sampling import _segment_timestamp_bounds
+
+            start_ms, end_ms = _segment_timestamp_bounds(segment)
+            max_duration_ms = max(max_duration_ms, end_ms - start_ms)
+        self.assertLess(max_duration_ms, 5 * 60 * 1000)
 
     def test_parse_scene_chain_repairs_corrupted_cong_prefix(self):
         from app.services.documentary.frame_timeline_sampling import (
@@ -1825,3 +1941,281 @@ class OpeningClimaxReplayTests(unittest.TestCase):
         ]
         updated = apply_opening_climax_chronological_replay(items, enabled=True)
         self.assertEqual(2, len(updated))
+
+
+class FrameCharacterNamingTests(unittest.TestCase):
+    def test_is_character_name_evidence_backed_with_alias(self):
+        from app.services.documentary.frame_character_naming import is_character_name_evidence_backed
+
+        self.assertTrue(is_character_name_evidence_backed("胡小跃", "我了解小月。"))
+        self.assertFalse(is_character_name_evidence_backed("刘天也", "秦枫在说话"))
+
+    def test_sanitize_segment_character_names(self):
+        from app.services.documentary.frame_character_naming import sanitize_segment_character_names
+
+        segment = {"characters": ["秦枫", "刘天也"], "subtitle_entries": [{"text": "秦枫你好"}]}
+        removed = sanitize_segment_character_names(
+            segment,
+            evidence_text="秦枫你好",
+            reference_names={"秦枫", "刘天也"},
+        )
+        self.assertEqual(["秦枫"], segment["characters"])
+        self.assertEqual(["刘天也"], removed)
+
+
+class FrameExtractionTestModeTests(unittest.TestCase):
+    def test_default_test_analysis_path_for_video(self):
+        from app.services.documentary.frame_analysis_pairing import default_test_analysis_path_for_video
+
+        path = default_test_analysis_path_for_video(r"D:\素材\6月4日.mp4", max_duration_seconds=5)
+        self.assertTrue(path.endswith("6月4日_frame_analysis_test_5s.json"))
+
+    def test_filter_keyframes_by_max_duration(self):
+        from app.services.documentary.frame_extraction_service import DocumentaryFrameExtractionService
+
+        frames = [
+            "/tmp/keyframe_000000_000000000.jpg",
+            "/tmp/keyframe_000075_000003000.jpg",
+            "/tmp/keyframe_000150_000006000.jpg",
+        ]
+        filtered = DocumentaryFrameExtractionService._filter_keyframes_by_max_duration(frames, 5.0)
+        self.assertEqual(frames[:2], filtered)
+
+    def test_resolve_max_duration_seconds_only_in_test_mode(self):
+        from app.services.documentary.frame_extraction_service import DocumentaryFrameExtractionService
+
+        self.assertIsNone(
+            DocumentaryFrameExtractionService._resolve_max_duration_seconds(5, test_mode=False)
+        )
+        self.assertEqual(
+            5.0,
+            DocumentaryFrameExtractionService._resolve_max_duration_seconds(5, test_mode=True),
+        )
+
+
+class DramaCharacterRegistryTests(unittest.TestCase):
+    def _temp_image_path(self) -> str:
+        import tempfile
+
+        import PIL.Image
+
+        handle, path = tempfile.mkstemp(suffix=".jpg")
+        os.close(handle)
+        PIL.Image.new("RGB", (64, 64), color=(120, 80, 40)).save(path)
+        self.addCleanup(lambda: os.path.exists(path) and os.remove(path))
+        return path
+
+    def test_list_dramas_includes_fazu2(self):
+        from app.services.drama_character_registry import DEFAULT_DRAMA_ID, list_dramas
+
+        dramas = list_dramas()
+        self.assertTrue(any(item["id"] == DEFAULT_DRAMA_ID for item in dramas))
+
+    def test_list_characters_for_fazu2(self):
+        from app.services.drama_character_registry import (
+            list_character_head_slot_groups,
+            list_characters_for_drama,
+        )
+
+        names = list_characters_for_drama("罚罪2")
+        self.assertIn("秦枫", names)
+        self.assertIn("胡小跃", names)
+        self.assertIn("罗博", names)
+        self.assertNotIn("金鼎集团", names)
+        self.assertEqual(59, len(names))
+
+        groups = list_character_head_slot_groups("罚罪2")
+        self.assertEqual(3, len(groups))
+        self.assertEqual(20, len(groups[0]["slots"]))
+        self.assertEqual("core", groups[0]["tier"])
+
+    def test_head_widget_session_keys_are_ascii(self):
+        from app.services.drama_character_registry import (
+            character_widget_slot_id,
+            head_selection_session_key,
+            head_uploader_session_key,
+        )
+
+        slot_id = character_widget_slot_id("罚罪2", "秦枫")
+        self.assertEqual(12, len(slot_id))
+        self.assertTrue(slot_id.isalnum())
+        self.assertNotIn("秦枫", head_uploader_session_key("罚罪2", "秦枫"))
+        self.assertNotIn("秦枫", head_selection_session_key("罚罪2", "秦枫"))
+
+    def test_list_unrecognized_head_images(self):
+        import shutil
+        import tempfile
+
+        from app.services.drama_character_registry import (
+            ensure_head_img_dir,
+            list_unrecognized_head_images,
+            save_head_image,
+        )
+        from PIL import Image
+        import io
+
+        tmp_root = tempfile.mkdtemp()
+        self.addCleanup(lambda: shutil.rmtree(tmp_root, ignore_errors=True))
+        drama_dir = os.path.join(tmp_root, "headImg", "test_drama")
+        os.makedirs(drama_dir, exist_ok=True)
+
+        orphan_path = os.path.join(drama_dir, "Snipaste_test.png")
+        Image.new("RGB", (8, 8), color=(1, 2, 3)).save(orphan_path)
+
+        import app.services.drama_character_registry as registry
+
+        original_root = registry._PROJECT_ROOT
+        registry._PROJECT_ROOT = tmp_root
+        self.addCleanup(lambda: setattr(registry, "_PROJECT_ROOT", original_root))
+
+        from app.data.drama_knowledge import fazu2_upload_roster as roster_mod
+
+        original_rosters = dict(roster_mod.DRAMA_UPLOAD_ROSTERS)
+        roster_mod.DRAMA_UPLOAD_ROSTERS["test_drama"] = ({"name": "秦枫", "tier": "core", "role_hint": ""},)
+        self.addCleanup(lambda: roster_mod.DRAMA_UPLOAD_ROSTERS.update(original_rosters))
+
+        buf = io.BytesIO()
+        Image.new("RGB", (8, 8), color=(4, 5, 6)).save(buf, format="JPEG")
+        save_head_image("test_drama", "秦枫", buf.getvalue(), original_filename="a.jpg")
+
+        orphans = list_unrecognized_head_images("test_drama")
+        self.assertIn("Snipaste_test.png", orphans)
+        self.assertNotIn("秦枫.jpg", orphans)
+        from app.services.drama_character_registry import build_character_reference_prompt_section
+
+        section = build_character_reference_prompt_section(
+            [{"name": "秦枫", "path": "/tmp/qin.jpg"}],
+            video_frame_count=3,
+        )
+        self.assertIn("秦枫", section)
+        self.assertIn("3", section)
+        self.assertIn("参照图 #1", section)
+
+    def test_compose_batch_vision_inputs_prepends_refs(self):
+        from app.services.documentary.frame_extraction_service import DocumentaryFrameExtractionService
+
+        frames = ["/tmp/frame1.jpg", "/tmp/frame2.jpg"]
+        img = self._temp_image_path()
+        refs = [{"name": "秦枫", "path": img}]
+        settings = {"frame_reference_token_saver": False, "frame_reference_use_collage": False}
+        images, active, carryover, ref_count = DocumentaryFrameExtractionService._compose_batch_vision_inputs(
+            frames,
+            batch_index=0,
+            character_references=refs,
+            documentary_settings=settings,
+        )
+        self.assertEqual(3, len(images))
+        self.assertTrue(images[0].endswith(".jpg"))
+        self.assertNotEqual(img, images[0])
+        self.assertEqual(frames, images[1:])
+        self.assertEqual(1, len(active))
+        self.assertEqual(1, ref_count)
+        self.assertEqual("", carryover)
+
+    def test_compose_batch_vision_inputs_first_batch_only(self):
+        from app.services.documentary.frame_extraction_service import DocumentaryFrameExtractionService
+
+        frames = ["/tmp/frame1.jpg"]
+        img = self._temp_image_path()
+        refs = [{"name": "秦枫", "path": img}]
+        settings = {"frame_reference_token_saver": True, "frame_reference_use_collage": False}
+        images0, _, carryover0, count0 = DocumentaryFrameExtractionService._compose_batch_vision_inputs(
+            frames,
+            batch_index=0,
+            character_references=refs,
+            documentary_settings=settings,
+        )
+        images1, _, carryover1, count1 = DocumentaryFrameExtractionService._compose_batch_vision_inputs(
+            frames,
+            batch_index=1,
+            character_references=refs,
+            documentary_settings=settings,
+        )
+        self.assertEqual(2, len(images0))
+        self.assertEqual(1, count0)
+        self.assertEqual(frames, images1)
+        self.assertEqual(0, count1)
+        self.assertIn("沿用", carryover1)
+
+    def test_compose_batch_vision_inputs_relationship_diagram_first(self):
+        from app.services.documentary.frame_extraction_service import DocumentaryFrameExtractionService
+
+        frames = ["/tmp/frame1.jpg"]
+        rel = self._temp_image_path()
+        img = self._temp_image_path()
+        refs = [{"name": "秦枫", "path": img}]
+        settings = {"frame_reference_token_saver": False, "frame_reference_use_collage": False}
+        images, active, _, ref_count = DocumentaryFrameExtractionService._compose_batch_vision_inputs(
+            frames,
+            batch_index=0,
+            relationship_diagram_path=rel,
+            character_references=refs,
+            documentary_settings=settings,
+        )
+        self.assertEqual(3, len(images))
+        self.assertTrue(images[0].endswith(".jpg"))
+        self.assertTrue(os.path.isfile(images[0]))
+        self.assertEqual(frames, images[2:])
+        self.assertEqual(1, len(active))
+        self.assertEqual(2, ref_count)
+
+    def test_merge_frame_analysis_settings_disables_text_by_default(self):
+        from app.services.drama_character_registry import merge_frame_analysis_settings_for_drama
+
+        merged = merge_frame_analysis_settings_for_drama({}, "罚罪2")
+        self.assertFalse(merged.get("enable_frame_analysis_drama_knowledge"))
+
+    def test_merge_frame_analysis_settings_enables_text_when_requested(self):
+        from app.services.drama_character_registry import merge_frame_analysis_settings_for_drama
+
+        merged = merge_frame_analysis_settings_for_drama({}, "罚罪2", enable_knowledge_text=True)
+        self.assertTrue(merged.get("enable_frame_analysis_drama_knowledge"))
+        self.assertEqual("罚罪2", merged.get("selected_drama_id"))
+
+    def test_should_attach_reference_images_first_batch_only(self):
+        from app.services.documentary.frame_reference_images import (
+            ATTACH_MODE_FIRST_BATCH,
+            should_attach_reference_images,
+        )
+
+        settings = {"frame_reference_token_saver": True}
+        self.assertTrue(should_attach_reference_images(0, settings))
+        self.assertFalse(should_attach_reference_images(1, settings))
+        settings_off = {"frame_reference_token_saver": False, "frame_reference_attach_mode": ATTACH_MODE_FIRST_BATCH}
+        self.assertFalse(should_attach_reference_images(1, settings_off))
+
+        from app.services.drama_character_registry import resolve_active_relationship_diagram_path
+
+        self.assertEqual("", resolve_active_relationship_diagram_path("罚罪2", enabled=False))
+
+    def test_resolve_character_references_filters_by_selection(self):
+        from app.services.drama_character_registry import resolve_character_references
+
+        with unittest.mock.patch(
+            "app.services.drama_character_registry.list_character_head_slots",
+            return_value=[
+                {"name": "秦枫", "image_path": __file__, "uploaded": True},
+                {"name": "刘天也", "image_path": __file__, "uploaded": True},
+            ],
+        ):
+            all_refs = resolve_character_references("罚罪2")
+            self.assertEqual(2, len(all_refs))
+            selected = resolve_character_references("罚罪2", selected_names={"秦枫"})
+            self.assertEqual(1, len(selected))
+            self.assertEqual("秦枫", selected[0]["name"])
+            empty = resolve_character_references("罚罪2", selected_names=set())
+            self.assertEqual([], empty)
+
+    def test_build_batch_vision_reference_prompt_includes_relationship(self):
+        from app.services.drama_character_registry import build_batch_vision_reference_prompt_section
+
+        section = build_batch_vision_reference_prompt_section(
+            relationship_diagram_path=__file__,
+            character_references=[{"name": "秦枫", "path": __file__}],
+            video_frame_count=3,
+            drama_label="罚罪2",
+        )
+        self.assertIn("关系图", section)
+        self.assertIn("图 #1", section)
+        self.assertIn("秦枫", section)
+

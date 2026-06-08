@@ -15,6 +15,7 @@ from loguru import logger
 _PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
 
 _DEFAULT_KNOWLEDGE_BY_THEME: tuple[tuple[str, str], ...] = (
+    ("罚罪2", "app/data/drama_knowledge/fazu2_relationships.md"),
     ("罚罪", "app/data/drama_knowledge/fazu2_relationships.md"),
     ("fazu", "app/data/drama_knowledge/fazu2_relationships.md"),
 )
@@ -191,13 +192,14 @@ def build_frame_analysis_drama_knowledge_section(
         (settings or {}).get("frame_analysis_drama_knowledge_max_chars", 5000) or 5000
     )
     work = (theme or "本剧").strip()
-    header = f"""## 剧集人物关系对照（抽帧分析必读 · {work}）
+    header = f"""## 剧集人物关系对照（抽帧 · {work} · **仅作校正，不可猜人**）
 
-写 action / observation 前请对照本节，**画面可见性别优先**，人名须与字幕/硬字幕一致：
-- 仅字幕或硬字幕出现姓名时才写真名；否则用「未名人员(男/女)」
+本节用于**校正**已出现在本批字幕/硬字幕/画面中的人物身份，**不是**出场名单：
+- **先**看本批硬字幕/SRT/subtitle_entries，**再**用本节校正谐音与关系（秦峰→秦枫，老叶→叶天佑）
+- **禁止**因对照表里有某角色，就把该名字写到本批未在字幕/画面中出现的人身上
+- 仅字幕或硬字幕出现姓名时才写真名；面孔无法确认时用「未名人员(男/女)」
 - **禁止**：胡小月/小月→须写胡小跃；秦峰→秦枫；罗伯→罗博
-- **勿混**：叶天佑/老叶（局长）≠ 伟业；秦枫≠刘天也；文江燕是刘天也亲妹妹
-- 关系、职级、阵营须与本对照一致，禁止张冠李戴"""
+- **勿混**：叶天佑/老叶（局长）≠ 伟业；秦枫≠刘天也；文江燕是刘天也亲妹妹"""
     return _build_drama_knowledge_block(
         theme=theme,
         settings=settings,

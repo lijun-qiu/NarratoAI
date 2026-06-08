@@ -7,6 +7,13 @@ from app.utils.video_processor import VideoProcessor
 
 
 class VideoProcessorDocumentaryTests(unittest.TestCase):
+    def test_resolve_extraction_end_time_limits_duration(self):
+        processor = VideoProcessor.__new__(VideoProcessor)
+        processor.duration = 120.0
+        self.assertEqual(5.0, processor._resolve_extraction_end_time(5.0))
+        self.assertEqual(120.0, processor._resolve_extraction_end_time(None))
+        self.assertEqual(120.0, processor._resolve_extraction_end_time(0))
+
     @patch.object(VideoProcessor, "_extract_frames_fast_path", return_value=["a.jpg"])
     def test_extract_frames_by_interval_prefers_fast_path(self, fast_path):
         processor = VideoProcessor.__new__(VideoProcessor)
@@ -17,7 +24,7 @@ class VideoProcessorDocumentaryTests(unittest.TestCase):
         result = processor.extract_frames_by_interval_with_fallback("/tmp/out", interval_seconds=3.0)
 
         self.assertEqual(["a.jpg"], result)
-        fast_path.assert_called_once_with("/tmp/out", interval_seconds=3.0)
+        fast_path.assert_called_once_with("/tmp/out", interval_seconds=3.0, max_duration_seconds=None)
 
     def test_extract_frames_by_interval_falls_back_to_ultra_compatible(self):
         processor = VideoProcessor.__new__(VideoProcessor)
@@ -28,7 +35,7 @@ class VideoProcessorDocumentaryTests(unittest.TestCase):
         with TemporaryDirectory() as output_dir:
             expected_frame_path = os.path.join(output_dir, "keyframe_000000_000000000.jpg")
 
-            def ultra_compatible_fallback(self, output_dir_arg, interval_seconds=5.0):
+            def ultra_compatible_fallback(self, output_dir_arg, interval_seconds=5.0, **kwargs):
                 with open(expected_frame_path, "wb") as frame_file:
                     frame_file.write(b"frame")
                 return [0]
@@ -42,8 +49,8 @@ class VideoProcessorDocumentaryTests(unittest.TestCase):
                 result = processor.extract_frames_by_interval_with_fallback(output_dir, interval_seconds=3.0)
 
         self.assertEqual([expected_frame_path], result)
-        fast_path.assert_called_once_with(output_dir, interval_seconds=3.0)
-        fallback.assert_called_once_with(processor, output_dir, interval_seconds=3.0)
+        fast_path.assert_called_once_with(output_dir, interval_seconds=3.0, max_duration_seconds=None)
+        fallback.assert_called_once_with(processor, output_dir, interval_seconds=3.0, max_duration_seconds=None)
 
     def test_extract_frames_by_interval_rejects_non_positive_interval(self):
         processor = VideoProcessor.__new__(VideoProcessor)
@@ -67,12 +74,12 @@ class VideoProcessorDocumentaryTests(unittest.TestCase):
             stale_fastframe = os.path.join(output_dir, "fastframe_000000.jpg")
             expected_keyframe = os.path.join(output_dir, "keyframe_000000_000000000.jpg")
 
-            def fast_path_with_partial_output(_output_dir, interval_seconds=5.0):
+            def fast_path_with_partial_output(_output_dir, interval_seconds=5.0, **kwargs):
                 with open(stale_fastframe, "wb") as frame_file:
                     frame_file.write(b"stale")
                 raise RuntimeError("simulated fast-path failure")
 
-            def ultra_compatible_fallback(self, output_dir_arg, interval_seconds=5.0):
+            def ultra_compatible_fallback(self, output_dir_arg, interval_seconds=5.0, **kwargs):
                 with open(expected_keyframe, "wb") as frame_file:
                     frame_file.write(b"frame")
                 return [0]
@@ -87,5 +94,5 @@ class VideoProcessorDocumentaryTests(unittest.TestCase):
 
             self.assertEqual([expected_keyframe], result)
             self.assertFalse(os.path.exists(stale_fastframe))
-            fast_path.assert_called_once_with(output_dir, interval_seconds=3.0)
-            fallback.assert_called_once_with(processor, output_dir, interval_seconds=3.0)
+            fast_path.assert_called_once_with(output_dir, interval_seconds=3.0, max_duration_seconds=None)
+            fallback.assert_called_once_with(processor, output_dir, interval_seconds=3.0, max_duration_seconds=None)

@@ -18,10 +18,17 @@ from app.services.documentary.frame_analysis_pairing import (
     find_paired_frame_analysis_path,
 )
 from app.services.documentary.frame_extraction_service import DocumentaryFrameExtractionService
+from app.services.drama_character_registry import (
+    DEFAULT_DRAMA_ID,
+    merge_frame_analysis_settings_for_drama,
+    resolve_active_relationship_diagram_path,
+    resolve_character_references,
+)
 from app.services.documentary.subtitle_calibration_pipeline import (
     requires_subtitle_before_frame_analysis,
 )
 from app.services.subtitle_video_pairing import find_paired_subtitle_path, load_subtitle_content, resolve_subtitle_path_for_video
+from app.services.srt_utils import clip_entries_to_duration, entries_to_srt, parse_srt
 
 
 def _normalize_progress_value(progress: float | int) -> int:
@@ -44,7 +51,24 @@ def _resolve_subtitle_content(video_path: str) -> str:
     return session_content
 
 
-def extract_frame_analysis_docu(params, *, compact: bool = False):
+def _clip_subtitle_content(content: str, max_duration_seconds: float) -> str:
+    cleaned = (content or "").strip()
+    if not cleaned or max_duration_seconds <= 0:
+        return cleaned
+    entries = parse_srt(cleaned)
+    if not entries:
+        return cleaned
+    clipped = clip_entries_to_duration(entries, int(max_duration_seconds * 1000))
+    return entries_to_srt(clipped).strip()
+
+
+def extract_frame_analysis_docu(
+    params,
+    *,
+    compact: bool = False,
+    test_mode: bool = False,
+    test_duration_seconds: float | None = None,
+):
     """抽帧并用视觉模型分析，产出 JSON 供后续脚本生成复用。"""
     progress_bar = st.progress(0)
     status_text = st.empty()
@@ -60,9 +84,11 @@ def extract_frame_analysis_docu(params, *, compact: bool = False):
     analysis_path = ""
     keyframe_count = 0
     part_paths: list[str] = []
+    test_duration = float(test_duration_seconds if test_duration_seconds is not None else 5.0)
 
     try:
-        with st.spinner("正在抽帧并分析..."):
+        label = "测试抽帧" if test_mode else "抽帧"
+        with st.spinner(f"正在{label}并分析..."):
             if not params.video_origin_path:
                 st.error("请先选择视频文件")
                 return
@@ -96,6 +122,29 @@ def extract_frame_analysis_docu(params, *, compact: bool = False):
                     st.session_state.get("doc_enable_subtitle_enrichment")
                 )
 
+            drama_id = str(st.session_state.get("doc_frame_drama_id") or DEFAULT_DRAMA_ID).strip()
+            enable_knowledge_text = bool(st.session_state.get("doc_frame_enable_drama_knowledge_text"))
+            enable_relationship_diagram = bool(st.session_state.get("doc_frame_enable_relationship_diagram"))
+            doc_settings = dict(doc_settings)
+            doc_settings["frame_reference_token_saver"] = bool(
+                st.session_state.get("doc_frame_reference_token_saver", True)
+            )
+            doc_settings = merge_frame_analysis_settings_for_drama(
+                doc_settings,
+                drama_id,
+                enable_knowledge_text=enable_knowledge_text,
+            )
+            relationship_diagram_path = resolve_active_relationship_diagram_path(
+                drama_id,
+                enabled=enable_relationship_diagram,
+            )
+            selected_names = set(st.session_state.get("doc_frame_selected_character_names") or [])
+            character_references = (
+                st.session_state.get("doc_frame_character_references")
+                or resolve_character_references(drama_id, selected_names=selected_names)
+            )
+            video_theme = str(st.session_state.get("video_theme") or drama_id).strip()
+
             subtitle_path = resolve_subtitle_path_for_video(
                 params.video_origin_path,
                 explicit_path=st.session_state.get("subtitle_path"),
@@ -109,6 +158,14 @@ def extract_frame_analysis_docu(params, *, compact: bool = False):
             subtitle_content = ""
             if doc_settings.get("enable_subtitle_enrichment", True):
                 subtitle_content = _resolve_subtitle_content(params.video_origin_path)
+
+            test_duration = float(
+                test_duration_seconds
+                if test_duration_seconds is not None
+                else st.session_state.get("doc_frame_test_duration_seconds", test_duration)
+            )
+            if test_mode:
+                subtitle_content = _clip_subtitle_content(subtitle_content, test_duration)
 
             default_interval = doc_settings.get("frame_interval_input") or config.frames.get(
                 "frame_interval_input", 3
@@ -125,7 +182,7 @@ def extract_frame_analysis_docu(params, *, compact: bool = False):
             result = asyncio.run(
                 service.analyze_video(
                     video_path=params.video_origin_path,
-                    video_theme=st.session_state.get("video_theme", ""),
+                    video_theme=video_theme,
                     custom_prompt=st.session_state.get("custom_prompt", ""),
                     frame_interval_input=frame_interval_input,
                     vision_batch_size=vision_batch_size,
@@ -137,6 +194,13 @@ def extract_frame_analysis_docu(params, *, compact: bool = False):
                     max_concurrency=vision_max_concurrency,
                     documentary_settings=doc_settings,
                     subtitle_content=subtitle_content,
+                    drama_id=drama_id,
+                    character_references=character_references,
+                    relationship_diagram_path=relationship_diagram_path,
+                    frame_drama_knowledge_text_enabled=enable_knowledge_text,
+                    frame_relationship_diagram_enabled=enable_relationship_diagram,
+                    max_duration_seconds=test_duration if test_mode else None,
+                    test_mode=test_mode,
                 )
             )
 
@@ -146,9 +210,11 @@ def extract_frame_analysis_docu(params, *, compact: bool = False):
             st.session_state["doc_frame_analysis_file_processed"] = True
             st.session_state["_frame_analysis_synced_video_path"] = params.video_origin_path
             keyframe_count = len(result.get("keyframe_files") or [])
-            logger.info(f"抽帧分析完成: {analysis_path}，共 {keyframe_count} 帧")
+            logger.info(f"{'测试' if test_mode else ''}抽帧分析完成: {analysis_path}，共 {keyframe_count} 帧")
 
             split_parts = int(st.session_state.get("doc_output_split_parts") or 1)
+            if test_mode:
+                split_parts = 1
             split_result = DocumentaryFrameExtractionService.save_split_analysis_artifacts(
                 analysis_path,
                 split_parts,
@@ -158,10 +224,13 @@ def extract_frame_analysis_docu(params, *, compact: bool = False):
 
         time.sleep(0.1)
         progress_bar.progress(100)
-        status_text.text("🎉 抽帧分析完成！")
+        status_text.text("🎉 测试抽帧完成！" if test_mode else "🎉 抽帧分析完成！")
+        prefix = "✅ 测试抽帧已保存" if test_mode else "✅ 抽帧分析已保存"
         success_msg = (
-            f"✅ 抽帧分析已保存: `{os.path.basename(analysis_path)}`（{keyframe_count} 帧）"
+            f"{prefix}: `{os.path.basename(analysis_path)}`（{keyframe_count} 帧）"
         )
+        if test_mode:
+            success_msg += f"\n\n仅分析前 **{test_duration:g}** 秒，不会覆盖完整版 `{os.path.basename(DocumentaryFrameExtractionService.default_analysis_path_for_video(params.video_origin_path))}`。"
         if part_paths:
             success_msg += f"\n\n另存 **{len(part_paths)}** 份切割文件："
             success_msg += "\n".join(f"- `{os.path.basename(path)}`" for path in part_paths)

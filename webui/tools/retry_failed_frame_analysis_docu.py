@@ -14,6 +14,12 @@ from app.services.documentary.documentary_settings import (
 )
 from app.services.documentary.frame_analysis_pairing import load_analysis_artifact
 from app.services.documentary.frame_extraction_service import DocumentaryFrameExtractionService
+from app.services.drama_character_registry import (
+    DEFAULT_DRAMA_ID,
+    merge_frame_analysis_settings_for_drama,
+    resolve_active_relationship_diagram_path,
+    resolve_character_references,
+)
 from app.services.subtitle_video_pairing import find_paired_subtitle_path, load_subtitle_content
 
 
@@ -102,6 +108,33 @@ def retry_failed_frame_analysis_docu(
                 st.session_state.get("doc_enable_subtitle_enrichment")
             )
 
+        drama_id = str(
+            st.session_state.get("doc_frame_drama_id")
+            or artifact.get("drama_id")
+            or DEFAULT_DRAMA_ID
+        ).strip()
+        enable_knowledge_text = bool(st.session_state.get("doc_frame_enable_drama_knowledge_text"))
+        enable_relationship_diagram = bool(st.session_state.get("doc_frame_enable_relationship_diagram"))
+        doc_settings = dict(doc_settings)
+        doc_settings["frame_reference_token_saver"] = bool(
+            st.session_state.get("doc_frame_reference_token_saver", True)
+        )
+        doc_settings = merge_frame_analysis_settings_for_drama(
+            doc_settings,
+            drama_id,
+            enable_knowledge_text=enable_knowledge_text,
+        )
+        relationship_diagram_path = resolve_active_relationship_diagram_path(
+            drama_id,
+            enabled=enable_relationship_diagram,
+        )
+        selected_names = set(st.session_state.get("doc_frame_selected_character_names") or [])
+        character_references = (
+            st.session_state.get("doc_frame_character_references")
+            or resolve_character_references(drama_id, selected_names=selected_names)
+        )
+        video_theme = str(st.session_state.get("video_theme") or drama_id).strip()
+
         subtitle_content = ""
         if doc_settings.get("enable_subtitle_enrichment", True) and video_path:
             subtitle_content = _resolve_subtitle_content(video_path)
@@ -116,7 +149,7 @@ def retry_failed_frame_analysis_docu(
                 service.retry_failed_batches(
                     analysis_json_path=target_path,
                     video_path=video_path,
-                    video_theme=st.session_state.get("video_theme", ""),
+                    video_theme=video_theme,
                     custom_prompt=st.session_state.get("custom_prompt", ""),
                     vision_llm_provider=vision_llm_provider,
                     progress_callback=update_progress,
@@ -126,6 +159,11 @@ def retry_failed_frame_analysis_docu(
                     max_concurrency=vision_max_concurrency,
                     documentary_settings=doc_settings,
                     subtitle_content=subtitle_content,
+                    drama_id=drama_id,
+                    character_references=character_references,
+                    relationship_diagram_path=relationship_diagram_path,
+                    frame_drama_knowledge_text_enabled=enable_knowledge_text,
+                    frame_relationship_diagram_enabled=enable_relationship_diagram,
                 )
             )
 

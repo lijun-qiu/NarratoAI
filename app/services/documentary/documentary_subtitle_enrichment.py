@@ -165,13 +165,15 @@ def attach_burned_in_subtitles_to_artifact(
         if batch_observations:
             observations_by_batch.setdefault(batch_index, batch_observations)
 
+    all_observations = _iter_frame_observation_dicts(artifact)
+
     unique_segments = _collect_unique_scene_segments(artifact)
     for segment in unique_segments:
         batch_index = int(segment.get("batch_index", 0))
-        texts = collect_burned_in_texts_for_segment(
-            segment,
-            observations_by_batch.get(batch_index, []),
-        )
+        batch_obs = observations_by_batch.get(batch_index, [])
+        texts = collect_burned_in_texts_for_segment(segment, batch_obs)
+        if not texts and batch_obs is not all_observations:
+            texts = collect_burned_in_texts_for_segment(segment, all_observations)
         segment.pop("subtitle_entries", None)
         segment.pop("time_range", None)
         if texts:
@@ -527,6 +529,46 @@ def resolve_subtitles_for_plot_blueprint(
     return "", "", ""
 
 
+def collect_subtitle_time_bounds(subtitle_content: str) -> dict[str, int]:
+    """从 SRT 文本汇总对白可用时间范围（毫秒）。"""
+    from app.services.srt_utils import parse_srt
+
+    entries = parse_srt(subtitle_content or "")
+    if not entries:
+        return {"min_ms": 0, "max_ms": 0}
+    return {
+        "min_ms": min(entry.start_ms for entry in entries),
+        "max_ms": max(entry.end_ms for entry in entries),
+    }
+
+
+def _raw_scene_segments_from_artifact(artifact: dict) -> list[dict]:
+    top_level = artifact.get("scene_segments")
+    if isinstance(top_level, list) and top_level:
+        return [segment for segment in top_level if isinstance(segment, dict)]
+    return []
+
+
+def _scan_segment_time_bounds(segments: list[dict]) -> tuple[int, int]:
+    min_ms = 0
+    max_ms = 0
+    for segment in segments:
+        clip_range = resolve_segment_time_range(segment)
+        if not clip_range or "-" not in clip_range:
+            clip_range = str(segment.get("timestamp") or "")
+        if not clip_range or "-" not in clip_range:
+            continue
+        try:
+            start_ms, end_ms = parse_timestamp_range_ms(clip_range)
+        except Exception:
+            continue
+        if not max_ms or end_ms > max_ms:
+            max_ms = end_ms
+        if not min_ms or start_ms < min_ms:
+            min_ms = start_ms
+    return min_ms, max_ms
+
+
 def collect_frame_analysis_time_bounds(
     frame_json_path: str | None,
 ) -> dict[str, Any]:
@@ -547,12 +589,18 @@ def collect_frame_analysis_time_bounds(
         logger.warning(f"读取抽帧 JSON 时间边界失败: {exc}")
         return empty
 
-    segments = collect_scene_segments_from_analysis(artifact)
-    if not segments:
-        return empty
+    raw_segments = _raw_scene_segments_from_artifact(artifact)
+    if raw_segments:
+        min_ms, max_ms = _scan_segment_time_bounds(raw_segments)
+    else:
+        min_ms, max_ms = 0, 0
 
-    min_ms = 0
-    max_ms = 0
+    segments = collect_scene_segments_from_analysis(artifact)
+    if not segments and not raw_segments:
+        return empty
+    if not max_ms and segments:
+        min_ms, max_ms = _scan_segment_time_bounds(segments)
+
     anchors: list[dict[str, str]] = []
     for segment in segments:
         clip_range = resolve_segment_time_range(segment)
@@ -564,10 +612,6 @@ def collect_frame_analysis_time_bounds(
             start_ms, end_ms = parse_timestamp_range_ms(clip_range)
         except Exception:
             continue
-        if not max_ms or end_ms > max_ms:
-            max_ms = end_ms
-        if not min_ms or start_ms < min_ms:
-            min_ms = start_ms
         scene = str(segment.get("scene") or "").strip()
         if "切换至" in scene:
             scene = scene.split("切换至")[-1].strip()
@@ -595,6 +639,8 @@ def build_frame_analysis_time_bounds_section(
     frame_json_path: str | None,
     *,
     source_duration_sec: float | None = None,
+    srt_max_ms: int | None = None,
+    srt_min_ms: int = 0,
     max_anchor_rows: int = 28,
 ) -> str:
     """注入蓝图 prompt：原片/抽帧可用时间上限与场景锚点索引。"""
@@ -612,7 +658,7 @@ def build_frame_analysis_time_bounds_section(
     frame_max_label = format_timestamp_ms(max_ms)
     frame_min_label = format_timestamp_ms(min_ms)
     cap_ms = max_ms
-    cap_note = f"抽帧覆盖至 **{frame_max_label}**"
+    cap_note = f"抽帧覆盖 **{frame_min_label}–{frame_max_label}**"
     if source_duration_sec and source_duration_sec > 0:
         video_ms = int(source_duration_sec * 1000)
         cap_ms = min(video_ms, max_ms) if max_ms > 0 else video_ms
@@ -620,7 +666,16 @@ def build_frame_analysis_time_bounds_section(
         cap_label = format_timestamp_ms(cap_ms)
         cap_note = (
             f"原片时长 **{video_label}**；抽帧覆盖 **{frame_min_label}–{frame_max_label}**；"
-            f"**所有 timestamp 结束时间不得超过 {cap_label}**"
+            f"**画面 timestamp 结束时间不得超过 {cap_label}**"
+        )
+    if srt_max_ms and srt_max_ms > 0:
+        srt_max_label = format_timestamp_ms(srt_max_ms)
+        srt_min_label = format_timestamp_ms(max(0, srt_min_ms))
+        dialogue_cap = min(cap_ms, srt_max_ms) if cap_ms else srt_max_ms
+        dialogue_label = format_timestamp_ms(dialogue_cap)
+        cap_note += (
+            f"；SRT 对白覆盖 **{srt_min_label}–{srt_max_label}**；"
+            f"**OST=1 原声 timestamp 结束时间不得超过 {dialogue_label}**"
         )
 
     anchors = bounds.get("anchors") or []
@@ -1486,11 +1541,17 @@ def analyze_subtitle_with_frames(
     source_note = "SRT 字幕文件" if subtitle_source == "srt_file" else "抽帧 JSON 内硬字幕/对位字幕"
     time_bounds_section = ""
     frame_time_bounds: dict[str, Any] = {}
+    srt_time_bounds: dict[str, int] = {"min_ms": 0, "max_ms": 0}
+    if for_plot_blueprint:
+        if has_srt_subtitle:
+            srt_time_bounds = collect_subtitle_time_bounds(srt_text)
     if for_plot_blueprint and json_path:
         frame_time_bounds = collect_frame_analysis_time_bounds(json_path)
         time_bounds_section = build_frame_analysis_time_bounds_section(
             json_path,
             source_duration_sec=source_duration_sec,
+            srt_max_ms=int(srt_time_bounds.get("max_ms") or 0) or None,
+            srt_min_ms=int(srt_time_bounds.get("min_ms") or 0),
         )
     analysis_label = "字幕×抽帧×剧情构思" if for_plot_blueprint else "字幕×抽帧对照分析"
     if for_plot_blueprint:
@@ -1970,6 +2031,8 @@ def analyze_subtitle_with_frames(
                     source_duration_ms=source_duration_ms,
                     frame_max_ms=frame_max_ms,
                     frame_min_ms=frame_min_ms,
+                    srt_max_ms=int(srt_time_bounds.get("max_ms") or 0) or None,
+                    srt_min_ms=int(srt_time_bounds.get("min_ms") or 0),
                     settings=validation_settings,
                     lexicon=frame_lexicon_data,
                     drama_known_names=drama_known_names,

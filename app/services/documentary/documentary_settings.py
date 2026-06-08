@@ -70,11 +70,19 @@ DOCUMENTARY_DEFAULTS: Dict[str, Any] = {
     "dedupe_scene_environment": True,
     # 抽帧 JSON 保存为紧凑单行（无 indent，体积更小）
     "compact_analysis_json": False,
+    # 抽帧落盘时是否剥离 frame_observations.observation / batches 调试字段（默认保留完整 JSON）
+    "compress_frame_analysis_on_save": False,
+    # 抽帧参照图 token 优化：仅首批发送、缩小、多头像拼图
+    "frame_reference_token_saver": True,
+    "frame_reference_attach_mode": "first_batch",
+    "frame_reference_max_edge": 384,
+    "frame_reference_use_collage": True,
     # 抽帧视觉分析：默认不注入剧集人物关系知识库（避免脑补全剧名场面）
     "enable_frame_analysis_drama_knowledge": False,
     # 抽帧 scene_segments 硬性规则：仅可见画面、同批同景合并、跨场景重叠剔除
     "enable_frame_strict_scene_rules": True,
     "frame_cross_scene_overlap_prune_ratio": 0.5,
+    "frame_max_segment_duration_sec": 30,
     "narration_chunk_max_chars": 50000,
     "narration_chunk_max_sections": 30,
     # 单次 LLM 调用可靠输出的 items 上限；分块数以段数容量为下限，仅单块超限时才增块
@@ -235,6 +243,11 @@ DOCUMENTARY_SETTING_KEYS = frozenset(
         "enable_drama_knowledge",
         "enable_frame_strict_scene_rules",
         "frame_cross_scene_overlap_prune_ratio",
+        "frame_max_segment_duration_sec",
+        "frame_reference_token_saver",
+        "frame_reference_attach_mode",
+        "frame_reference_max_edge",
+        "frame_reference_use_collage",
     }
 )
 
@@ -428,14 +441,22 @@ def build_frame_visible_content_hint(
     frame_count: int = 0,
 ) -> str:
     """抽帧视觉分析：仅描述本批次帧内可见内容（硬性）。"""
+    from app.services.documentary.frame_extraction_rules import (
+        resolve_frame_max_segment_duration_sec,
+    )
+
     cfg = settings or get_documentary_settings()
     if cfg.get("enable_frame_strict_scene_rules") is False:
         return ""
     count_text = str(frame_count) if frame_count > 0 else "本批次"
+    max_seg_sec = resolve_frame_max_segment_duration_sec(cfg)
     return (
         f"**仅可见画面（硬性）**：scene_segments 只能描述本批次 {count_text} 张图片中实际可见的内容；"
         "禁止编造未出现在画面中的地点、人物、闪回、航拍、牺牲、追车、仓库突袭等「印象名场面」。"
         "若连续帧为同一地点、同一组人物对话，**本批次只输出 1 条** scene_segment，合并 timestamp 覆盖该对话时段；"
+        f"单条 segment 时长不得超过约 {max_seg_sec} 秒，跨场景须拆成多条；"
+        "**scene 必填**（如「楼顶天台」「审讯室」），禁止留空；"
+        "须填写 shot_scale / lighting_time / edit_role，方便后期选 OST=1 与 picture；"
         "同一批次内 timestamp 不得重叠；不同地点/不同场景不得拆成多条重叠时间段。"
         "人名仅在本批次硬字幕或 SRT 对白摘录中出现过时可写，否则用「未名人员(男/女)」。"
     )
@@ -445,10 +466,11 @@ def build_frame_character_naming_hint(settings: Optional[Dict[str, Any]] = None)
     """视觉分析阶段：人名须有据，无据用未名人员+性别。"""
     cfg = settings or get_documentary_settings()
     hints: list[str] = [
-        "人名/称呼**仅在本批次硬字幕、SRT 对白摘录、scene_segments.subtitle_entries.text 中出现过**时才能写入 observation/action；",
+        "人名/称呼写入顺序：**本批硬字幕/SRT/subtitle_entries** > **本批可见面孔与定妆照匹配** > 关系表谐音校正；",
+        "关系表/关系图**不能**作为「猜谁是画面里的人」的依据；",
         "subtitle_entries 每条 text 即为**原片字幕原文**（含 ASR 错字如「小月」也须原样出现在摘录侧，画面描述侧对照关系表写「胡小跃」）；",
         "摘录中的**全名、小名、昵称、关系称呼**（老叶、小跃、师傅、文妈等）须与字幕原文一致；",
-        f"无法从字幕确认身份时，用「{FRAME_UNKNOWN_CHARACTER_MALE}」「{FRAME_UNKNOWN_CHARACTER_FEMALE}」，"
+        f"无法从本批字幕或可见面孔确认身份时，用「{FRAME_UNKNOWN_CHARACTER_MALE}」「{FRAME_UNKNOWN_CHARACTER_FEMALE}」，"
         f"**禁止**用「领导」「警员」「男子A」等泛称作姓名；",
         "「伟业」是局长人物专属名，勿把与之对话的上级/长辈称为伟业；",
         "硬字幕/SRT 出现「老叶」时写「老叶(男)」，与「伟业(男)」区分两人。",
@@ -1440,7 +1462,11 @@ OST={default_ost} 解说铺垫 → OST=1 原声高潮 → OST={default_ost} 点�
 def build_frame_highlight_hint(settings: Optional[Dict[str, Any]] = None) -> str:
     """视觉分析阶段：标记高能量场面，供后续脚本选用 OST=1。"""
     cfg = settings or get_documentary_settings()
-    hints: list[str] = []
+    hints: list[str] = [
+        "剪辑师标注：激烈冲突、名场面台词、情绪爆发、静默压迫 → edit_role 标「高潮/动作/反应」，"
+        "importance 标「高」，audio_cue 写可听见的原声线索；"
+        "平缓对话/定场 → edit_role「对话/定场」，importance「中/低」。",
+    ]
     if is_fazu2_compact_settings(cfg):
         hints.append(
             "画面描述：人物+动作+场景+可见性别/职级+光线/昼夜/天气+情绪，15–30 字；"
@@ -1448,21 +1474,20 @@ def build_frame_highlight_hint(settings: Optional[Dict[str, Any]] = None) -> str
             "禁止把「领导」当人物姓名；伟业是局长专名，勿与上级混称；性别须据画面判断。"
         )
         hints.append(
-            "若该帧有可作 OST=1 的标志性台词，标注 `[金句原声]` 并摘录对白+字幕时间。"
+            "若该帧有可作 OST=1 的标志性台词，在 audio_cue 标注 `[金句原声]` 并确保 timestamp 对齐字幕。"
         )
     elif is_compact_documentary_settings(cfg):
         hints.append(
-            "写出景别、运镜、构图与人物动作，供解说引用。"
+            "写出景别、运镜、构图与人物动作，供解说 picture 引用。"
         )
     if cfg.get("enable_original_audio_highlights", True):
         hints.append(
-            "若某场景出现爆炸、追逐、尖叫、恐怖、激烈冲突、名场面台词或音效高潮，"
-            "请在 scene_segments 的 audio_cue 中标注，并将 importance 设为「高（高光原声）」。"
+            "爆炸、追逐、尖叫、恐怖、激烈冲突、名场面台词或音效高潮 → audio_cue 须具体写出，importance 为「高」。"
         )
     if cfg.get("enable_action_expression_modifiers", True):
         hints.append(
-            "scene_segments 的 action / emotion / key_visual 须写出人物表情、肢体动作与场景氛围，"
-            "用具体可见的细节帮助后续解说理解画面。"
+            "action / emotion / key_visual 须写出可见表情、肢体与氛围；"
+            "key_visual 同时写清光线+景别+构图，避免空泛「画面紧张」。"
         )
     if cfg.get("enable_logic_roast", True) and not is_compact_documentary_settings(cfg):
         hints.append(

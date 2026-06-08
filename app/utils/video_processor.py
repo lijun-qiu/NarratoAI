@@ -87,7 +87,8 @@ class VideoProcessor:
             }
 
     def extract_frames_by_interval(self, output_dir: str, interval_seconds: float = 5.0,
-                                  use_hw_accel: bool = True) -> List[int]:
+                                  use_hw_accel: bool = True,
+                                  max_duration_seconds: float | None = None) -> List[int]:
         """
         按指定时间间隔提取视频帧
 
@@ -106,7 +107,7 @@ class VideoProcessor:
 
         # 计算起始时间和帧提取点
         start_time = 0
-        end_time = self.duration
+        end_time = self._resolve_extraction_end_time(max_duration_seconds)
         extraction_times = []
 
         current_time = start_time
@@ -185,7 +186,13 @@ class VideoProcessor:
 
         return frame_numbers
 
-    def extract_frames_by_interval_with_fallback(self, output_dir: str, interval_seconds: float = 5.0) -> List[str]:
+    def extract_frames_by_interval_with_fallback(
+        self,
+        output_dir: str,
+        interval_seconds: float = 5.0,
+        *,
+        max_duration_seconds: float | None = None,
+    ) -> List[str]:
         """
         先尝试单次 ffmpeg 快路径抽帧，失败时回退到高兼容方案。
         """
@@ -195,14 +202,33 @@ class VideoProcessor:
         os.makedirs(output_dir, exist_ok=True)
 
         try:
-            return self._extract_frames_fast_path(output_dir, interval_seconds=interval_seconds)
+            return self._extract_frames_fast_path(
+                output_dir,
+                interval_seconds=interval_seconds,
+                max_duration_seconds=max_duration_seconds,
+            )
         except Exception as exc:
             logger.warning(f"快路径抽帧失败，回退到兼容模式: {exc}")
             self._cleanup_fast_path_artifacts(output_dir)
-            self.extract_frames_by_interval_ultra_compatible(output_dir, interval_seconds=interval_seconds)
+            self.extract_frames_by_interval_ultra_compatible(
+                output_dir,
+                interval_seconds=interval_seconds,
+                max_duration_seconds=max_duration_seconds,
+            )
             return self._collect_extracted_frame_paths(output_dir)
 
-    def _extract_frames_fast_path(self, output_dir: str, interval_seconds: float = 5.0) -> List[str]:
+    def _resolve_extraction_end_time(self, max_duration_seconds: float | None) -> float:
+        if max_duration_seconds is None or max_duration_seconds <= 0:
+            return self.duration
+        return min(self.duration, float(max_duration_seconds))
+
+    def _extract_frames_fast_path(
+        self,
+        output_dir: str,
+        interval_seconds: float = 5.0,
+        *,
+        max_duration_seconds: float | None = None,
+    ) -> List[str]:
         """
         使用单次 ffmpeg 命令按固定间隔抽帧，随后重命名为既有 keyframe 约定格式。
         """
@@ -218,15 +244,21 @@ class VideoProcessor:
             "error",
             "-i",
             self.video_path,
-            "-vf",
-            f"fps=1/{interval_seconds}",
-            "-q:v",
-            "2",
-            "-start_number",
-            "0",
-            "-y",
-            raw_pattern,
         ]
+        if max_duration_seconds is not None and max_duration_seconds > 0:
+            cmd.extend(["-t", str(max_duration_seconds)])
+        cmd.extend(
+            [
+                "-vf",
+                f"fps=1/{interval_seconds}",
+                "-q:v",
+                "2",
+                "-start_number",
+                "0",
+                "-y",
+                raw_pattern,
+            ]
+        )
         subprocess.run(cmd, capture_output=True, text=True, check=True, timeout=120)
 
         raw_files = sorted(
@@ -581,7 +613,13 @@ class VideoProcessor:
             logger.error(f"视频处理失败: \n{traceback.format_exc()}")
             raise
 
-    def extract_frames_by_interval_ultra_compatible(self, output_dir: str, interval_seconds: float = 5.0) -> List[int]:
+    def extract_frames_by_interval_ultra_compatible(
+        self,
+        output_dir: str,
+        interval_seconds: float = 5.0,
+        *,
+        max_duration_seconds: float | None = None,
+    ) -> List[int]:
         """
         使用超级兼容性方案按指定时间间隔提取视频帧
         
@@ -599,7 +637,7 @@ class VideoProcessor:
 
         # 计算起始时间和帧提取点
         start_time = 0
-        end_time = self.duration
+        end_time = self._resolve_extraction_end_time(max_duration_seconds)
         extraction_times = []
 
         current_time = start_time

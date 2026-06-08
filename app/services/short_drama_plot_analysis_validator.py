@@ -56,11 +56,21 @@ def _clip_ts_duration_sec(start: str, end: str) -> float:
 
 def _collect_ost1_section_timestamp_durations(text: str) -> list[float]:
     durations: list[float] = []
-    for header in ("## 建议保留原声 OST=1", "## OST=1 金句清单"):
+    for header in (
+        "## 建议保留原声 OST=1",
+        "## OST=1 金句清单",
+        "## 成片叙事顺序方案",
+        "## 开头高潮方案",
+    ):
         section = _extract_section(text, header)
         if not section:
             continue
         for start, end in _CLIP_TS_RANGE_RE.findall(section):
+            if header == "## 成片叙事顺序方案":
+                block_start = max(0, section.find(f"{start}"))
+                block = section[block_start : block_start + 240]
+                if "OST=1" not in block and "OST = 1" not in block:
+                    continue
             durations.append(_clip_ts_duration_sec(start, end))
     return durations
 

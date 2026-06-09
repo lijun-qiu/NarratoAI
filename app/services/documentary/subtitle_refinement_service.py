@@ -69,7 +69,7 @@ def _build_batch_frame_context(batch: dict[str, Any]) -> str:
     if summary:
         lines.append(f"片段摘要：{summary}")
 
-    observations = batch.get("frame_observations") or batch.get("observations") or []
+    observations = batch.get("frame_observations") or []
     batch_segments = batch.get("scene_segments") or []
     segment_subtitle_lines: list[str] = []
     if batch_segments:

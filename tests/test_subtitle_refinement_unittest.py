@@ -78,12 +78,15 @@ class SubtitleRefinementServiceTest(unittest.TestCase):
             with open(analysis_path, "w", encoding="utf-8") as fp:
                 json.dump(
                     {
+                        "artifact_version": "documentary-frame-analysis-v4",
                         "video_path": f"{tmp_dir}/demo.mp4",
+                        "keyframe_cache_key": "test_cache",
                         "batches": [
                             {
                                 "batch_index": 0,
                                 "time_range": "00:00:00,000-00:00:05,000",
                                 "overall_activity_summary": "摘要",
+                                "frame_files": ["keyframe_000000_000000000.jpg"],
                                 "frame_observations": [],
                             }
                         ],

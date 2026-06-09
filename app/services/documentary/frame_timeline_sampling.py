@@ -48,7 +48,7 @@ def parse_timestamp_range_ms(time_range: str) -> tuple[int, int]:
 
 
 def _segment_subtitle_display(segment: dict) -> str:
-    """展示用字幕文本（优先 subtitle 字段，兼容旧 JSON 的 subtitle_entries）。"""
+    """展示用字幕文本（subtitle 字段）。"""
     text = str(segment.get("subtitle") or "").strip()
     if text:
         return text
@@ -405,10 +405,19 @@ def resolve_frame_max_segment_duration_ms(settings: dict | None = None) -> int:
     return max(5_000, int(sec * 1000))
 
 
+def _scene_label_looks_like_person_description(label: str) -> bool:
+    text = str(label or "").strip()
+    if not text:
+        return False
+    if re.search(r"[\(（][男女][\)）]", text):
+        return True
+    return text.startswith("未名人员") or text.startswith("警员")
+
+
 def infer_scene_label_from_segment(segment: dict) -> str:
     """从 observation/action/key_visual 推断 scene 标签（模型漏填 scene 时补全）。"""
     scene = _single_scene_label(str(segment.get("scene") or ""))
-    if scene:
+    if scene and not _scene_label_looks_like_person_description(scene):
         return scene
     for key in ("observation", "key_visual", "action"):
         text = str(segment.get(key) or "").strip()
@@ -420,9 +429,22 @@ def infer_scene_label_from_segment(segment: dict) -> str:
         lead = re.match(r"^([\u4e00-\u9fff]{2,8})[，,]", text)
         if lead:
             candidate = lead.group(1).strip()
-            skip_tokens = ("画面", "镜头", "特写", "两名", "一名", "男子", "女子", "警方", "公安")
+            skip_tokens = (
+                "画面",
+                "镜头",
+                "特写",
+                "两名",
+                "一名",
+                "男子",
+                "女子",
+                "警方",
+                "公安",
+                "未名人员",
+                "警员",
+            )
             if not any(token in candidate for token in skip_tokens):
-                return candidate
+                if not _scene_label_looks_like_person_description(candidate):
+                    return candidate
     return ""
 
 
@@ -969,8 +991,9 @@ def frame_analysis_to_timeline_sampled_markdown(
         return f"错误: 文件 {json_file_path} 不存在"
 
     try:
-        with open(json_file_path, "r", encoding="utf-8") as file:
-            data = json.load(file)
+        from app.services.documentary.frame_analysis_pairing import load_analysis_artifact
+
+        data = load_analysis_artifact(json_file_path)
     except Exception as exc:
         return f"处理JSON文件时出错: {traceback.format_exc() if logger.level('DEBUG') else exc}"
 
@@ -1071,7 +1094,7 @@ def extract_frame_subtitle_lexicon(data: dict) -> dict:
     for batch in data.get("batches") or []:
         if not isinstance(batch, dict):
             continue
-        obs_list = batch.get("frame_observations") or batch.get("observations") or []
+        obs_list = batch.get("frame_observations") or []
         for obs in obs_list:
             if not isinstance(obs, dict):
                 continue
@@ -1109,8 +1132,9 @@ def build_frame_subtitle_lexicon_markdown(
         return "", empty
 
     try:
-        with open(json_file_path, "r", encoding="utf-8") as file:
-            data = json.load(file)
+        from app.services.documentary.frame_analysis_pairing import load_analysis_artifact
+
+        data = load_analysis_artifact(json_file_path)
     except Exception as exc:
         logger.warning(f"读取抽帧字幕索引失败: {exc}")
         return "", empty

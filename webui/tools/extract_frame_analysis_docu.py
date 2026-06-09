@@ -249,7 +249,12 @@ def extract_frame_analysis_docu(
             st.session_state["doc_frame_analysis_file_processed"] = True
             st.session_state["_frame_analysis_synced_video_path"] = params.video_origin_path
             keyframe_count = len(result.get("keyframe_files") or [])
-            logger.info(f"{'测试' if test_mode else ''}抽帧分析完成: {analysis_path}，共 {keyframe_count} 帧")
+            overview = (result.get("analysis_artifact") or {}).get("video_segment_overview") or {}
+            segment_count = int(overview.get("segment_count") or 0)
+            logger.info(
+                f"{'测试' if test_mode else ''}抽帧分析完成: {analysis_path}，"
+                f"共 {keyframe_count} 帧，{segment_count} 个场景片段"
+            )
 
             split_parts = int(st.session_state.get("doc_output_split_parts") or 1)
             if test_mode:
@@ -265,9 +270,15 @@ def extract_frame_analysis_docu(
         progress_bar.progress(100)
         status_text.text("🎉 测试抽帧完成！" if test_mode else "🎉 抽帧分析完成！")
         prefix = "✅ 测试抽帧已保存" if test_mode else "✅ 抽帧分析已保存"
+        overview = (result.get("analysis_artifact") or {}).get("video_segment_overview") or {}
+        narrative_outline = str(overview.get("narrative_outline") or "").strip()
+        segment_count = int(overview.get("segment_count") or 0)
         success_msg = (
-            f"{prefix}: `{os.path.basename(analysis_path)}`（{keyframe_count} 帧）"
+            f"{prefix}: `{os.path.basename(analysis_path)}`（{keyframe_count} 帧"
+            f"{f'，{segment_count} 个场景片段' if segment_count else ''}）"
         )
+        if narrative_outline:
+            success_msg += f"\n\n**片段概览**\n{narrative_outline}"
         if test_mode:
             if test_start > 0:
                 success_msg += (

@@ -1,4 +1,5 @@
 import json
+import os
 import tempfile
 import unittest
 from unittest.mock import patch
@@ -49,9 +50,10 @@ class HardSubtitleOcrServiceTest(unittest.TestCase):
 
     def test_collect_ocr_frames_from_batches(self):
         artifact = {
+            "keyframe_cache_key": "test_cache",
             "batches": [
                 {
-                    "frame_paths": ["/tmp/keyframe_000000_000001000.jpg"],
+                    "frame_files": ["keyframe_000000_000001000.jpg"],
                     "frame_observations": [
                         {"timestamp": "00:00:01,000", "observation": "test"},
                     ],
@@ -97,9 +99,10 @@ class HardSubtitleOcrServiceTest(unittest.TestCase):
 
     def test_extract_ocr_hits_from_artifact(self):
         artifact = {
+            "keyframe_cache_key": "test_cache",
             "batches": [
                 {
-                    "frame_paths": ["/tmp/keyframe_000000_000001000.jpg"],
+                    "frame_files": ["keyframe_000000_000001000.jpg"],
                     "frame_observations": [
                         {
                             "timestamp": "00:00:01,000",
@@ -145,7 +148,10 @@ class HardSubtitleOcrServiceTest(unittest.TestCase):
             OcrFrameHit("a.jpg", 1000, "00:00:01,000", "校正对白", True),
         ]
         with tempfile.TemporaryDirectory() as tmp_dir:
-            frame_path = f"{tmp_dir}/keyframe_000000_000001000.jpg"
+            cache_key = "demo_cache"
+            keyframes_dir = os.path.join(tmp_dir, "keyframes", cache_key)
+            os.makedirs(keyframes_dir, exist_ok=True)
+            frame_path = os.path.join(keyframes_dir, "keyframe_000000_000001000.jpg")
             image = PIL.Image.new("RGB", (640, 360), color=(0, 0, 0))
             image.save(frame_path, format="JPEG")
 
@@ -159,9 +165,11 @@ class HardSubtitleOcrServiceTest(unittest.TestCase):
                 json.dump(
                     {
                         "video_path": f"{tmp_dir}/demo.mp4",
+                        "keyframe_cache_key": cache_key,
+                        "frame_interval_seconds": 2.0,
                         "batches": [
                             {
-                                "frame_paths": [frame_path],
+                                "frame_files": ["keyframe_000000_000001000.jpg"],
                                 "frame_observations": [
                                     {
                                         "timestamp": "00:00:01,000",
@@ -177,11 +185,12 @@ class HardSubtitleOcrServiceTest(unittest.TestCase):
                     ensure_ascii=False,
                 )
             output_path = f"{tmp_dir}/demo_ocr_refined.srt"
-            result = calibrate_subtitle_with_hard_subtitle_ocr(
-                subtitle_path=subtitle_path,
-                analysis_json_path=analysis_path,
-                output_path=output_path,
-            )
+            with patch("app.utils.utils.temp_dir", return_value=tmp_dir):
+                result = calibrate_subtitle_with_hard_subtitle_ocr(
+                    subtitle_path=subtitle_path,
+                    analysis_json_path=analysis_path,
+                    output_path=output_path,
+                )
             self.assertEqual(output_path, result)
             mock_run_async.assert_not_called()
             with open(result, "r", encoding="utf-8") as fp:

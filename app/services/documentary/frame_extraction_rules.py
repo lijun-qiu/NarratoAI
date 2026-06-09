@@ -32,8 +32,8 @@ SCENE_SEGMENT_ALL_FIELDS = SCENE_SEGMENT_CORE_FIELDS + SCENE_SEGMENT_EDITOR_FIEL
 SCENE_SEGMENT_FIELD_COMMENTS: dict[str, str] = {
     "timestamp": "剪辑区间 HH:MM:SS,mmm-HH:MM:SS,mmm，须落在本批次真实时间轴内",
     "scene": "唯一场景地点（如楼顶天台、审讯室）；必填，禁止空",
-    "observation": "本段画面一句话：谁+在哪+做什么+氛围（30–80字；不复述对白）",
-    "action": "可见动作与站位；人物须带性别，如胡小跃(男)握拳逼近",
+    "observation": "本段画面一句话：地点+动作+氛围（30–80字；不复述对白；**不写人名**，人名放 characters）",
+    "action": "可见动作与站位（不写人名；谁在场见 characters 字段）",
     "emotion": "画面情绪张力（压抑、爆发、冷峻、悲怆等）",
     "key_visual": "光线/色调/景别/构图/运镜（如「阴天冷调中景，对称构图，低角度仰拍」）",
     "shot_scale": "景别：远景/全景/中景/近景/特写/大特写",
@@ -97,6 +97,7 @@ def build_frame_scene_segment_spec(*, max_seg_sec: int) -> str:
 - 单条 segment 时长 **≤ {max_seg_sec} 秒**；超长须按场景或动作节点拆分
 - **scene 禁止留空**；同一批次内 timestamp **不得重叠**
 - observation **禁止复述对白**（对白放 subtitle / 硬字幕）；action 写「看得见」的肢体与走位
+- **characters**（数组）：本段/本帧画面内可见人物的规范姓名（面孔匹配后填写）；**禁止**在 observation/action/key_visual 中写 `姓名(男/女)`
 - 可作 OST=1 的对白/冲突场面：`importance` 标「高」，`edit_role` 标「高潮/对话」，`audio_cue` 写关键词
 - key_visual 须含 **至少两项**：光线 + 景别或构图（例：「夜间暖灯近景，浅景深，人物占画面左侧三分线」）"""
 
@@ -129,10 +130,10 @@ def build_frame_observation_spec(*, frame_count: int) -> str:
 
 每条对应**一帧**，按时间顺序输出，**不得遗漏**；**每一帧独立分析**，禁止整批复制同一句：
 - **timestamp**：该帧时间 `HH:MM:SS,mmm`（**须与输入帧文件名时间码一致**，勿从 00:00:00 重计）
-- **observation**：15–40 字，格式建议「[景别] 地点，可见人物(性别)+动作，光线关键词」
-  - **人名**：本帧每张可见脸须**独立**对照定妆照；匹配 → 写 `姓名(男/女)`；脸不可辨/背对 → 写未名人员或暂称
-  - 例：「[特写] 审讯室，胡小跃(男)拍桌，顶光硬阴影」
-  - 例：「[特写] 车顶，秦枫(男)趴伏抓边，夜/室外/冷调」
+- **characters**（数组）：本帧画面内可见人物的规范姓名（须逐脸对照定妆照匹配）；无匹配则不写该项
+- **observation**：15–40 字，格式建议「[景别] 地点，动作/姿态，光线关键词」——**禁止写人名**
+  - 例：「[特写] 审讯室，拍桌质问，顶光硬阴影」，characters: ["胡小跃"]
+  - 例：「[特写] 车顶，趴伏抓边，夜/室外/冷调」，characters: ["秦枫"]
 - 若本帧有硬字幕：另填 JSON 字段 `burned_in_subtitle` / `has_burned_in_subtitle`（**不要**写进 observation 字符串里）
 - **硬字幕 ≠ 本帧说话人**：仅复制文字；谁说话须看本帧嘴型/手势，反应镜/聆听镜勿标「开口说话」
 - 逐帧只写**这一帧**可见内容；相邻帧若画面相同，仍须分别描述细微变化（表情、手势、字幕出现）"""
@@ -163,8 +164,9 @@ def build_frame_extraction_json_skeleton(
     {{
       "timestamp": "00:05:00,000-00:05:03,000",
       "scene": "废弃停车场车顶",
-      "observation": "夜间，秦枫(男)趴伏于行驶中的车顶，神情紧张",
-      "action": "秦枫(男)抓握车顶边缘，车辆高速行驶",
+      "characters": ["秦枫"],
+      "observation": "夜间，趴伏于行驶中的车顶，神情紧张",
+      "action": "抓握车顶边缘，车辆高速行驶",
       "emotion": "紧张",
       "key_visual": "夜/室外/冷调，特写，动态模糊",
       "shot_scale": "特写",
@@ -176,8 +178,9 @@ def build_frame_extraction_json_skeleton(
     {{
       "timestamp": "00:05:04,000-00:05:09,000",
       "scene": "废弃停车场",
-      "observation": "车辆甩尾后，秦枫(男)持枪在停车场内奔跑追捕",
-      "action": "秦枫(男)持枪奔跑，后方警员跟随",
+      "characters": ["秦枫"],
+      "observation": "车辆甩尾后，持枪在停车场内奔跑追捕",
+      "action": "持枪奔跑，后方有人跟随",
       "emotion": "紧迫",
       "key_visual": "夜/室外/冷调，中景，低角度跟拍",
       "shot_scale": "中景",
@@ -188,7 +191,7 @@ def build_frame_extraction_json_skeleton(
   ],
   "frame_observations": [
     {{"timestamp": "00:05:00,000", "observation": "[远景] 废弃停车场，汽车行驶，夜间暗调{burned}"}},
-    {{"timestamp": "00:05:02,000", "observation": "[特写] 车顶，秦枫(男)侧脸，神色凝重{burned}"}}
+    {{"timestamp": "00:05:02,000", "characters": ["秦枫"], "observation": "[特写] 车顶，侧脸凝重{burned}"}}
   ],
   "overall_activity_summary": "本批次：5:00 停车场车辆行驶 → 5:01–5:03 车顶秦枫趴伏 → 5:04 车辆甩尾 → 5:07 秦枫持枪奔跑"
 }}

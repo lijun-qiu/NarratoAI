@@ -7,8 +7,11 @@ from __future__ import annotations
 
 import json
 import os
+import re
 from datetime import datetime
 from typing import Any
+
+from app.utils import utils
 
 from app.services.documentary.documentary_subtitle_enrichment import (
     clean_subtitle_punctuation,
@@ -37,6 +40,7 @@ from app.services.documentary.frame_analysis_pairing import (
 COMPACT_ARTIFACT_VERSION = "documentary-frame-analysis-v3-compact"
 MINIMAL_SCENE_ARTIFACT_VERSION = "documentary-frame-analysis-v3-minimal-scene"
 
+_KEYFRAME_FILENAME_RE = re.compile(r"^keyframe_\d{6}_\d{9}\.jpg$", re.IGNORECASE)
 _SCENE_SEGMENT_SUBTITLE_FIELDS = (
     "subtitle",
     "subtitles",
@@ -61,6 +65,7 @@ MINIMAL_SCENE_SEGMENT_FIELDS = (
 
 _OBSERVATION_FIELDS = (
     "timestamp",
+    "characters",
     "observation",
     "subtitle",
     "subtitle_start",
@@ -72,6 +77,7 @@ _OBSERVATION_FIELDS = (
 
 _METADATA_FIELDS = (
     "video_path",
+    "keyframe_cache_key",
     "frame_interval_seconds",
     "vision_batch_size",
     "vision_llm_provider",
@@ -102,10 +108,11 @@ COMPACT_FIELD_COMMENTS: dict[str, str] = {
     "artifact_version": "精简版 artifact 版本号",
     "compacted_at": "精简导出时间（ISO8601）",
     "source_artifact_path": "来源完整抽帧 JSON 路径",
+    "keyframe_cache_key": "关键帧缓存目录名（配合 frame_files 还原图片路径）",
+    "video_segment_overview": "全片片段概览：段数、时间跨度、各段摘要",
     "scene_segments": "全片场景片段列表（脚本生成主用）",
     "frame_observations": "逐帧观察（字幕校准时可选）",
-    "overall_activity_summaries": "各批次活动摘要",
-    "batches": "批次索引与时间范围（无 raw_response / frame_paths）",
+    "batches": "批次索引与时间范围（含 frame_files，无 raw_response）",
     "batch_index": "批次序号，从 0 起",
     "time_range": "scene_segments：subtitle_entries 首尾对位；batches：批次覆盖的时间范围",
     "status": "批次分析状态（success / failed）",
@@ -148,6 +155,125 @@ def slim_scene_segment_core(segment: dict[str, Any]) -> dict[str, str]:
         "action": str(segment.get("action") or "").strip(),
         "emotion": str(segment.get("emotion") or "").strip(),
         "key_visual": str(segment.get("key_visual") or "").strip(),
+    }
+
+
+def keyframe_basename(path: str) -> str:
+    """关键帧路径 → 文件名（keyframe_HHMMSS_mmmmmm.jpg）。"""
+    name = os.path.basename(str(path or "").replace("\\", "/"))
+    if _KEYFRAME_FILENAME_RE.fullmatch(name):
+        return name
+    return name if name else ""
+
+
+def resolve_keyframe_cache_dir(artifact: dict[str, Any]) -> str:
+    cache_key = str(artifact.get("keyframe_cache_key") or "").strip()
+    if not cache_key:
+        return ""
+    return os.path.join(utils.temp_dir(), "keyframes", cache_key)
+
+
+def resolve_frame_file_path(artifact: dict[str, Any], filename: str) -> str:
+    """由 artifact 缓存目录 + 文件名还原绝对路径。"""
+    basename = keyframe_basename(filename)
+    if not basename:
+        return ""
+    if os.path.isabs(filename) and os.path.isfile(filename):
+        return filename
+    cache_dir = resolve_keyframe_cache_dir(artifact)
+    if not cache_dir:
+        return ""
+    candidate = os.path.join(cache_dir, basename)
+    return candidate if os.path.isfile(candidate) else ""
+
+
+def resolve_batch_frame_files(
+    artifact: dict[str, Any],
+    batch: dict[str, Any],
+) -> list[str]:
+    """从 frame_files + keyframe_cache_key 还原批次关键帧绝对路径列表。"""
+    files = [str(name) for name in (batch.get("frame_files") or []) if str(name).strip()]
+    if not files:
+        return []
+    resolved = [resolve_frame_file_path(artifact, name) for name in files]
+    return [path for path in resolved if path and os.path.isfile(path)]
+
+
+def compact_frame_storage_in_artifact(artifact: dict[str, Any]) -> None:
+    """规范化 frame_files 短文件名，剥离已废弃的 frame_paths / frame_path 字段。"""
+    if not isinstance(artifact, dict):
+        return
+
+    for batch in artifact.get("batches") or []:
+        if not isinstance(batch, dict):
+            continue
+        files = [str(name) for name in (batch.get("frame_files") or []) if str(name).strip()]
+        if files:
+            batch["frame_files"] = [keyframe_basename(name) for name in files if keyframe_basename(name)]
+        batch.pop("frame_paths", None)
+
+    for observation in artifact.get("frame_observations") or []:
+        if isinstance(observation, dict):
+            observation.pop("frame_path", None)
+
+    for batch in artifact.get("batches") or []:
+        if not isinstance(batch, dict):
+            continue
+        for observation in batch.get("frame_observations") or []:
+            if isinstance(observation, dict):
+                observation.pop("frame_path", None)
+        batch.pop("frame_paths", None)
+
+
+def build_video_segment_overview(artifact: dict[str, Any]) -> dict[str, Any]:
+    """抽帧完成后：汇总全片片段数量与各段剧情摘要，便于快速理解视频结构。"""
+    segments = artifact.get("scene_segments")
+    if not isinstance(segments, list):
+        segments = []
+    segments = [segment for segment in segments if isinstance(segment, dict)]
+    if not segments:
+        return {}
+
+    ordered = sorted(segments, key=lambda item: str(item.get("timestamp") or ""))
+    overview_items: list[dict[str, Any]] = []
+    outline_parts: list[str] = []
+
+    for index, segment in enumerate(ordered, start=1):
+        timestamp = str(segment.get("timestamp") or "").strip()
+        scene = str(segment.get("scene") or "").strip() or "未标场景"
+        summary = resolve_scene_segment_observation(segment)
+        if not summary:
+            summary = str(segment.get("action") or "").strip()
+        summary = summary[:160]
+        overview_items.append(
+            {
+                "index": index,
+                "timestamp": timestamp,
+                "scene": scene,
+                "summary": summary,
+            }
+        )
+        time_label = timestamp.split("-", 1)[0].strip() if timestamp else ""
+        snippet = summary[:72] + ("…" if len(summary) > 72 else "")
+        outline_parts.append(f"#{index} {time_label} {scene}：{snippet}")
+
+    first_range = str(ordered[0].get("timestamp") or "").strip()
+    last_range = str(ordered[-1].get("timestamp") or "").strip()
+    if first_range and last_range:
+        start_label = first_range.split("-", 1)[0].strip()
+        end_label = last_range.split("-", 1)[-1].strip()
+        time_span = f"{start_label}-{end_label}" if start_label and end_label else first_range
+    else:
+        time_span = first_range or last_range
+
+    return {
+        "segment_count": len(overview_items),
+        "time_span": time_span,
+        "segments": overview_items,
+        "narrative_outline": (
+            f"全片共 {len(overview_items)} 个片段："
+            + " → ".join(outline_parts)
+        ),
     }
 
 
@@ -264,7 +390,7 @@ def _collect_top_level_observations(artifact: dict[str, Any]) -> list[dict[str, 
     for batch in artifact.get("batches") or []:
         if not isinstance(batch, dict):
             continue
-        for observation in batch.get("frame_observations") or batch.get("observations") or []:
+        for observation in batch.get("frame_observations") or []:
             if isinstance(observation, dict):
                 payload = dict(observation)
                 payload.setdefault("batch_index", batch.get("batch_index"))
@@ -327,16 +453,6 @@ def rebuild_batches_from_artifact(artifact: dict[str, Any]) -> list[dict[str, An
             }
         )
 
-    for summary in artifact.get("overall_activity_summaries") or []:
-        if not isinstance(summary, dict):
-            continue
-        batch_index = int(summary.get("batch_index", 0))
-        if batch_index not in time_range_by_batch:
-            time_range_by_batch[batch_index] = str(summary.get("time_range") or "")
-        text = str(summary.get("summary") or "").strip()
-        if text:
-            summaries_by_batch[batch_index] = text
-
     batch_indices = sorted(
         set(time_range_by_batch.keys())
         | set(segments_by_batch.keys())
@@ -371,7 +487,7 @@ def compact_analysis_artifact(
     """
     将完整抽帧分析 JSON 整理为精简版。
 
-    移除：raw_response、frame_paths、批次内重复 scene_segments/frame_observations、fallback_summary 等。
+    移除：raw_response、批次内重复 scene_segments/frame_observations、fallback_summary 等。
     """
     if not is_valid_analysis_artifact(artifact):
         raise ValueError("无效的抽帧分析 artifact")
@@ -394,10 +510,9 @@ def compact_analysis_artifact(
     if source_path:
         compact["source_artifact_path"] = os.path.abspath(source_path)
 
-    if include_summaries:
-        summaries = artifact.get("overall_activity_summaries")
-        if isinstance(summaries, list) and summaries:
-            compact["overall_activity_summaries"] = summaries
+    overview = artifact.get("video_segment_overview")
+    if include_summaries and isinstance(overview, dict) and overview:
+        compact["video_segment_overview"] = overview
 
     if include_frame_observations:
         compact["frame_observations"] = [
@@ -406,15 +521,25 @@ def compact_analysis_artifact(
         ]
 
     if include_batch_index:
-        compact["batches"] = [
-            {
+        compact_batches: list[dict[str, Any]] = []
+        for batch in (artifact.get("batches") or []):
+            if not isinstance(batch, dict):
+                continue
+            slim_batch: dict[str, Any] = {
                 "batch_index": int(batch.get("batch_index", 0)),
                 "time_range": str(batch.get("time_range") or ""),
                 "status": str(batch.get("status") or "success"),
             }
-            for batch in (artifact.get("batches") or [])
-            if isinstance(batch, dict)
-        ]
+            if keep_batch_meta:
+                frame_files = [
+                    str(name)
+                    for name in (batch.get("frame_files") or [])
+                    if str(name).strip()
+                ]
+                if frame_files:
+                    slim_batch["frame_files"] = frame_files
+            compact_batches.append(slim_batch)
+        compact["batches"] = compact_batches
         if not compact["batches"]:
             compact["batches"] = [
                 {
@@ -495,13 +620,35 @@ def normalize_analysis_artifact_storage(
 
         segments_by_batch: dict[int, list[dict[str, Any]]] = {}
         for segment in ordered:
+            if "batch_index" not in segment:
+                continue
             batch_index = int(segment.get("batch_index", 0))
             segments_by_batch.setdefault(batch_index, []).append(segment)
         for batch in artifact.get("batches") or []:
             if not isinstance(batch, dict):
                 continue
             batch_index = int(batch.get("batch_index", 0))
+            if str(batch.get("status") or "").lower() != "success":
+                batch["scene_segments"] = []
+                batch["frame_observations"] = []
+                batch.pop("raw_response", None)
+                batch.pop("fallback_summary", None)
+                continue
             batch["scene_segments"] = segments_by_batch.get(batch_index, [])
+
+    for batch in artifact.get("batches") or []:
+        if not isinstance(batch, dict):
+            continue
+        if str(batch.get("status") or "").lower() != "success":
+            batch.pop("raw_response", None)
+            batch.pop("scene_segments", None)
+            batch.pop("frame_observations", None)
+            batch.pop("fallback_summary", None)
+
+    compact_frame_storage_in_artifact(artifact)
+    overview = build_video_segment_overview(artifact)
+    if overview:
+        artifact["video_segment_overview"] = overview
 
     return artifact
 
@@ -525,15 +672,23 @@ def strip_frame_analysis_debug_payload(
     for batch in artifact.get("batches") or []:
         if not isinstance(batch, dict):
             continue
-        if str(batch.get("status") or "").lower() == "success":
+        status = str(batch.get("status") or "").lower()
+        if status == "success":
             batch.pop("raw_response", None)
-            batch.pop("frame_paths", None)
+            batch.pop("fallback_summary", None)
+            batch.pop("error_message", None)
+            # frame_files + keyframe_cache_key 保留，供 OCR / 重跑批次还原路径
+        else:
+            batch.pop("raw_response", None)
+            batch.pop("scene_segments", None)
+            batch.pop("frame_observations", None)
+            batch.pop("fallback_summary", None)
         batch.pop("subtitle", None)
         batch.pop("subtitle_entries", None)
         batch.pop("subtitle_excerpt", None)
         if has_scene_segments:
             batch.pop("frame_observations", None)
-            batch.pop("observations", None)
+            batch.pop("scene_segments", None)
 
     if has_scene_segments:
         slim_observations: list[dict[str, Any]] = []

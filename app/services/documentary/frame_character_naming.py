@@ -1,7 +1,7 @@
 #!/usr/bin/env python
 # -*- coding: UTF-8 -*-
 
-"""抽帧人名：仅定妆照/头像面孔精准匹配可写规范姓名，禁止凭字幕猜人。"""
+"""抽帧人名：定妆照/头像面孔对照匹配（约70%相似）可写规范姓名，禁止凭字幕猜人。"""
 
 from __future__ import annotations
 
@@ -11,6 +11,7 @@ from typing import Any
 from loguru import logger
 
 from app.services.documentary.documentary_settings import (
+    FRAME_FACE_MATCH_SIMILARITY_HINT,
     FRAME_UNKNOWN_CHARACTER_FEMALE,
     FRAME_UNKNOWN_CHARACTER_MALE,
 )
@@ -84,9 +85,10 @@ def build_frame_naming_priority_rules(
 ) -> str:
     """抽帧写人名的优先级：仅面孔匹配，禁止字幕猜人。"""
     lines = [
-        "## 人名写入规则（硬性 · 仅头像/定妆照面孔匹配）",
-        "1. **唯一依据**：本帧/本批关键帧中**脸/侧脸清晰可见**，且与已上传**定妆照/头像**一致 → **必须**写对应规范姓名 `姓名(男/女)`，"
-        "**禁止**用便衣男/年轻男子/警员等代称代替；",
+        "## 人名写入规则（硬性 · 头像/定妆照面孔对照匹配）",
+        f"1. **唯一依据**：本帧/本批关键帧中**脸/侧脸清晰可见**，且与已上传**定妆照/头像**对照匹配（{FRAME_FACE_MATCH_SIMILARITY_HINT}）"
+        " → **必须**在 **characters** 字段写规范姓名，"
+        "**禁止**在 observation/action 写人名，**禁止**用便衣男/年轻男子/警员等代称代替；",
         "2. **硬字幕/SRT/subtitle_entries 中的姓名、称呼、关系词**（如「二师兄」「老叶」「秦枫」台词）"
         "**不得**用于推断画面人物身份，仅作对白摘录；",
         "3. **人物关系表** 仅用于已写入姓名的**谐音校正**（秦峰→秦枫），"
@@ -105,7 +107,7 @@ def build_frame_naming_priority_rules(
         )
     if has_character_references:
         lines.append(
-            "- 勾选头像**不是**默认全员在场：每一规范姓名须对应本批某帧可见面孔与参照图一致。"
+            f"- 勾选头像**不是**默认全员在场：每一规范姓名须对应本批某帧可见面孔与参照图达到相似度阈值（{FRAME_FACE_MATCH_SIMILARITY_HINT}）。"
         )
     if is_carryover_batch:
         lines.append(
@@ -134,8 +136,9 @@ def build_frame_face_match_batch_hint(
             "## 定妆照逐脸对照（硬性 · 写规范姓名的唯一途径）",
             f"参照图从左到右依次为：{numbered}。",
             f"**逐帧独立对照**：{frame_hint}，**每一帧分别**查看可见面孔并对照参照图；"
-            "该帧匹配成功 → 在该帧 observation 写 `姓名(男/女)`，**禁止**用整批统一代称敷衍；",
-            "本批关键帧中**脸/侧脸清晰可见**时，须**逐脸对照参照图**；匹配成功 → **必须**写 `姓名(男)` 或 `姓名(女)`；",
+            "该帧匹配成功 → 在该帧 **characters** 数组写规范姓名，**禁止**在 observation 写人名；",
+            f"本批关键帧中**脸/侧脸清晰可见**时，须**逐脸对照参照图**（{FRAME_FACE_MATCH_SIMILARITY_HINT}）；"
+            "匹配成功 → **必须**写 `姓名(男)` 或 `姓名(女)`；",
             "**禁止**在脸已清晰可辨时仍用「便衣男(男)」「年轻男子(男)」「警服警官(男)」「警员(男)」等代称敷衍；",
             "仅当脸不可辨、背对镜头、远景模糊、或确实无法与任一头像匹配时，"
             f"才写带服装特征的暂称或「{FRAME_UNKNOWN_CHARACTER_MALE}」「{FRAME_UNKNOWN_CHARACTER_FEMALE}」；",
@@ -282,6 +285,12 @@ def collect_face_identified_names_from_frames(
     for frame in frames:
         if not isinstance(frame, dict):
             continue
+        chars = frame.get("characters")
+        if isinstance(chars, list):
+            for name in chars:
+                cleaned = _canonical_for_name(str(name).strip())
+                if cleaned and (not ref_names or cleaned in ref_names):
+                    found.add(cleaned)
         obs = str(frame.get("observation") or "")
         for name in ref_names:
             if f"{name}(男)" in obs or f"{name}(女)" in obs:
@@ -294,9 +303,16 @@ def collect_face_identified_names_from_frames(
 
 def count_face_name_mentions_in_frames(name: str, frames: list[dict[str, Any]]) -> int:
     count = 0
+    canonical = _canonical_for_name(name)
     for frame in frames:
         if not isinstance(frame, dict):
             continue
+        chars = frame.get("characters")
+        if isinstance(chars, list):
+            for item in chars:
+                if _canonical_for_name(str(item).strip()) == canonical:
+                    count += 1
+                    break
         obs = str(frame.get("observation") or "")
         if f"{name}(男)" in obs or f"{name}(女)" in obs:
             count += obs.count(f"{name}(男)") + obs.count(f"{name}(女)")
@@ -488,8 +504,275 @@ def _process_face_gated_batch(
         )
         if updated != obs:
             frame["observation"] = updated
+        chars = frame.get("characters")
+        if isinstance(chars, list):
+            kept = [
+                _canonical_for_name(str(name).strip())
+                for name in chars
+                if str(name).strip()
+                and is_character_name_face_backed(_canonical_for_name(str(name).strip()), reliable)
+            ]
+            if kept:
+                frame["characters"] = sorted(set(kept))
+            else:
+                frame.pop("characters", None)
 
     return total_removed
+
+
+_ROLE_LABEL_WITH_GENDER_RE = re.compile(
+    r"(?:未名人员|(?:另)?一?名?警员|年轻警员|黄衣男子|男子|女子|"
+    + "|".join(re.escape(label) for label in _GENERIC_FACE_ROLE_LABELS)
+    + r")[\(（][男女不明][\)）]"
+)
+_PERSON_IN_SCENE_LABEL_RE = re.compile(r"[\(（][男女][\)）]")
+
+
+def _clean_descriptive_text_punctuation(text: str) -> str:
+    updated = (text or "").strip()
+    if not updated:
+        return ""
+    updated = re.sub(r"[，,]{2,}", "，", updated)
+    updated = re.sub(r"，\s*，", "，", updated)
+    updated = re.sub(r"^[\s，,；;]+", "", updated)
+    updated = re.sub(r"[\s，,；;]+$", "", updated)
+    return updated.strip()
+
+
+def extract_character_names_from_text(
+    text: str,
+    *,
+    ref_names: set[str] | None = None,
+) -> list[str]:
+    """从带性别标记的文本中提取规范人名（不含未名人员/代称）。"""
+    found: list[str] = []
+    for match in _NAMED_WITH_GENDER_RE.finditer(text or ""):
+        canonical = _canonical_for_name(match.group(1))
+        if not canonical or canonical == "未名人员" or "未名" in canonical:
+            continue
+        if ref_names is not None and canonical not in ref_names:
+            continue
+        if canonical not in found:
+            found.append(canonical)
+    return found
+
+
+def strip_character_tokens_from_descriptive_text(
+    text: str,
+    *,
+    ref_names: set[str] | None = None,
+) -> str:
+    """从场景/动作描述中移除人名与带性别代称，仅保留环境与动作信息。"""
+    updated = (text or "").strip()
+    if not updated:
+        return ""
+
+    updated = _NAMED_WITH_GENDER_RE.sub("", updated)
+    updated = _ROLE_LABEL_WITH_GENDER_RE.sub("", updated)
+
+    if ref_names:
+        for name in sorted(ref_names, key=len, reverse=True):
+            updated = re.sub(
+                rf"(?<![\u4e00-\u9fff]){re.escape(name)}(?![\u4e00-\u9fff])",
+                "",
+                updated,
+            )
+
+    updated = re.sub(
+        r"(身着警服的|身穿警服的|身穿棕色夹克的|穿警服的)",
+        "",
+        updated,
+    )
+    return _clean_descriptive_text_punctuation(updated)
+
+
+def populate_frame_characters_from_observation(
+    frame: dict[str, Any],
+    *,
+    ref_names: set[str] | None = None,
+) -> None:
+    """逐帧：从 observation 提取人名写入 characters，并从描述中剥离人名。"""
+    if not isinstance(frame, dict):
+        return
+    obs = str(frame.get("observation") or "")
+    names = extract_character_names_from_text(obs, ref_names=ref_names)
+    if names:
+        frame["characters"] = names
+    stripped = strip_character_tokens_from_descriptive_text(obs, ref_names=ref_names)
+    if stripped:
+        frame["observation"] = stripped
+    elif obs:
+        frame.pop("observation", None)
+
+
+def separate_characters_from_segment_fields(
+    segment: dict[str, Any],
+    *,
+    ref_names: set[str] | None = None,
+) -> None:
+    """segment：汇总 characters 字段，并从 observation/action/key_visual 剥离人名。"""
+    if not isinstance(segment, dict):
+        return
+
+    names: list[str] = []
+    existing = segment.get("characters")
+    if isinstance(existing, list):
+        names.extend(str(name).strip() for name in existing if str(name).strip())
+    elif isinstance(existing, str) and existing.strip():
+        names.extend(
+            part.strip()
+            for part in re.split(r"[、,，/]", existing)
+            if part.strip()
+        )
+
+    for key in ("observation", "action", "key_visual"):
+        for name in extract_character_names_from_text(
+            str(segment.get(key) or ""),
+            ref_names=ref_names,
+        ):
+            if name not in names:
+                names.append(name)
+
+    if names:
+        segment["characters"] = sorted(set(names))
+    else:
+        segment.pop("characters", None)
+
+    for key in ("observation", "action", "key_visual"):
+        value = str(segment.get(key) or "").strip()
+        if not value:
+            continue
+        stripped = strip_character_tokens_from_descriptive_text(value, ref_names=ref_names)
+        if stripped:
+            segment[key] = stripped
+        else:
+            segment.pop(key, None)
+
+
+def normalize_person_as_scene_label(segment: dict[str, Any]) -> None:
+    """scene 误填为人物描述时，改回地点标签。"""
+    if not isinstance(segment, dict):
+        return
+    scene = str(segment.get("scene") or "").strip()
+    if not scene or not _PERSON_IN_SCENE_LABEL_RE.search(scene):
+        return
+    from app.services.documentary.frame_timeline_sampling import infer_scene_label_from_segment
+
+    inferred = infer_scene_label_from_segment(segment)
+    if inferred and not _PERSON_IN_SCENE_LABEL_RE.search(inferred):
+        segment["scene"] = inferred
+    else:
+        segment.pop("scene", None)
+
+
+def apply_character_field_separation_to_artifact(artifact: dict[str, Any]) -> None:
+    """整份 artifact：人名进 characters 字段，描述文本不再含人名。"""
+    if not isinstance(artifact, dict):
+        return
+
+    ref_names = {
+        str(item.get("name") or "").strip()
+        for item in (artifact.get("character_references") or [])
+        if isinstance(item, dict) and str(item.get("name") or "").strip()
+    }
+    ref_set = ref_names or None
+
+    all_frames: list[dict[str, Any]] = []
+    for observation in artifact.get("frame_observations") or []:
+        if isinstance(observation, dict):
+            all_frames.append(observation)
+    for batch in artifact.get("batches") or []:
+        if not isinstance(batch, dict):
+            continue
+        for observation in batch.get("frame_observations") or []:
+            if isinstance(observation, dict):
+                all_frames.append(observation)
+
+    for frame in all_frames:
+        populate_frame_characters_from_observation(frame, ref_names=ref_set)
+
+    all_segments: list[dict[str, Any]] = []
+    for segment in artifact.get("scene_segments") or []:
+        if isinstance(segment, dict):
+            all_segments.append(segment)
+    for batch in artifact.get("batches") or []:
+        if not isinstance(batch, dict):
+            continue
+        for segment in batch.get("scene_segments") or []:
+            if isinstance(segment, dict) and segment not in all_segments:
+                all_segments.append(segment)
+
+    for segment in all_segments:
+        separate_characters_from_segment_fields(segment, ref_names=ref_set)
+        normalize_person_as_scene_label(segment)
+
+
+def reconcile_segment_observation_action_names(segment: dict[str, Any]) -> None:
+    """当 observation 已写出真名而 action 仍用未名人员作主语时，对齐主语。"""
+    if not isinstance(segment, dict):
+        return
+    observation = str(segment.get("observation") or "")
+    action = str(segment.get("action") or "")
+    if not observation or not action or "未名人员" not in action:
+        return
+
+    primary = ""
+    gender = "男"
+    for match in _NAMED_WITH_GENDER_RE.finditer(observation):
+        candidate = _canonical_for_name(match.group(1))
+        if not candidate or candidate == "未名人员" or "未名" in candidate:
+            continue
+        primary = candidate
+        gender_match = re.search(r"[\(（]([男女])[\)）]", match.group(2))
+        gender = gender_match.group(1) if gender_match else "男"
+        break
+    if not primary or primary not in observation:
+        return
+    updated = re.sub(
+        r"未名人员\([男女]\)",
+        f"{primary}({gender})",
+        action,
+        count=1,
+    )
+    if updated != action:
+        segment["action"] = updated
+
+
+def populate_segment_characters_from_batch(
+    segments: list[dict[str, Any]],
+    *,
+    frame_observations: list[dict[str, Any]],
+    reference_names: set[str] | None = None,
+) -> None:
+    """从 observation/action 与可靠面孔匹配结果回填 segment.characters。"""
+    ref_names = reference_names or set()
+    reliable = (
+        collect_reliable_face_identified_names(frame_observations, ref_names)
+        if ref_names
+        else set()
+    )
+
+    for segment in segments:
+        if not isinstance(segment, dict):
+            continue
+        texts = [
+            str(segment.get("observation") or ""),
+            str(segment.get("action") or ""),
+            str(segment.get("key_visual") or ""),
+        ]
+        combined = "\n".join(texts)
+        names = extract_canonical_names_from_text(combined, known_names=ref_names or None)
+        if reliable:
+            names = {name for name in names if name in reliable}
+            names.update(
+                name
+                for name in reliable
+                if any(name in text for text in texts)
+            )
+        elif names and ref_names:
+            names = {name for name in names if name in ref_names}
+        if names:
+            segment["characters"] = sorted(names)
 
 
 def apply_face_gated_names_to_artifact(artifact: dict[str, Any]) -> None:
@@ -543,35 +826,8 @@ def apply_face_gated_names_to_artifact(artifact: dict[str, Any]) -> None:
             if updated != value:
                 batch[key] = updated
 
-    for summary in artifact.get("overall_activity_summaries") or []:
-        if not isinstance(summary, dict):
-            continue
-        batch_index = int(summary.get("batch_index", 0))
-        frames = obs_by_batch.get(batch_index, [])
-        reliable = collect_reliable_face_identified_names(frames, ref_names)
-        value = str(summary.get("summary") or "")
-        if not value:
-            continue
-        updated = strip_unreliable_names_in_text(
-            value,
-            reliable_faces=reliable,
-            ref_names=ref_names,
-        )
-        if updated != value:
-            summary["summary"] = updated
-
     if total_removed:
         logger.info(f"抽帧 artifact：已移除 {total_removed} 条无面孔匹配依据的 characters 人名")
-
-
-def apply_subtitle_gated_names_to_artifact(artifact: dict[str, Any]) -> None:
-    """兼容旧名：抽帧已改为仅面孔匹配，转发至 apply_face_gated_names_to_artifact。"""
-    apply_face_gated_names_to_artifact(artifact)
-
-
-def apply_subtitle_alias_normalization_to_artifact(artifact: dict[str, Any]) -> None:
-    """抽帧阶段禁用：不因字幕简称（老叶等）归并人名。"""
-    return
 
 
 def extract_canonical_names_from_text(
@@ -741,3 +997,45 @@ def apply_obvious_character_relationships_to_artifact(artifact: dict[str, Any]) 
 
     if enriched:
         logger.info(f"抽帧 artifact：已为 {enriched} 条 segment 补充明显人物关系")
+
+
+def apply_segment_character_consistency_to_artifact(artifact: dict[str, Any]) -> None:
+    """回填 characters，并将人名从描述文本分离到 characters 字段。"""
+    if not isinstance(artifact, dict):
+        return
+
+    ref_names = {
+        str(item.get("name") or "").strip()
+        for item in (artifact.get("character_references") or [])
+        if isinstance(item, dict) and str(item.get("name") or "").strip()
+    }
+
+    obs_by_batch: dict[int, list[dict[str, Any]]] = {}
+    for observation in artifact.get("frame_observations") or []:
+        if not isinstance(observation, dict):
+            continue
+        batch_index = int(observation.get("batch_index", 0))
+        obs_by_batch.setdefault(batch_index, []).append(observation)
+
+    all_segments: list[dict[str, Any]] = []
+    for segment in artifact.get("scene_segments") or []:
+        if isinstance(segment, dict):
+            all_segments.append(segment)
+
+    for batch in artifact.get("batches") or []:
+        if not isinstance(batch, dict):
+            continue
+        for segment in batch.get("scene_segments") or []:
+            if isinstance(segment, dict) and segment not in all_segments:
+                all_segments.append(segment)
+
+    for segment in all_segments:
+        batch_index = int(segment.get("batch_index", 0))
+        frames = obs_by_batch.get(batch_index, [])
+        populate_segment_characters_from_batch(
+            [segment],
+            frame_observations=frames,
+            reference_names=ref_names,
+        )
+
+    apply_character_field_separation_to_artifact(artifact)

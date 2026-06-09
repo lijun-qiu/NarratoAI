@@ -48,6 +48,14 @@ def _clear_calibration_frame_analysis_path() -> None:
 def _import_frame_analysis_file(tr, analysis_file) -> None:
     try:
         payload = json.loads(analysis_file.getvalue().decode("utf-8"))
+        from app.services.documentary.frame_analysis_pairing import (
+            _LEGACY_ARTIFACT_ERROR,
+            is_legacy_analysis_artifact,
+        )
+
+        if is_legacy_analysis_artifact(payload):
+            st.error(_LEGACY_ARTIFACT_ERROR)
+            st.stop()
         if not is_valid_analysis_artifact(payload):
             st.error("无效的抽帧分析 JSON：缺少 scene_segments / batches / frame_observations")
             st.stop()

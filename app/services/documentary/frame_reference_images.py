@@ -92,13 +92,13 @@ def build_reference_carryover_prompt(
     work = (drama_label or "本剧").strip()
     lines = [
         "## 视觉参照沿用（本批不再重复发送参照图）",
-        f"首批已提供 **{work}** 人物定妆照；本批写规范姓名仍须**对照该批关键帧可见面孔**与首批参照一致。",
+        f"首批已提供 **{work}** 人物定妆照；本批写规范姓名仍须**对照该批关键帧可见面孔**与首批参照达到约70%面部相似度。",
     ]
     if relationship_diagram_attached:
         lines.append("- 关系图仅作谐音/关系**校正**，不可凭关系图猜人")
     if names:
         lines.append(
-            f"- 定妆照人物（{ '、'.join(names) }）须面孔匹配后才可写规范名；"
+            f"- 定妆照人物（{ '、'.join(names) }）须面孔相似度约70%以上匹配后才可写规范名；"
             f"硬字幕/SRT 称呼（二师兄、老叶等）**不得**猜人"
         )
     lines.append(f"- 无依据时用「{FRAME_UNKNOWN_CHARACTER_MALE}」「{FRAME_UNKNOWN_CHARACTER_FEMALE}」")

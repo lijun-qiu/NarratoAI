@@ -40,9 +40,9 @@ def parse_frame_analysis_to_markdown(json_file_path, *, detail_level: str = "ful
         return f"错误: 文件 {json_file_path} 不存在"
     
     try:
-        # 读取JSON文件
-        with open(json_file_path, 'r', encoding='utf-8') as file:
-            data = json.load(file)
+        from app.services.documentary.frame_analysis_pairing import load_analysis_artifact
+
+        data = load_analysis_artifact(json_file_path)
         
         def time_to_milliseconds(time_text):
             time_text = (time_text or "").strip()
@@ -130,7 +130,15 @@ def parse_frame_analysis_to_markdown(json_file_path, *, detail_level: str = "ful
                     or batch.get("fallback_summary")
                     or ""
                 )
-                observations = batch.get("frame_observations") or batch.get("observations") or []
+                batch_index = int(batch.get("batch_index", i - 1))
+                observations = list(batch.get("frame_observations") or [])
+                if not observations:
+                    observations = [
+                        frame
+                        for frame in (data.get("frame_observations") or [])
+                        if isinstance(frame, dict)
+                        and int(frame.get("batch_index", 0)) == batch_index
+                    ]
 
                 markdown += f"## 片段 {i}\n"
                 markdown += f"- 时间范围：{time_range}\n"
@@ -163,38 +171,6 @@ def parse_frame_analysis_to_markdown(json_file_path, *, detail_level: str = "ful
                 markdown += "\n"
 
             return markdown
-
-        # 兼容旧结构
-        summaries = data.get('overall_activity_summaries', [])
-        frame_observations = data.get('frame_observations', [])
-
-        batch_frames = {}
-        for frame in frame_observations:
-            batch_index = frame.get('batch_index')
-            if batch_index not in batch_frames:
-                batch_frames[batch_index] = []
-            batch_frames[batch_index].append(frame)
-
-        for i, summary in enumerate(summaries, 1):
-            batch_index = summary.get('batch_index')
-            time_range = summary.get('time_range', '')
-            batch_summary = summary.get('summary', '')
-
-            markdown += f"## 片段 {i}\n"
-            markdown += f"- 时间范围：{time_range}\n"
-            markdown += f"- 片段描述：{batch_summary}\n" if batch_summary else f"- 片段描述：\n"
-            frames = batch_frames.get(batch_index, [])
-            if compact:
-                markdown += "- 详细描述：（已压缩；请以片段描述为主，首尾帧采样如下）\n"
-                markdown += format_sample_frames(frames)
-            else:
-                markdown += "- 详细描述：\n"
-                for frame in frames:
-                    timestamp = frame.get('timestamp', '')
-                    observation = frame.get('observation', '')
-                    markdown += f"  - {timestamp}: {observation}\n" if observation else f"  - {timestamp}: \n"
-
-            markdown += "\n"
 
         return markdown
     

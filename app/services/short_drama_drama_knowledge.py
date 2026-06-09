@@ -376,7 +376,7 @@ def apply_name_corrections_to_frame_analysis_artifact(artifact: dict[str, Any]) 
             continue
         for segment in batch.get("scene_segments") or []:
             apply_name_corrections_to_segment(segment)
-        for observation in batch.get("frame_observations") or batch.get("observations") or []:
+        for observation in batch.get("frame_observations") or []:
             apply_name_corrections_to_observation(observation)
     for observation in artifact.get("frame_observations") or []:
         apply_name_corrections_to_observation(observation)

@@ -6,6 +6,7 @@ from unittest.mock import patch
 
 from app.services.documentary.frame_analysis_models import DocumentaryAnalysisConfig
 from app.services.documentary.frame_analysis_service import DocumentaryFrameAnalysisService
+from app.services.documentary.frame_extraction_service import DocumentaryFrameExtractionService
 from app.utils import utils
 
 
@@ -226,14 +227,12 @@ class DocumentaryFrameAnalysisServiceTests(unittest.TestCase):
         self.assertEqual(
             [
                 {
-                    "frame_path": "/tmp/keyframe_000000_000000000.jpg",
                     "timestamp": "00:00:00,000",
                     "observation": "第一帧画面",
                     "burned_in_subtitle": "",
                     "has_burned_in_subtitle": False,
                 },
                 {
-                    "frame_path": "/tmp/keyframe_000075_000003000.jpg",
                     "timestamp": "00:00:03,000",
                     "observation": "第二帧画面",
                     "burned_in_subtitle": "",
@@ -269,7 +268,7 @@ class DocumentaryFrameAnalysisServiceTests(unittest.TestCase):
         self.assertEqual("success", batch.status)
         self.assertEqual(1, len(batch.scene_segments))
         self.assertEqual(2, len(batch.frame_observations))
-        self.assertEqual("", batch.overall_activity_summary)
+        self.assertTrue(batch.overall_activity_summary.startswith("本批次："))
 
     def test_parse_batch_overrides_model_timestamp_with_keyframe_filename(self):
         service = DocumentaryFrameAnalysisService()
@@ -297,47 +296,38 @@ class DocumentaryFrameAnalysisServiceTests(unittest.TestCase):
         self.assertEqual("00:05:01,000", batch.frame_observations[0]["timestamp"])
         self.assertEqual("00:05:02,000", batch.frame_observations[1]["timestamp"])
 
-    def test_cache_key_changes_when_interval_changes(self):
-        service = DocumentaryFrameAnalysisService()
+    def test_keyframe_cache_key_changes_when_interval_changes(self):
+        service = DocumentaryFrameExtractionService()
 
         with patch("app.services.documentary.frame_extraction_service.os.path.getmtime", return_value=100.0):
-            key_a = service._build_cache_key("video.mp4", 3.0, "prompt-v1", "model-a", 10, 2)
-            key_b = service._build_cache_key("video.mp4", 5.0, "prompt-v1", "model-a", 10, 2)
+            key_a = service._build_keyframe_cache_key("video.mp4", 3.0)
+            key_b = service._build_keyframe_cache_key("video.mp4", 5.0)
 
         self.assertNotEqual(key_a, key_b)
 
-    def test_cache_key_changes_when_model_changes(self):
-        service = DocumentaryFrameAnalysisService()
-
-        with patch("app.services.documentary.frame_extraction_service.os.path.getmtime", return_value=100.0):
-            key_a = service._build_cache_key("video.mp4", 3.0, "prompt-v1", "model-a", 10, 2)
-            key_b = service._build_cache_key("video.mp4", 3.0, "prompt-v1", "model-b", 10, 2)
-
-        self.assertNotEqual(key_a, key_b)
-
-    def test_cache_key_starts_with_legacy_video_hash_prefix(self):
-        service = DocumentaryFrameAnalysisService()
+    def test_keyframe_cache_key_starts_with_video_hash_prefix(self):
+        service = DocumentaryFrameExtractionService()
 
         with patch("app.services.documentary.frame_extraction_service.os.path.getmtime", return_value=123.0):
-            key = service._build_cache_key("video.mp4", 3.0, "prompt-v1", "model-a", 10, 2)
+            key = service._build_keyframe_cache_key("video.mp4", 3.0)
 
         expected_prefix = utils.md5("video.mp4" + "123.0")
         self.assertTrue(key.startswith(expected_prefix))
 
     def test_clear_keyframes_cache_respects_scope_and_prefix_match(self):
         with TemporaryDirectory() as temp_root:
-            service = DocumentaryFrameAnalysisService()
-            analysis_dir = os.path.join(temp_root, "analysis")
-            os.makedirs(analysis_dir, exist_ok=True)
+            service = DocumentaryFrameExtractionService()
+            keyframes_dir = os.path.join(temp_root, "keyframes")
+            os.makedirs(keyframes_dir, exist_ok=True)
 
             with patch("app.services.documentary.frame_extraction_service.os.path.getmtime", return_value=123.0):
-                target_key_a = service._build_cache_key("video.mp4", 3.0, "prompt-v1", "model-a", 10, 2)
-                target_key_b = service._build_cache_key("video.mp4", 5.0, "prompt-v1", "model-a", 10, 2)
-                keep_key = service._build_cache_key("other.mp4", 3.0, "prompt-v1", "model-a", 10, 2)
+                target_key_a = service._build_keyframe_cache_key("video.mp4", 3.0)
+                target_key_b = service._build_keyframe_cache_key("video.mp4", 5.0)
+                keep_key = service._build_keyframe_cache_key("other.mp4", 3.0)
 
-            target_dir_a = os.path.join(analysis_dir, target_key_a)
-            target_dir_b = os.path.join(analysis_dir, target_key_b)
-            keep_dir = os.path.join(analysis_dir, keep_key)
+            target_dir_a = os.path.join(keyframes_dir, target_key_a)
+            target_dir_b = os.path.join(keyframes_dir, target_key_b)
+            keep_dir = os.path.join(keyframes_dir, keep_key)
             os.makedirs(target_dir_a, exist_ok=True)
             os.makedirs(target_dir_b, exist_ok=True)
             os.makedirs(keep_dir, exist_ok=True)
@@ -345,7 +335,7 @@ class DocumentaryFrameAnalysisServiceTests(unittest.TestCase):
             with patch("app.utils.utils.temp_dir", return_value=temp_root), patch(
                 "app.utils.utils.os.path.getmtime", return_value=123.0
             ):
-                utils.clear_keyframes_cache(video_path="video.mp4", cache_scope="analysis")
+                utils.clear_keyframes_cache(video_path="video.mp4", cache_scope="keyframes")
 
             self.assertFalse(os.path.exists(target_dir_a))
             self.assertFalse(os.path.exists(target_dir_b))
@@ -448,27 +438,31 @@ class DocumentaryFrameAnalysisServiceTests(unittest.TestCase):
 
     def test_batch_dict_to_result(self):
         service = DocumentaryFrameAnalysisService()
-        batch = service._batch_dict_to_result(
-            {
-                "batch_index": 3,
-                "status": "failed",
-                "time_range": "00:00:30,000-00:00:39,000",
-                "frame_paths": ["/tmp/a.jpg"],
-                "error_message": "parse error",
-            }
-        )
+        artifact = {"keyframe_cache_key": "test_cache_key"}
+        with patch("os.path.isfile", return_value=True):
+            batch = service._batch_dict_to_result(
+                {
+                    "batch_index": 3,
+                    "status": "failed",
+                    "time_range": "00:00:30,000-00:00:39,000",
+                    "frame_files": ["keyframe_000030_000030000.jpg"],
+                    "error_message": "parse error",
+                },
+                artifact=artifact,
+            )
         self.assertEqual(3, batch.batch_index)
         self.assertEqual("failed", batch.status)
-        self.assertEqual(["/tmp/a.jpg"], batch.frame_paths)
+        self.assertEqual(1, len(batch.frame_paths))
         self.assertEqual("parse error", batch.error_message)
 
 
 class DocumentaryFrameAnalysisCompactTests(unittest.TestCase):
     def _sample_artifact(self) -> dict:
         return {
-            "artifact_version": "documentary-frame-analysis-v3",
+            "artifact_version": "documentary-frame-analysis-v4",
             "generated_at": "2026-06-07T12:00:00",
             "video_path": "/tmp/demo.mp4",
+            "keyframe_cache_key": "abc123_def456",
             "frame_interval_seconds": 1.0,
             "scene_segments": [
                 {
@@ -486,27 +480,23 @@ class DocumentaryFrameAnalysisCompactTests(unittest.TestCase):
             ],
             "frame_observations": [
                 {
-                    "frame_path": "/tmp/keyframe_000000_000000000.jpg",
                     "timestamp": "00:00:00,000",
                     "observation": "阴天",
                     "batch_index": 0,
                     "time_range": "00:00:00,000-00:00:09,000",
                 }
             ],
-            "overall_activity_summaries": [
-                {
-                    "batch_index": 0,
-                    "time_range": "00:00:00,000-00:00:09,000",
-                    "summary": "开场",
-                }
-            ],
+            "video_segment_overview": {
+                "segment_count": 1,
+                "segments": [{"index": 1, "scene": "天台", "summary": "对话"}],
+            },
             "batches": [
                 {
                     "batch_index": 0,
                     "status": "success",
                     "time_range": "00:00:00,000-00:00:09,000",
                     "raw_response": "x" * 1000,
-                    "frame_paths": ["/tmp/keyframe_000000_000000000.jpg"],
+                    "frame_files": ["keyframe_000000_000000000.jpg"],
                     "scene_segments": [
                         {
                             "timestamp": "00:00:01,000-00:00:03,000",
@@ -516,7 +506,6 @@ class DocumentaryFrameAnalysisCompactTests(unittest.TestCase):
                     ],
                     "frame_observations": [
                         {
-                            "frame_path": "/tmp/keyframe_000000_000000000.jpg",
                             "timestamp": "00:00:00,000",
                             "observation": "阴天",
                         }
@@ -551,7 +540,10 @@ class DocumentaryFrameAnalysisCompactTests(unittest.TestCase):
         self.assertNotIn("raw_response", json.dumps(payload_without_comments))
         self.assertNotIn("frame_paths", json.dumps(payload_without_comments))
         self.assertEqual(1, len(compact["batches"]))
-        self.assertEqual(["batch_index", "time_range", "status"], list(compact["batches"][0].keys()))
+        self.assertEqual(
+            ["batch_index", "time_range", "status", "frame_files"],
+            list(compact["batches"][0].keys()),
+        )
 
     def test_rebuild_batches_from_compact_artifact(self):
         from app.services.documentary.frame_analysis_compact import (
@@ -699,7 +691,6 @@ class DocumentaryMaterialOutputSplitTests(unittest.TestCase):
                 {"timestamp": "00:00:11,000-00:00:13,000", "scene": "B", "batch_index": 1},
             ],
             "frame_observations": [],
-            "overall_activity_summaries": [],
         }
         parts = split_frame_analysis_artifact(artifact, 2)
         self.assertEqual(2, len(parts))
@@ -732,12 +723,158 @@ class DocumentaryMaterialOutputSplitTests(unittest.TestCase):
             ],
             "scene_segments": [],
             "frame_observations": [],
-            "overall_activity_summaries": [],
         }
         parts = split_frame_analysis_artifact(artifact, 4)
         batch_ids = [batch["batch_index"] for part in parts for batch in part.get("batches") or []]
         self.assertEqual(len(batch_ids), len(set(batch_ids)))
         self.assertEqual(20, len(batch_ids))
+
+
+class FrameAnalysisPairingTests(unittest.TestCase):
+    def test_load_analysis_artifact_rejects_legacy_frame_paths(self):
+        from app.services.documentary.frame_analysis_pairing import (
+            _LEGACY_ARTIFACT_ERROR,
+            load_analysis_artifact,
+        )
+
+        with TemporaryDirectory() as tmpdir:
+            path = os.path.join(tmpdir, "legacy.json")
+            with open(path, "w", encoding="utf-8") as fp:
+                json.dump(
+                    {
+                        "batches": [
+                            {
+                                "batch_index": 0,
+                                "frame_paths": ["/tmp/keyframe.jpg"],
+                            }
+                        ]
+                    },
+                    fp,
+                )
+            with self.assertRaises(ValueError) as ctx:
+                load_analysis_artifact(path)
+            self.assertIn(_LEGACY_ARTIFACT_ERROR, str(ctx.exception))
+
+    def test_load_analysis_artifact_accepts_v4_payload(self):
+        from app.services.documentary.frame_analysis_pairing import load_analysis_artifact
+
+        with TemporaryDirectory() as tmpdir:
+            path = os.path.join(tmpdir, "v4.json")
+            with open(path, "w", encoding="utf-8") as fp:
+                json.dump(
+                    {
+                        "artifact_version": "documentary-frame-analysis-v4",
+                        "keyframe_cache_key": "abc",
+                        "scene_segments": [{"timestamp": "00:00:00,000-00:00:01,000", "scene": "A"}],
+                        "batches": [{"batch_index": 0, "frame_files": ["keyframe_000000_000000000.jpg"]}],
+                    },
+                    fp,
+                )
+            artifact = load_analysis_artifact(path)
+            self.assertEqual("documentary-frame-analysis-v4", artifact["artifact_version"])
+
+
+class FrameTimelineRefinementTests(unittest.TestCase):
+    def test_offset_scene_segments_to_absolute(self):
+        from app.services.documentary.frame_timeline_refinement import (
+            offset_scene_segments_to_absolute,
+        )
+
+        segments = offset_scene_segments_to_absolute(
+            [
+                {
+                    "timestamp": "00:00:00,000-00:00:15,000",
+                    "scene": "问询室",
+                    "observation": "对话",
+                },
+                {
+                    "timestamp": "00:00:14,000-00:00:20,000",
+                    "scene": "走廊",
+                    "observation": "交接",
+                },
+            ],
+            time_range="00:06:40,000-00:06:59,000",
+        )
+        self.assertEqual("00:06:40,000-00:06:55,000", segments[0]["timestamp"])
+        self.assertEqual("00:06:54,000-00:07:00,000", segments[1]["timestamp"])
+
+    def test_build_batch_timeline_summary_uses_milestones_not_every_frame(self):
+        from app.services.documentary.frame_timeline_refinement import build_batch_timeline_summary
+
+        frames = [
+            {
+                "timestamp": "00:06:50,000",
+                "observation": "[特写] 问询室，秦枫(男)低头陈述",
+                "burned_in_subtitle": "这件事情最后什么结果",
+            },
+            {
+                "timestamp": "00:06:51,000",
+                "observation": "[特写] 问询室，秦枫(男)面部阴影加深",
+                "burned_in_subtitle": "这件事情最后什么结果",
+            },
+            {
+                "timestamp": "00:06:53,000",
+                "observation": "[特写] 问询室，秦枫(男)嘴部微张",
+                "burned_in_subtitle": "我都认",
+            },
+        ]
+        summary = build_batch_timeline_summary(frames)
+        self.assertIn("本批次：", summary)
+        self.assertLessEqual(summary.count("→"), 2)
+
+    def test_failed_batch_does_not_receive_untagged_segments(self):
+        from app.services.documentary.frame_extraction_service import DocumentaryFrameExtractionService
+
+        artifact = {
+            "scene_segments": [
+                {
+                    "batch_index": 1,
+                    "timestamp": "00:06:50,000-00:06:59,000",
+                    "scene": "问询室",
+                    "observation": "秦枫(男)陈述",
+                }
+            ],
+            "batches": [
+                {"batch_index": 0, "status": "failed", "time_range": "00:06:40,000-00:06:49,000"},
+                {"batch_index": 1, "status": "success", "time_range": "00:06:50,000-00:06:59,000"},
+            ],
+        }
+        DocumentaryFrameExtractionService._finalize_scene_segments_in_artifact(artifact)
+        self.assertEqual([], artifact["batches"][0]["scene_segments"])
+        self.assertEqual(1, len(artifact["batches"][1]["scene_segments"]))
+
+    def test_character_field_separation_strips_names_from_descriptions(self):
+        from app.services.documentary.frame_character_naming import (
+            apply_character_field_separation_to_artifact,
+        )
+
+        artifact = {
+            "character_references": [{"name": "秦枫"}, {"name": "胡小跃"}],
+            "scene_segments": [
+                {
+                    "batch_index": 0,
+                    "scene": "审讯室",
+                    "observation": "秦枫(男)低头，胡小跃(男)搭肩安抚",
+                    "action": "秦枫(男)沉默，胡小跃(男)俯身耳语",
+                }
+            ],
+            "frame_observations": [
+                {
+                    "batch_index": 0,
+                    "timestamp": "00:06:40,000",
+                    "observation": "[近景] 审讯室，秦枫(男)低头，逆光暖调",
+                }
+            ],
+            "batches": [],
+        }
+        apply_character_field_separation_to_artifact(artifact)
+        segment = artifact["scene_segments"][0]
+        frame = artifact["frame_observations"][0]
+        self.assertEqual(["秦枫", "胡小跃"], segment["characters"])
+        self.assertNotIn("秦枫", segment["observation"])
+        self.assertNotIn("胡小跃", segment["action"])
+        self.assertEqual(["秦枫"], frame["characters"])
+        self.assertEqual("[近景] 审讯室，低头，逆光暖调", frame["observation"])
 
 
 class DocumentaryAnalysisConfigTests(unittest.TestCase):
@@ -802,8 +939,8 @@ class DocumentaryFrameGenderHintTests(unittest.TestCase):
             documentary_settings={"documentary_compact_mode": True, "documentary_compact_style": "fazu2"},
             time_range="00:00:00,000-00:00:06,000",
         )
-        self.assertIn("无法从字幕确认身份时", prompt)
-        self.assertIn("只允许写**已上传头像名单内**", prompt)
+        self.assertIn("禁止写姓名(男/女)", prompt)
+        self.assertIn("只允许在 characters 写**已上传头像名单内**", prompt)
         self.assertIn("禁止写名单外旧称（如伟业、老叶", prompt)
 
     def test_batch_prompt_default_skips_drama_knowledge_for_fazu_theme(self):
@@ -1003,7 +1140,7 @@ class DocumentaryFrameSubtitleAttachmentTests(unittest.TestCase):
                     "status": "success",
                     "time_range": "00:00:00,000-00:00:05,000",
                     "raw_response": "x" * 5000,
-                    "frame_paths": ["/tmp/a.jpg"],
+                    "frame_files": ["keyframe_000002_000002000.jpg"],
                     "subtitle": "老叶，",
                     "subtitle_entries": [{"start": "00:00:01,940", "end": "00:00:02,420", "text": "老叶，"}],
                     "frame_observations": [{"timestamp": "00:00:02,000", "observation": "画面"}],
@@ -1048,7 +1185,7 @@ class DocumentaryFrameSubtitleAttachmentTests(unittest.TestCase):
                     "status": "success",
                     "time_range": "00:00:00,000-00:00:05,000",
                     "raw_response": "debug",
-                    "frame_paths": ["/tmp/a.jpg"],
+                    "frame_files": ["keyframe_000002_000002000.jpg"],
                     "frame_observations": [
                         {
                             "timestamp": "00:00:02,000",
@@ -1071,10 +1208,88 @@ class DocumentaryFrameSubtitleAttachmentTests(unittest.TestCase):
         }
         compress_analysis_artifact(artifact, strip_debug=False)
         self.assertIn("raw_response", artifact["batches"][0])
-        self.assertIn("frame_paths", artifact["batches"][0])
+        self.assertIn("frame_files", artifact["batches"][0])
+        self.assertNotIn("frame_paths", artifact["batches"][0])
         self.assertIn("frame_observations", artifact["batches"][0])
         self.assertIn("observation", artifact["frame_observations"][0])
         self.assertEqual("对白", artifact["frame_observations"][0]["burned_in_subtitle"])
+
+    def test_compact_frame_storage_uses_short_filenames(self):
+        from app.services.documentary.frame_analysis_compact import (
+            compact_frame_storage_in_artifact,
+            resolve_batch_frame_files,
+        )
+
+        cache_key = "abc123_def456"
+        cache_dir = os.path.join(utils.temp_dir(), "keyframes", cache_key)
+        artifact = {
+            "keyframe_cache_key": cache_key,
+            "batches": [
+                {
+                    "batch_index": 0,
+                    "frame_files": [
+                        "keyframe_000000_000000000.jpg",
+                        "keyframe_000075_000003000.jpg",
+                    ],
+                    "frame_observations": [
+                        {
+                            "timestamp": "00:00:00,000",
+                            "observation": "画面",
+                        }
+                    ],
+                }
+            ],
+            "frame_observations": [
+                {
+                    "timestamp": "00:00:00,000",
+                    "observation": "画面",
+                }
+            ],
+        }
+        compact_frame_storage_in_artifact(artifact)
+        batch = artifact["batches"][0]
+        self.assertEqual(
+            ["keyframe_000000_000000000.jpg", "keyframe_000075_000003000.jpg"],
+            batch.get("frame_files"),
+        )
+        self.assertNotIn("frame_paths", batch)
+        self.assertNotIn("frame_path", artifact["frame_observations"][0])
+
+        with patch("os.path.isfile", return_value=True):
+            resolved = resolve_batch_frame_files(artifact, batch)
+        self.assertEqual(
+            [
+                os.path.join(cache_dir, "keyframe_000000_000000000.jpg"),
+                os.path.join(cache_dir, "keyframe_000075_000003000.jpg"),
+            ],
+            resolved,
+        )
+
+    def test_build_video_segment_overview(self):
+        from app.services.documentary.frame_analysis_compact import build_video_segment_overview
+
+        artifact = {
+            "scene_segments": [
+                {
+                    "timestamp": "00:00:00,000-00:00:10,000",
+                    "scene": "楼顶天台",
+                    "observation": "叶天佑与楚青桐对话",
+                    "action": "两人对峙",
+                },
+                {
+                    "timestamp": "00:00:10,000-00:00:20,000",
+                    "scene": "停车场",
+                    "observation": "秦枫奔跑追捕",
+                    "action": "秦枫(男)持枪奔跑",
+                },
+            ]
+        }
+        overview = build_video_segment_overview(artifact)
+        self.assertEqual(2, overview["segment_count"])
+        self.assertEqual("00:00:00,000-00:00:20,000", overview["time_span"])
+        self.assertEqual(2, len(overview["segments"]))
+        self.assertIn("全片共 2 个片段", overview["narrative_outline"])
+        self.assertIn("楼顶天台", overview["narrative_outline"])
 
     def test_assign_subtitle_entries_to_segments_assigns_once(self):
         from app.services.documentary.documentary_subtitle_enrichment import (
@@ -1700,7 +1915,7 @@ class SceneSegmentDedupTests(unittest.TestCase):
         from app.services.documentary.frame_analysis_compact import compact_analysis_artifact
 
         artifact = {
-            "artifact_version": "documentary-frame-analysis-v3",
+            "artifact_version": "documentary-frame-analysis-v4",
             "video_path": "/tmp/demo.mp4",
             "scene_segments": [
                 {
@@ -2140,29 +2355,6 @@ class FrameExtractionTestModeTests(unittest.TestCase):
             DocumentaryFrameExtractionService._resolve_max_duration_seconds(5, test_mode=True),
         )
 
-
-    def test_subtitle_alias_not_applied_during_frame_extraction(self):
-        from app.services.documentary.frame_character_naming import (
-            apply_subtitle_alias_normalization_to_artifact,
-        )
-
-        artifact = {
-            "drama_id": "罚罪2",
-            "character_references": [{"name": "叶天佑"}, {"name": "楚青桐"}],
-            "scene_segments": [
-                {
-                    "batch_index": 0,
-                    "action": "老叶(男)与未名人员(男)对话",
-                    "subtitle": "老叶；你都到厅级了",
-                }
-            ],
-            "batches": [],
-            "frame_observations": [],
-        }
-        apply_subtitle_alias_normalization_to_artifact(artifact)
-        action = artifact["scene_segments"][0]["action"]
-        self.assertIn("老叶(男)", action)
-        self.assertNotIn("叶天佑(男)", action)
 
     def test_obvious_relationship_supplement_when_both_named(self):
         from app.services.documentary.frame_character_naming import (

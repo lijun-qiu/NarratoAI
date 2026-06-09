@@ -161,7 +161,7 @@ def attach_burned_in_subtitles_to_artifact(
         if not isinstance(batch, dict):
             continue
         batch_index = int(batch.get("batch_index", 0))
-        batch_observations = list(batch.get("frame_observations") or batch.get("observations") or [])
+        batch_observations = list(batch.get("frame_observations") or [])
         if batch_observations:
             observations_by_batch.setdefault(batch_index, batch_observations)
 
@@ -237,20 +237,10 @@ def join_subtitle_texts(parts: list[str] | tuple[str, ...]) -> str:
 
 
 def resolve_segment_subtitle_text(segment: dict[str, Any]) -> str:
-    """从 segment 的 subtitle 或（兼容旧 JSON）subtitle_entries 得到清洗后的合并字幕。"""
+    """从 segment 的 subtitle 字段得到清洗后的合并字幕。"""
     if not isinstance(segment, dict):
         return ""
-    direct = clean_subtitle_punctuation(str(segment.get("subtitle") or "").strip())
-    if direct:
-        return direct
-    entries = segment.get("subtitle_entries")
-    if isinstance(entries, list) and entries:
-        merged = join_subtitle_texts(
-            str(item.get("text") or "") for item in entries if isinstance(item, dict)
-        )
-        if merged:
-            return merged
-    return ""
+    return clean_subtitle_punctuation(str(segment.get("subtitle") or "").strip())
 
 
 def resolve_segment_time_range(segment: dict[str, Any]) -> str:
@@ -347,7 +337,7 @@ def _iter_frame_observation_dicts(data: dict[str, Any]) -> list[dict[str, Any]]:
     for batch in data.get("batches") or []:
         if not isinstance(batch, dict):
             continue
-        for obs in batch.get("frame_observations") or batch.get("observations") or []:
+        for obs in batch.get("frame_observations") or []:
             add_obs(obs)
     for obs in data.get("frame_observations") or []:
         add_obs(obs)
@@ -468,9 +458,10 @@ def extract_subtitle_srt_from_frame_analysis(frame_json_path: str) -> str:
     if not path or not os.path.isfile(path):
         return ""
     try:
-        with open(path, encoding="utf-8") as fp:
-            data = json.load(fp)
-    except OSError as exc:
+        from app.services.documentary.frame_analysis_pairing import load_analysis_artifact
+
+        data = load_analysis_artifact(path)
+    except (OSError, ValueError) as exc:
         logger.warning(f"读取抽帧 JSON 字幕失败 {path}: {exc}")
         return ""
 

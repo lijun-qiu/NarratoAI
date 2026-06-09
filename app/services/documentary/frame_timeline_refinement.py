@@ -13,6 +13,7 @@ from loguru import logger
 from app.services.documentary.frame_timeline_sampling import (
     _SCENE_LABEL_FROM_TEXT_RE,
     infer_scene_label_from_segment,
+    parse_timestamp_range_ms,
 )
 
 _FRAME_OBS_PREFIX_RE = re.compile(
@@ -204,27 +205,105 @@ def build_scene_segments_from_frame_observations(
     return segments
 
 
-def build_batch_timeline_summary(frame_observations: list[dict[str, Any]]) -> str:
-    """按时间顺序生成批次事件链，便于仅读 JSON 即可还原「发生了什么」。"""
-    parts: list[str] = []
-    for frame in frame_observations:
-        if not isinstance(frame, dict):
+def _ms_to_timestamp(ms: int) -> str:
+    from app.utils import utils
+
+    return utils.seconds_to_time(ms / 1000.0).replace(".", ",")
+
+
+def offset_scene_segments_to_absolute(
+    segments: list[dict[str, Any]],
+    *,
+    time_range: str,
+) -> list[dict[str, Any]]:
+    """将模型返回的批次内相对时间（常从 00:00:00 起）平移为全片绝对时间。"""
+    if not segments or not str(time_range or "").strip():
+        return segments
+
+    batch_start_ms, batch_end_ms = parse_timestamp_range_ms(time_range)
+    if batch_start_ms <= 0 and batch_end_ms <= 0:
+        return segments
+
+    updated: list[dict[str, Any]] = []
+    for segment in segments:
+        if not isinstance(segment, dict):
             continue
+        payload = dict(segment)
+        timestamp = str(payload.get("timestamp") or "").strip()
+        if not timestamp:
+            updated.append(payload)
+            continue
+        seg_start_ms, seg_end_ms = parse_timestamp_range_ms(timestamp)
+        if seg_start_ms < batch_start_ms:
+            seg_start_ms += batch_start_ms
+            seg_end_ms += batch_start_ms
+            if batch_end_ms > batch_start_ms and seg_end_ms > batch_end_ms + 2000:
+                seg_end_ms = batch_end_ms
+            payload["timestamp"] = f"{_ms_to_timestamp(seg_start_ms)}-{_ms_to_timestamp(seg_end_ms)}"
+        updated.append(payload)
+    return updated
+
+
+def stamp_batch_index_on_segments(
+    segments: list[dict[str, Any]],
+    *,
+    batch_index: int,
+) -> list[dict[str, Any]]:
+    stamped: list[dict[str, Any]] = []
+    for segment in segments:
+        if not isinstance(segment, dict):
+            continue
+        payload = dict(segment)
+        payload["batch_index"] = int(batch_index)
+        stamped.append(payload)
+    return stamped
+
+
+def _milestone_key_from_frame(frame: dict[str, Any]) -> str:
+    obs = str(frame.get("observation") or "").strip()
+    location_match = _FRAME_OBS_PREFIX_RE.match(obs)
+    location = location_match.group(1).strip() if location_match else ""
+    subtitle = str(frame.get("burned_in_subtitle") or "").strip()
+    body = re.sub(r"^\[[^\]]+\]\s*", "", obs)
+    body = re.sub(r"，?烧录字幕:.*$", "", body).strip()
+    body = body[:48]
+    if subtitle:
+        return f"{location}|{subtitle}|{body}"
+    return f"{location}|{body}"
+
+
+def build_batch_timeline_summary(frame_observations: list[dict[str, Any]]) -> str:
+    """按时间顺序生成批次事件链（地点/字幕变化节点），避免逐帧复读。"""
+    milestones: list[str] = []
+    last_key = ""
+    ordered = sorted(
+        [item for item in frame_observations if isinstance(item, dict)],
+        key=lambda item: str(item.get("timestamp") or ""),
+    )
+    for frame in ordered:
         obs = str(frame.get("observation") or "").strip()
         if not obs:
+            continue
+        key = _milestone_key_from_frame(frame)
+        if milestones and key == last_key:
             continue
         ts = str(frame.get("timestamp") or "").strip()
         short_ts = ts.split(",")[0][-8:] if ts else ""
         body = re.sub(r"^\[[^\]]+\]\s*", "", obs)
+        body = re.sub(r"，?烧录字幕:.*$", "", body).strip()
+        if len(body) > 56:
+            body = body[:56] + "…"
         label = f"{short_ts} {body}" if short_ts else body
-        if parts and parts[-1] == label:
-            continue
-        parts.append(label)
-    if not parts:
+        milestones.append(label)
+        last_key = key
+        if len(milestones) >= 6:
+            break
+
+    if not milestones:
         return ""
-    if len(parts) == 1:
-        return f"本批次：{parts[0]}"
-    return "本批次：" + " → ".join(parts)
+    if len(milestones) == 1:
+        return f"本批次：{milestones[0]}"
+    return "本批次：" + " → ".join(milestones)
 
 
 def should_rebuild_segments_from_frames(
@@ -267,17 +346,20 @@ def refine_batch_from_frame_observations(
                 f"抽帧 batch #{batch_index}：已由 {len(frames)} 条逐帧观察重建为 {len(rebuilt)} 条 scene_segments"
             )
 
+    segments = offset_scene_segments_to_absolute(segments, time_range=time_range)
+    segments = stamp_batch_index_on_segments(segments, batch_index=batch_index)
+
     timeline_summary = build_batch_timeline_summary(frames)
     if mislabel_fixes:
         logger.info(f"抽帧 batch #{batch_index}：已修正 {mislabel_fixes} 条「车内→车顶」空间误判")
 
-    if timeline_summary and (
-        not (overall_summary or "").strip()
-        or count_distinct_location_buckets(frames) >= 2
-        or len(segments) >= 2
-    ):
+    model_summary = (overall_summary or "").strip()
+    repetitive_model = model_summary.count("→") >= 3 or len(model_summary) > 320
+    if model_summary and not repetitive_model:
+        summary = model_summary
+    elif timeline_summary:
         summary = timeline_summary
     else:
-        summary = (overall_summary or "").strip() or timeline_summary
+        summary = model_summary or timeline_summary
 
     return segments, frames, summary

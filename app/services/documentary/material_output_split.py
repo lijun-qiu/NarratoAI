@@ -172,10 +172,6 @@ def split_frame_analysis_artifact(
     source_observations = [
         observation for observation in (artifact.get("frame_observations") or []) if isinstance(observation, dict)
     ]
-    source_summaries = [
-        summary for summary in (artifact.get("overall_activity_summaries") or []) if isinstance(summary, dict)
-    ]
-
     batch_groups = group_items_by_part(
         source_batches,
         windows,
@@ -191,12 +187,6 @@ def split_frame_analysis_artifact(
         windows,
         start_ms_getter=lambda observation: _timestamp_bounds_ms(str(observation.get("timestamp") or ""))[0],
     )
-    summary_groups = group_items_by_part(
-        source_summaries,
-        windows,
-        start_ms_getter=lambda summary: _time_range_bounds_ms(str(summary.get("time_range") or ""))[0],
-    )
-
     parts: list[dict[str, Any]] = []
     for window in windows:
         part_index = int(window["part_index"])
@@ -204,6 +194,7 @@ def split_frame_analysis_artifact(
             "artifact_version": artifact.get("artifact_version"),
             "generated_at": artifact.get("generated_at"),
             "video_path": artifact.get("video_path"),
+            "keyframe_cache_key": artifact.get("keyframe_cache_key"),
             "frame_interval_seconds": artifact.get("frame_interval_seconds"),
             "vision_batch_size": artifact.get("vision_batch_size"),
             "vision_llm_provider": artifact.get("vision_llm_provider"),
@@ -215,8 +206,10 @@ def split_frame_analysis_artifact(
             "scene_segments": [deepcopy(item) for item in segment_groups.get(part_index, [])],
             "batches": [deepcopy(item) for item in batch_groups.get(part_index, [])],
             "frame_observations": [deepcopy(item) for item in observation_groups.get(part_index, [])],
-            "overall_activity_summaries": [deepcopy(item) for item in summary_groups.get(part_index, [])],
         }
+        overview = artifact.get("video_segment_overview")
+        if isinstance(overview, dict) and overview:
+            part_payload["video_segment_overview"] = deepcopy(overview)
         if artifact.get("source_artifact_path"):
             part_payload["source_artifact_path"] = artifact.get("source_artifact_path")
         parts.append(part_payload)

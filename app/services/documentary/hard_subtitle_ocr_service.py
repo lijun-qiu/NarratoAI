@@ -104,22 +104,32 @@ def _append_observation_record(
 
 
 def _build_keyframe_index_from_artifact(artifact: dict[str, Any]) -> list[tuple[int, str]]:
-    video_path = str(artifact.get("video_path") or "").strip()
-    if not video_path or not os.path.isfile(video_path):
-        return []
-    try:
-        frame_interval_seconds = float(artifact.get("frame_interval_seconds") or 0)
-    except (TypeError, ValueError):
-        frame_interval_seconds = 0.0
-    if frame_interval_seconds <= 0:
-        return []
-
+    from app.services.documentary.frame_analysis_compact import resolve_keyframe_cache_dir
     from app.services.documentary.frame_extraction_service import DocumentaryFrameExtractionService
 
     service = DocumentaryFrameExtractionService()
-    keyframes_root = os.path.join(utils.temp_dir(), "keyframes")
-    cache_key = service._build_keyframe_cache_key(video_path, frame_interval_seconds)
-    cache_dir = os.path.join(keyframes_root, cache_key)
+    cache_dir = resolve_keyframe_cache_dir(artifact)
+    if not cache_dir or not os.path.isdir(cache_dir):
+        video_path = str(artifact.get("video_path") or "").strip()
+        if not video_path or not os.path.isfile(video_path):
+            return []
+        try:
+            frame_interval_seconds = float(artifact.get("frame_interval_seconds") or 0)
+        except (TypeError, ValueError):
+            frame_interval_seconds = 0.0
+        if frame_interval_seconds <= 0:
+            return []
+        test_mode, test_max_duration, test_start_time = service._resolve_test_window_from_artifact(artifact)
+        keyframes_root = os.path.join(utils.temp_dir(), "keyframes")
+        cache_key = str(artifact.get("keyframe_cache_key") or "").strip()
+        if not cache_key:
+            cache_key = service._build_keyframe_cache_key(
+                video_path,
+                frame_interval_seconds,
+                max_duration_seconds=test_max_duration if test_mode else None,
+                start_time_seconds=test_start_time if test_mode else 0.0,
+            )
+        cache_dir = os.path.join(keyframes_root, cache_key)
     paths = service._collect_keyframe_paths(cache_dir)
     index: list[tuple[int, str]] = []
     for path in paths:
@@ -172,9 +182,11 @@ def _iter_frame_records_from_artifact(
         for batch in batches:
             if not isinstance(batch, dict):
                 continue
-            observations = batch.get("frame_observations") or batch.get("observations") or []
-            frame_paths = batch.get("frame_paths") or []
-            if isinstance(frame_paths, list) and frame_paths:
+            observations = batch.get("frame_observations") or []
+            from app.services.documentary.frame_analysis_compact import resolve_batch_frame_files
+
+            frame_paths = resolve_batch_frame_files(artifact, batch)
+            if frame_paths:
                 for index, frame_path in enumerate(frame_paths):
                     if not isinstance(frame_path, str) or not frame_path:
                         continue
@@ -534,7 +546,7 @@ def calibrate_subtitle_with_hard_subtitle_ocr(
         frames = _collect_ocr_frames(artifact)
         if not frames:
             raise ValueError(
-                "抽帧分析中未找到可用关键帧路径（frame_path）。"
+                "抽帧分析中未找到可用关键帧（需 keyframe_cache_key + frame_files 或 timestamp 可匹配缓存）。"
                 "请先完成抽帧分析，或确认关键帧缓存仍存在（与 video_path、frame_interval_seconds 一致）。"
             )
 

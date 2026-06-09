@@ -9,32 +9,28 @@ from app.services.generate_narration_script import parse_frame_analysis_to_markd
 class GenerateNarrationMarkdownTests(unittest.TestCase):
     def test_markdown_keeps_batches_without_summary_and_sorts_by_time(self):
         artifact = {
+            "artifact_version": "documentary-frame-analysis-v4",
+            "keyframe_cache_key": "test_cache",
             "batches": [
                 {
                     "batch_index": 1,
                     "time_range": "00:00:03,000-00:00:06,000",
+                    "frame_files": ["keyframe_000003_000003000.jpg"],
                     "overall_activity_summary": "人物转身跑向远处",
                     "fallback_summary": "",
-                    "frame_observations": [
-                        {
-                            "timestamp": "00:00:03,000",
-                            "observation": "人物突然回头",
-                        }
-                    ],
                 },
                 {
                     "batch_index": 0,
                     "time_range": "00:00:00,000-00:00:03,000",
+                    "frame_files": ["keyframe_000000_000000000.jpg"],
                     "overall_activity_summary": "",
                     "fallback_summary": "原始响应回退摘要",
-                    "frame_observations": [
-                        {
-                            "timestamp": "00:00:00,000",
-                            "observation": "镜头里有一只猫",
-                        }
-                    ],
                 },
-            ]
+            ],
+            "frame_observations": [
+                {"timestamp": "00:00:00,000", "observation": "镜头里有一只猫", "batch_index": 0},
+                {"timestamp": "00:00:03,000", "observation": "人物突然回头", "batch_index": 1},
+            ],
         }
 
         with TemporaryDirectory() as temp_dir:

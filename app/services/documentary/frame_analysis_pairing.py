@@ -13,6 +13,19 @@ from typing import Any
 
 from app.utils import utils
 
+FRAME_ANALYSIS_ARTIFACT_VERSION = "documentary-frame-analysis-v4"
+_LEGACY_ARTIFACT_VERSIONS = frozenset(
+    {
+        "documentary-frame-analysis-v1",
+        "documentary-frame-analysis-v2",
+        "documentary-frame-analysis-v3",
+    }
+)
+_LEGACY_ARTIFACT_ERROR = (
+    "旧版抽帧 JSON 已不再支持，请重新执行抽帧分析以生成 "
+    f"{FRAME_ANALYSIS_ARTIFACT_VERSION} 格式"
+)
+
 
 def analysis_artifact_dir() -> str:
     return os.path.join(utils.storage_dir(), "temp", "analysis")
@@ -51,8 +64,43 @@ def normalize_video_path(video_path: str) -> str:
     return os.path.normcase(os.path.abspath(video_path))
 
 
+def is_compact_or_minimal_artifact(payload: dict[str, Any]) -> bool:
+    version = str(payload.get("artifact_version") or "")
+    return version.endswith("-compact") or version.endswith("-minimal-scene")
+
+
+def is_legacy_analysis_artifact(payload: Any) -> bool:
+    """检测旧版抽帧 JSON（frame_paths / overall_activity_summaries 等）。"""
+    if not isinstance(payload, dict):
+        return False
+    version = str(payload.get("artifact_version") or "")
+    if version in _LEGACY_ARTIFACT_VERSIONS:
+        return True
+    if payload.get("overall_activity_summaries"):
+        return True
+    for batch in payload.get("batches") or []:
+        if not isinstance(batch, dict):
+            continue
+        if batch.get("frame_paths"):
+            return True
+        if batch.get("observations"):
+            return True
+    for observation in payload.get("frame_observations") or []:
+        if isinstance(observation, dict) and observation.get("frame_path"):
+            return True
+    for batch in payload.get("batches") or []:
+        if not isinstance(batch, dict):
+            continue
+        for observation in batch.get("frame_observations") or []:
+            if isinstance(observation, dict) and observation.get("frame_path"):
+                return True
+    return False
+
+
 def is_valid_analysis_artifact(payload: Any) -> bool:
     if not isinstance(payload, dict):
+        return False
+    if is_legacy_analysis_artifact(payload):
         return False
     if payload.get("scene_segments"):
         return True
@@ -66,6 +114,8 @@ def is_valid_analysis_artifact(payload: Any) -> bool:
 def load_analysis_artifact(analysis_json_path: str) -> dict[str, Any]:
     with open(analysis_json_path, "r", encoding="utf-8") as fp:
         payload = json.load(fp)
+    if is_legacy_analysis_artifact(payload):
+        raise ValueError(_LEGACY_ARTIFACT_ERROR)
     if not is_valid_analysis_artifact(payload):
         raise ValueError(f"无效的抽帧分析文件: {analysis_json_path}")
     return payload

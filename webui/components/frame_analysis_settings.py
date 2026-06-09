@@ -293,8 +293,13 @@ def _render_frame_analysis_status(video_path: str) -> None:
         model_hint = ""
         if models_used:
             model_hint = f" · 模型: {', '.join(str(m) for m in models_used)}"
+        overview = artifact.get("video_segment_overview") or {}
+        overview_count = int(overview.get("segment_count") or 0) if isinstance(overview, dict) else 0
         if scene_count:
-            detail = f"（{scene_count} 场景片段 / {batch_count} 批次，成功 {success_count}"
+            detail = f"（{scene_count} 场景片段"
+            if overview_count and overview_count != scene_count:
+                detail += f" / 概览 {overview_count} 段"
+            detail += f" / {batch_count} 批次，成功 {success_count}"
             if failed_count:
                 detail += f"，失败 {failed_count}"
             detail += f"{model_hint}）"
@@ -339,8 +344,16 @@ def _import_frame_analysis_file(
 ) -> None:
     try:
         payload = json.loads(analysis_file.getvalue().decode("utf-8"))
+        from app.services.documentary.frame_analysis_pairing import (
+            _LEGACY_ARTIFACT_ERROR,
+            is_legacy_analysis_artifact,
+        )
+
+        if is_legacy_analysis_artifact(payload):
+            st.error(_LEGACY_ARTIFACT_ERROR)
+            st.stop()
         if not is_valid_analysis_artifact(payload):
-            st.error("无效的抽帧分析 JSON：缺少 batches 或 frame_observations 字段")
+            st.error("无效的抽帧分析 JSON：缺少 scene_segments / batches / frame_observations")
             st.stop()
 
         safe_filename = os.path.basename(analysis_file.name)

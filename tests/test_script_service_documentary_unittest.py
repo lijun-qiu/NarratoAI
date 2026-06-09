@@ -8,6 +8,32 @@ from app.services.documentary.frame_analysis_service import DocumentaryFrameAnal
 from app.services.script_service import ScriptGenerator
 
 
+def _v4_analysis_payload(*, summary: str = "测试摘要", fallback: str = "") -> dict:
+    return {
+        "artifact_version": "documentary-frame-analysis-v4",
+        "keyframe_cache_key": "test_cache",
+        "scene_segments": [
+            {
+                "timestamp": "00:00:00,000-00:00:03,000",
+                "scene": "室内",
+                "observation": "镜头里有一只猫",
+            }
+        ],
+        "batches": [
+            {
+                "batch_index": 0,
+                "time_range": "00:00:00,000-00:00:03,000",
+                "frame_files": ["keyframe_000000_000000000.jpg"],
+                "overall_activity_summary": summary,
+                "fallback_summary": fallback,
+            }
+        ],
+        "frame_observations": [
+            {"timestamp": "00:00:00,000", "observation": "镜头里有一只猫", "batch_index": 0},
+        ],
+    }
+
+
 class ScriptGeneratorDocumentaryTests(unittest.IsolatedAsyncioTestCase):
     async def test_generate_script_forwards_explicit_values_to_shared_service(self):
         expected_script = [
@@ -99,27 +125,14 @@ class ScriptGeneratorDocumentaryTests(unittest.IsolatedAsyncioTestCase):
 class DocumentaryFrameAnalysisServiceScriptGenerationTests(unittest.IsolatedAsyncioTestCase):
     async def test_generate_documentary_script_returns_final_narrated_items(self):
         service = DocumentaryFrameAnalysisService()
-        analysis_payload = {
-            "batches": [
-                {
-                    "batch_index": 0,
-                    "time_range": "00:00:00,000-00:00:03,000",
-                    "overall_activity_summary": "",
-                    "fallback_summary": "回退摘要",
-                    "frame_observations": [
-                        {"timestamp": "00:00:00,000", "observation": "镜头里有一只猫"},
-                    ],
-                }
-            ]
-        }
+        analysis_payload = _v4_analysis_payload(summary="", fallback="回退摘要")
 
         with TemporaryDirectory() as temp_dir:
             analysis_path = Path(temp_dir) / "frame_analysis_test.json"
             analysis_path.write_text(json.dumps(analysis_payload, ensure_ascii=False), encoding="utf-8")
 
-            with patch.object(
-                DocumentaryFrameAnalysisService,
-                "resolve_reusable_analysis_path",
+            with patch(
+                "app.services.documentary.frame_analysis_service.resolve_frame_analysis_path_for_documentary",
                 return_value=str(analysis_path),
             ), patch.dict(
                 "app.services.documentary.frame_analysis_service.config.app",
@@ -147,27 +160,14 @@ class DocumentaryFrameAnalysisServiceScriptGenerationTests(unittest.IsolatedAsyn
 
     async def test_generate_documentary_script_raises_when_narration_json_is_malformed(self):
         service = DocumentaryFrameAnalysisService()
-        analysis_payload = {
-            "batches": [
-                {
-                    "batch_index": 0,
-                    "time_range": "00:00:00,000-00:00:03,000",
-                    "overall_activity_summary": "测试摘要",
-                    "fallback_summary": "",
-                    "frame_observations": [
-                        {"timestamp": "00:00:00,000", "observation": "镜头里有一只猫"},
-                    ],
-                }
-            ]
-        }
+        analysis_payload = _v4_analysis_payload()
 
         with TemporaryDirectory() as temp_dir:
             analysis_path = Path(temp_dir) / "frame_analysis_test.json"
             analysis_path.write_text(json.dumps(analysis_payload, ensure_ascii=False), encoding="utf-8")
 
-            with patch.object(
-                DocumentaryFrameAnalysisService,
-                "resolve_reusable_analysis_path",
+            with patch(
+                "app.services.documentary.frame_analysis_service.resolve_frame_analysis_path_for_documentary",
                 return_value=str(analysis_path),
             ), patch.dict(
                 "app.services.documentary.frame_analysis_service.config.app",
@@ -223,27 +223,14 @@ class DocumentaryFrameAnalysisServiceScriptGenerationTests(unittest.IsolatedAsyn
 
     async def test_generate_documentary_script_includes_theme_and_custom_prompt_for_narration(self):
         service = DocumentaryFrameAnalysisService()
-        analysis_payload = {
-            "batches": [
-                {
-                    "batch_index": 0,
-                    "time_range": "00:00:00,000-00:00:03,000",
-                    "overall_activity_summary": "测试摘要",
-                    "fallback_summary": "",
-                    "frame_observations": [
-                        {"timestamp": "00:00:00,000", "observation": "镜头里有一只猫"},
-                    ],
-                }
-            ]
-        }
+        analysis_payload = _v4_analysis_payload()
 
         with TemporaryDirectory() as temp_dir:
             analysis_path = Path(temp_dir) / "frame_analysis_test.json"
             analysis_path.write_text(json.dumps(analysis_payload, ensure_ascii=False), encoding="utf-8")
 
-            with patch.object(
-                DocumentaryFrameAnalysisService,
-                "resolve_reusable_analysis_path",
+            with patch(
+                "app.services.documentary.frame_analysis_service.resolve_frame_analysis_path_for_documentary",
                 return_value=str(analysis_path),
             ), patch.dict(
                 "app.services.documentary.frame_analysis_service.config.app",

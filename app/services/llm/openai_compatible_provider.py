@@ -47,6 +47,24 @@ def _is_timeout_error(exc: Exception) -> bool:
     return "timed out" in msg or "timeout" in msg
 
 
+def _is_retryable_transport_error(exc: Exception) -> bool:
+    if _is_timeout_error(exc):
+        return True
+    msg = str(exc).lower()
+    exc_name = type(exc).__name__.lower()
+    retry_markers = (
+        "connection error",
+        "readerror",
+        "connecterror",
+        "remote protocol error",
+        "server disconnected",
+        "connection reset",
+        "broken pipe",
+        "unexpected eof",
+    )
+    return any(marker in msg or marker in exc_name for marker in retry_markers)
+
+
 def resolve_llm_timeout(
     *,
     for_script: bool = False,
@@ -220,6 +238,115 @@ class OpenAICompatibleVisionProvider(_OpenAICompatibleBase, VisionModelProvider)
         img_buffer = io.BytesIO()
         img.save(img_buffer, format="JPEG", quality=85)
         return base64.b64encode(img_buffer.getvalue()).decode("utf-8")
+
+    @staticmethod
+    def _video_to_data_url(video_path: Union[str, Path]) -> str:
+        path = Path(video_path)
+        if not path.is_file():
+            raise FileNotFoundError(f"视频文件不存在: {path}")
+        encoded = base64.b64encode(path.read_bytes()).decode("utf-8")
+        return f"data:video/mp4;base64,{encoded}"
+
+    @staticmethod
+    def _reference_image_to_data_url(image_path: Union[str, Path]) -> str:
+        path = Path(image_path)
+        if not path.is_file():
+            raise FileNotFoundError(f"参照图不存在: {path}")
+        suffix = path.suffix.lower()
+        if suffix in (".png",):
+            mime = "image/png"
+        elif suffix in (".webp",):
+            mime = "image/webp"
+        else:
+            mime = "image/jpeg"
+        encoded = base64.b64encode(path.read_bytes()).decode("utf-8")
+        return f"data:{mime};base64,{encoded}"
+
+    async def analyze_video(
+        self,
+        video_path: Union[str, Path],
+        prompt: str,
+        **kwargs,
+    ) -> str:
+        """直接分析 mp4 视频（网关需支持 data:video/mp4 base64）。"""
+        path = Path(video_path)
+        size_mb = path.stat().st_size / (1024 * 1024)
+        reference_paths = [
+            str(item).strip()
+            for item in (kwargs.get("reference_image_paths") or [])
+            if str(item).strip()
+        ]
+        logger.info(
+            f"视频分析上传: {path.name} ({size_mb:.2f} MB)"
+            + (f"，参照图 {len(reference_paths)} 张" if reference_paths else "")
+        )
+
+        data_url = self._video_to_data_url(path)
+        content: list[dict[str, Any]] = [{"type": "text", "text": prompt}]
+        for ref_path in reference_paths:
+            content.append(
+                {
+                    "type": "image_url",
+                    "image_url": {"url": self._reference_image_to_data_url(ref_path)},
+                }
+            )
+        content.append({"type": "image_url", "image_url": {"url": data_url}})
+        messages = [{"role": "user", "content": content}]
+        model_name = _normalize_model_name(self.model_name)
+        base_timeout = float(
+            kwargs.get("timeout_override") or config.app.get("llm_vision_timeout", 120)
+        )
+        timeout_retries = max(3, int(config.app.get("llm_timeout_retries", 2)))
+        last_error: Optional[Exception] = None
+
+        for attempt in range(timeout_retries):
+            timeout_seconds = base_timeout * (1.0 + 0.5 * attempt)
+            if attempt > 0:
+                wait_seconds = min(30.0, 2.0 ** attempt)
+                logger.warning(
+                    f"视频分析连接异常，{wait_seconds:.0f}s 后重试 "
+                    f"({attempt + 1}/{timeout_retries})，超时 {timeout_seconds:.0f}s"
+                )
+                await asyncio.sleep(wait_seconds)
+
+            async with self._open_client(
+                api_key_override=kwargs.get("api_key"),
+                base_url_override=kwargs.get("api_base"),
+                timeout_override=timeout_seconds,
+            ) as client:
+                try:
+                    response = await client.chat.completions.create(
+                        model=model_name,
+                        messages=messages,
+                        temperature=kwargs.get("temperature", 0.2),
+                        max_tokens=kwargs.get("max_tokens", 8000),
+                    )
+                    if response.choices and response.choices[0].message and response.choices[0].message.content:
+                        return response.choices[0].message.content
+                    raise APICallError("OpenAI 兼容接口返回空响应")
+                except OpenAIAuthError as exc:
+                    raise AuthenticationError(str(exc))
+                except OpenAIRateLimitError as exc:
+                    raise RateLimitError(str(exc))
+                except OpenAIBadRequestError as exc:
+                    error_msg = str(exc)
+                    if _is_content_filter_error(error_msg):
+                        raise ContentFilterError(f"内容被安全过滤器阻止: {error_msg}")
+                    raise APICallError(f"请求错误: {error_msg}")
+                except OpenAIAPIError as exc:
+                    last_error = exc
+                    if _is_retryable_transport_error(exc) and attempt < timeout_retries - 1:
+                        continue
+                    raise APICallError(f"API 错误: {exc}")
+                except Exception as exc:
+                    last_error = exc
+                    if _is_retryable_transport_error(exc) and attempt < timeout_retries - 1:
+                        continue
+                    raise APICallError(f"调用失败: {exc}")
+
+        if last_error:
+            raise APICallError(f"API 错误: {last_error}")
+        raise APICallError("视频分析调用失败")
 
     async def _make_api_call(self, payload: Dict[str, Any]) -> Dict[str, Any]:
         return payload

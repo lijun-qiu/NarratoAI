@@ -25,6 +25,7 @@ def build_plot_blueprint_fingerprint(
     video_path: str,
     subtitle_path: str = "",
     analysis_path: str = "",
+    video_episode_analysis_path: str = "",
     video_theme: str = "",
     append_prompt: str = "",
     enable_frame_analysis: bool = True,
@@ -32,10 +33,11 @@ def build_plot_blueprint_fingerprint(
     parts = [
         mode,
         (video_path or "").strip(),
+        (video_episode_analysis_path or "").strip() if enable_frame_analysis else "",
         (analysis_path or "").strip() if enable_frame_analysis else "",
         (video_theme or "").strip(),
         (append_prompt or "").strip(),
-        "frame" if enable_frame_analysis else "subtitle_only",
+        "visual" if enable_frame_analysis else "subtitle_only",
     ]
     digest = hashlib.sha256("|".join(parts).encode("utf-8")).hexdigest()
     return digest[:16]

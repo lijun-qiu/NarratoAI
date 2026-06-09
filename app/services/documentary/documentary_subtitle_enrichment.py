@@ -43,6 +43,13 @@ from app.services.short_drama_drama_knowledge import (
     find_name_mistakes_in_text,
 )
 from app.services.short_drama_settings import get_short_drama_settings
+from app.services.documentary.video_episode_analysis import (
+    build_video_episode_analysis_markdown,
+    build_video_episode_time_bounds_section,
+    load_video_episode_analysis_artifact,
+    summarize_video_episode_markdown,
+    video_episode_summary_usable,
+)
 from app.services.srt_utils import SrtEntry, entries_to_srt, parse_srt, _time_str_to_ms
 from app.utils import utils
 
@@ -1294,10 +1301,22 @@ def build_plot_blueprint_material_principles(
     *,
     has_srt_subtitle: bool = False,
     has_frame_subtitle: bool = False,
+    use_video_episode_analysis: bool = False,
     theme: str = "",
     settings: dict[str, Any] | None = None,
 ) -> str:
-    """构思蓝图：抽帧为主（画面/场景），SRT 为辅（对白/时间戳）；无 SRT 时回退抽帧内字幕。"""
+    """构思蓝图：整片视频分析或抽帧为主（画面/剧情），SRT 为辅（对白/时间戳）。"""
+    if use_video_episode_analysis:
+        visual_line = (
+            "- **整片视频分析（主·画面/剧情/10秒格）**：下方 `<video_episode_analysis>` 的 "
+            "`episodic_segments`（time_range / key_events / narration / environment_description）"
+            "为剧情主线与画面环境第一依据"
+        )
+    else:
+        visual_line = (
+            "- **抽帧（主·画面/场景）**：时间线、action/observation、场景/昼夜/人物动作 — **画面须与抽帧一致**"
+        )
+
     if has_srt_subtitle:
         srt_line = (
             "- **SRT 字幕（对白/时间戳主）**：下方 `<subtitles>` 为原始 SRT；"
@@ -1334,11 +1353,16 @@ def build_plot_blueprint_material_principles(
     )
     cfg = settings or get_documentary_compact_settings()
     lead_sec = int(cfg.get("ost0_lead_before_ost1_sec", 10) or 10)
+    evidence_line = (
+        "情节点须能在整片视频分析与字幕中找到依据；禁止编造未支持的场景、台词或时间戳"
+        if use_video_episode_analysis
+        else "情节点须能在抽帧与字幕中找到依据；禁止编造未支持的场景、台词或时间戳"
+    )
     return f"""## 素材优先级（构思蓝图 · 硬性）
-- **抽帧（主·画面/场景）**：时间线、action/observation、场景/昼夜/人物动作 — **画面须与抽帧一致**
-- **剧集人物关系对照（辅）**：理解剧情、校正人名/关系/阵营；**不得覆盖或否定抽帧中已出现的画面**
+{visual_line}
+- **剧集人物关系对照（辅）**：理解剧情、校正人名/关系/阵营；**不得覆盖或否定画面中已出现的信息**
 {subtitle_lines}
-- 情节点须能在抽帧与字幕中找到依据；禁止编造未支持的场景、台词或时间戳
+- {evidence_line}
 
 ## OST=0 取画时间（声画对位 · 硬性）
 - **`_id` 播放顺序 ≠ 原片时间顺序**；但 OST=0 的 `timestamp` 必须对准**本段解说所描述/引出的画面**
@@ -1361,7 +1385,11 @@ def _append_plot_blueprint_material_sections(
     frame_subtitle_excerpt: str = "",
     has_srt_subtitle: bool = False,
     has_frame_subtitle: bool = False,
+    visual_summary: str = "",
+    use_video_episode_analysis: bool = False,
+    frame_supplement_summary: str = "",
 ) -> str:
+    primary_summary = (visual_summary or frame_summary or "").strip()
     if for_plot_blueprint:
         if has_srt_subtitle:
             subtitle_block = (
@@ -1390,14 +1418,33 @@ def _append_plot_blueprint_material_sections(
                 "<!-- 暂无 SRT 与抽帧内字幕；对白见抽帧摘要与字幕人物索引 -->\n"
                 "</subtitles>"
             )
+        visual_block = ""
+        if use_video_episode_analysis:
+            visual_block = (
+                f"<video_episode_analysis>\n"
+                f"<!-- 构思蓝图 · 整片视频分析第一依据 · 须逐项对照 -->\n"
+                f"{primary_summary}\n"
+                f"</video_episode_analysis>"
+            )
+            if (frame_supplement_summary or "").strip():
+                visual_block += (
+                    f"\n\n<video_frame_summary>\n"
+                    f"<!-- 抽帧补充参照（非第一依据） -->\n"
+                    f"{frame_supplement_summary.strip()}\n"
+                    f"</video_frame_summary>"
+                )
+        else:
+            visual_block = (
+                f"<video_frame_summary>\n"
+                f"<!-- 构思蓝图 · 画面/场景第一依据 · 须逐项对照 -->\n"
+                f"{primary_summary}\n"
+                f"</video_frame_summary>"
+            )
         return (
             prompt
             + f"""
 
-<video_frame_summary>
-<!-- 构思蓝图 · 画面/场景第一依据 · 须逐项对照 -->
-{frame_summary}
-</video_frame_summary>
+{visual_block}
 
 {subtitle_block}
 """
@@ -1407,7 +1454,7 @@ def _append_plot_blueprint_material_sections(
         + f"""
 
 <video_frame_summary>
-{frame_summary}
+{primary_summary}
 </video_frame_summary>
 
 <subtitles>
@@ -1430,10 +1477,13 @@ def analyze_subtitle_with_frames(
     frame_json_path: str | None = None,
     for_plot_blueprint: bool = False,
     source_duration_sec: float | None = None,
+    video_episode_json_path: str | None = None,
+    video_episode_markdown: str = "",
 ) -> str:
-    """文本模型：结合字幕与抽帧摘要做对照分析。
+    """文本模型：结合字幕与整片视频分析/抽帧摘要做对照分析。
 
-    for_plot_blueprint=True 时以抽帧画面为主；有 SRT 时对白/时间戳以 SRT 为准，抽帧内字幕作辅。
+    for_plot_blueprint=True 时优先以整片视频分析为主；否则以抽帧画面为主。
+    有 SRT 时对白/时间戳以 SRT 为准。
     """
     cfg = documentary_settings or get_documentary_settings()
     is_short_drama = (analysis_style or "").strip().lower() == "short_drama"
@@ -1471,6 +1521,21 @@ def analyze_subtitle_with_frames(
                 int(cfg.get("subtitle_analysis_max_subtitle_chars", 12000) or 12000),
             )
 
+    video_episode_path = (video_episode_json_path or "").strip()
+    video_episode_raw_markdown = (video_episode_markdown or "").strip()
+    video_episode_artifact: dict[str, Any] = {}
+    use_video_episode_analysis = False
+    video_episode_summary = ""
+    if video_episode_path and os.path.isfile(video_episode_path):
+        try:
+            video_episode_artifact = load_video_episode_analysis_artifact(video_episode_path)
+            if not video_episode_raw_markdown:
+                video_episode_raw_markdown = build_video_episode_analysis_markdown(
+                    video_episode_artifact
+                )
+        except (OSError, ValueError, json.JSONDecodeError) as exc:
+            logger.warning(f"读取整片视频分析失败: {video_episode_path} ({exc})")
+
     frame_max_chars = int(cfg.get("subtitle_analysis_max_frame_chars", 8000))
     frame_sampling = "head"
     if for_plot_blueprint or is_short_drama:
@@ -1489,8 +1554,69 @@ def analyze_subtitle_with_frames(
         sampling=frame_sampling,
         frame_json_path=frame_json_path,
     )
+    if video_episode_raw_markdown:
+        video_max_chars = int(cfg.get("subtitle_analysis_max_video_episode_chars", 30000) or 30000)
+        video_episode_summary = summarize_video_episode_markdown(
+            video_episode_raw_markdown,
+            video_max_chars,
+        )
+        use_video_episode_analysis = video_episode_summary_usable(video_episode_summary)
+
+    visual_summary = video_episode_summary if use_video_episode_analysis else frame_summary
+    visual_source_label = "整片视频分析" if use_video_episode_analysis else "抽帧"
+    frame_supplement_summary = frame_summary if use_video_episode_analysis else ""
+
+    if use_video_episode_analysis:
+        blueprint_read_hint = (
+            "请**深读 SRT 字幕（对白/时间戳第一依据）**并**对照下方整片视频分析（剧情/画面/环境第一依据）**"
+            if has_srt_subtitle
+            else "请**深读下方整片视频分析（第一依据）**"
+        )
+        blueprint_analysis_rules = (
+            """- **先通读 SRT 字幕**：梳理剧情主线、对白与关键台词
+- **再对照整片视频分析**：10秒格 time_range、key_events、narration、environment_description 须逐项利用
+- **交叉验证**：台词/时间戳以 SRT 为准，画面/环境/旁白以整片视频分析为准"""
+            if has_srt_subtitle
+            else """- **先通读整片视频分析**：按 episodic_segments 时间线梳理场景、人物、动作与环境"""
+        )
+        blueprint_timestamp_rule = (
+            "**优先来自 SRT**，格式 **HH:MM:SS,mmm-HH:MM:SS,mmm**（禁止 `-->`）；须落在整片视频分析时间边界内"
+            if has_srt_subtitle
+            else "**仅**能使用整片视频分析与 important_dialogues 中的真实时间；格式 **HH:MM:SS,mmm-HH:MM:SS,mmm**（禁止 `-->`）"
+        )
+        blueprint_timeline_label = (
+            "SRT + 整片视频分析 chronology" if has_srt_subtitle else "整片视频分析 chronology"
+        )
+        blueprint_visual_anchor = "整片视频分析同段 episodic_segments"
+        blueprint_evidence_source = "整片视频分析"
+    else:
+        blueprint_read_hint = (
+            "请**深读 SRT 字幕（对白/时间戳第一依据）**并**对照下方抽帧摘要（画面/场景第一依据）**"
+            if has_srt_subtitle
+            else "请**深读下方抽帧摘要（第一依据）**"
+        )
+        blueprint_analysis_rules = (
+            """- **先通读 SRT 字幕**：梳理剧情主线、对白与关键台词
+- **再对照抽帧**：场景、人物、动作、昼夜须与锚点表一致
+- **交叉验证**：抽帧 subtitle_entries 与 SRT 不一致时，**台词/时间戳以 SRT 为准**，画面以抽帧为准"""
+            if has_srt_subtitle
+            else """- **先通读抽帧**：按时间线梳理场景、人物、动作、subtitle_entries / 硬字幕"""
+        )
+        blueprint_timestamp_rule = (
+            "**优先来自 SRT**，格式 **HH:MM:SS,mmm-HH:MM:SS,mmm**（禁止 `-->`）；须落在抽帧时间边界上限内"
+            if has_srt_subtitle
+            else "**仅**能使用上方「抽帧时间边界与场景锚点」与 subtitle_entries；格式 **HH:MM:SS,mmm-HH:MM:SS,mmm**（禁止 `-->`）"
+        )
+        blueprint_timeline_label = "SRT + 抽帧 chronology" if has_srt_subtitle else "抽帧 chronology"
+        blueprint_visual_anchor = "锚点表同段抽帧"
+        blueprint_evidence_source = "抽帧"
+
     if for_plot_blueprint:
-        if not _frame_summary_usable(frame_summary):
+        if use_video_episode_analysis:
+            if not video_episode_summary_usable(video_episode_summary):
+                logger.warning("构思蓝图：整片视频分析摘要为空，无法生成")
+                return ""
+        elif not _frame_summary_usable(frame_summary):
             logger.warning("构思蓝图：抽帧摘要为空，无法生成")
             return ""
     elif not has_subtitle:
@@ -1536,7 +1662,11 @@ def analyze_subtitle_with_frames(
     if for_plot_blueprint:
         if has_srt_subtitle:
             srt_time_bounds = collect_subtitle_time_bounds(srt_text)
-    if for_plot_blueprint and json_path:
+    if for_plot_blueprint and use_video_episode_analysis and video_episode_artifact:
+        time_bounds_section = build_video_episode_time_bounds_section(video_episode_artifact)
+        if source_duration_sec and source_duration_sec > 0:
+            time_bounds_section += f"\n- 源视频实测时长：**{source_duration_sec:.1f}s**"
+    elif for_plot_blueprint and json_path:
         frame_time_bounds = collect_frame_analysis_time_bounds(json_path)
         time_bounds_section = build_frame_analysis_time_bounds_section(
             json_path,
@@ -1556,16 +1686,26 @@ def analyze_subtitle_with_frames(
             if has_frame_subtitle
             else "抽帧内字幕无"
         )
+        visual_input = (
+            f"整片视频分析摘要 {len(video_episode_summary)} 字"
+            if use_video_episode_analysis
+            else f"抽帧摘要 {len(frame_summary)} 字（采样 {frame_sampling}）"
+        )
         logger.info(
-            f"{analysis_label}输入：抽帧摘要 {len(frame_summary)} 字（采样 {frame_sampling}），"
+            f"{analysis_label}输入：{visual_input}，"
             f"{srt_info}，{frame_info}，要求输出 ≥{min_chars} 字"
             + (f"，抽帧字幕索引 {len(frame_lexicon_block)} 字" if frame_lexicon_block else "")
             + (f"，剧集知识库 {len(drama_knowledge_block)} 字" if drama_knowledge_block else "")
         )
         if not has_subtitle:
+            fallback_note = (
+                "对白与时间戳只能从整片视频分析 important_dialogues 推断"
+                if use_video_episode_analysis
+                else "对白与时间戳只能从抽帧 observation 推断"
+            )
             logger.warning(
                 "构思蓝图：未提供 SRT 且抽帧 JSON 无 subtitle_entries / 硬字幕，"
-                "对白与时间戳只能从抽帧 observation 推断"
+                + fallback_note
             )
     else:
         logger.info(
@@ -1584,12 +1724,17 @@ def analyze_subtitle_with_frames(
 
     if progress_callback:
         if for_plot_blueprint:
-            if has_srt_subtitle:
+            if use_video_episode_analysis:
+                if has_srt_subtitle:
+                    progress_callback("正在分析字幕并对照整片视频分析构思剧情方案...")
+                else:
+                    progress_callback("正在以整片视频分析为主构思剧情方案...")
+            elif has_srt_subtitle:
                 progress_callback("正在分析字幕并对照抽帧构思剧情方案...")
             else:
                 progress_callback("正在以抽帧为主构思剧情方案...")
         else:
-            progress_callback("正在分析字幕并对照抽帧画面...")
+            progress_callback("正在分析字幕并对照画面素材...")
 
     compact = is_compact_documentary_settings(cfg)
     append_text = resolve_append_custom_prompt(append_custom_prompt, cfg)
@@ -1619,26 +1764,11 @@ def analyze_subtitle_with_frames(
             principles = build_plot_blueprint_material_principles(
                 has_srt_subtitle=has_srt_subtitle,
                 has_frame_subtitle=has_frame_subtitle,
+                use_video_episode_analysis=use_video_episode_analysis,
                 theme=theme,
                 settings=cfg,
             )
-            blueprint_read_hint = (
-                "请**深读 SRT 字幕（对白/时间戳第一依据）**并**对照下方抽帧摘要（画面/场景第一依据）**"
-                if has_srt_subtitle
-                else "请**深读下方抽帧摘要（第一依据）**"
-            )
-            blueprint_analysis_rules = (
-                """- **先通读 SRT 字幕**：按时间线梳理剧情主线、对白与关键台词
-- **再对照抽帧**：场景、人物、动作、昼夜须与 scene_segments / 锚点表一致
-- **交叉验证**：抽帧 subtitle_entries / 硬字幕与 SRT 不一致时，**台词/时间戳以 SRT 为准**，画面以抽帧为准"""
-                if has_srt_subtitle
-                else """- **先通读抽帧**：按 scene_segments 时间线梳理场景、人物、动作、subtitle_entries / 硬字幕"""
-            )
-            timestamp_rule = (
-                "**优先来自 SRT**，且须落在上方「抽帧时间边界与场景锚点」上限内；禁止编造、禁止超出原片/抽帧上限"
-                if has_srt_subtitle
-                else "**仅**能使用上方「抽帧时间边界与场景锚点」表内或抽帧摘要中的真实时间；**禁止编造、禁止超出原片/抽帧上限**"
-            )
+            timestamp_rule = blueprint_timestamp_rule
             ost1_source = "SRT / 抽帧字幕索引" if has_srt_subtitle else "抽帧/字幕索引"
             ost1_text_priority = (
                 "优先 SRT 原文，其次 subtitle_entries.text"
@@ -1763,13 +1893,14 @@ def analyze_subtitle_with_frames(
             principles = build_plot_blueprint_material_principles(
                 has_srt_subtitle=has_srt_subtitle,
                 has_frame_subtitle=has_frame_subtitle,
+                use_video_episode_analysis=use_video_episode_analysis,
                 theme=theme,
                 settings=cfg,
             )
             compact_subtitle_hint = (
-                "SRT 字幕与抽帧画面摘要"
+                f"SRT 字幕与{visual_source_label}摘要"
                 if has_srt_subtitle
-                else "抽帧画面摘要"
+                else f"{visual_source_label}摘要"
             )
             prompt = f"""{append_block}{principles}请以**{compact_subtitle_hint}**为主、剧集对照为辅，输出供精剪脚本使用的对照分析（350–550 字）。
 
@@ -1812,53 +1943,36 @@ def analyze_subtitle_with_frames(
             principles = build_plot_blueprint_material_principles(
                 has_srt_subtitle=has_srt_subtitle,
                 has_frame_subtitle=has_frame_subtitle,
+                use_video_episode_analysis=use_video_episode_analysis,
                 theme=theme,
                 settings=cfg,
             )
-            sd_blueprint_read_hint = (
-                "请**深读 SRT 字幕（对白/时间戳第一依据）**并**对照下方抽帧摘要（画面/场景第一依据）**"
-                if has_srt_subtitle
-                else "请**深读下方抽帧摘要（第一依据）**"
-            )
-            sd_analysis_rules = (
-                """- **先通读 SRT 字幕**：梳理剧情主线、对白与关键台词
-- **再对照抽帧**：场景、人物、动作、昼夜须与锚点表一致
-- **交叉验证**：抽帧 subtitle_entries 与 SRT 不一致时，**台词/时间戳以 SRT 为准**，画面以抽帧为准"""
-                if has_srt_subtitle
-                else """- **先通读抽帧**：按时间线梳理场景、人物、动作、subtitle_entries / 硬字幕"""
-            )
-            sd_timestamp_rule = (
-                "**优先来自 SRT**，格式 **HH:MM:SS,mmm-HH:MM:SS,mmm**（禁止 `-->`）；须落在抽帧时间边界上限内"
-                if has_srt_subtitle
-                else "**仅**能使用上方「抽帧时间边界与场景锚点」与 subtitle_entries；格式 **HH:MM:SS,mmm-HH:MM:SS,mmm**（禁止 `-->`）；**禁止超出原片/抽帧上限**"
-            )
-            sd_timeline_label = "SRT + 抽帧 chronology" if has_srt_subtitle else "抽帧 chronology"
             prompt = f"""{append_block}{principles}
 {time_bounds_section}
-{knowledge_section}{lexicon_section}你是顶级短剧解说策划。{sd_blueprint_read_hint}，用剧集人物关系对照理解并校正人名/关系，输出供写 JSON 脚本的**完美剧情构思方案**（**2000–3500 字**，结构化 Markdown，不要 JSON）。
+{knowledge_section}{lexicon_section}你是顶级短剧解说策划。{blueprint_read_hint}，用剧集人物关系对照理解并校正人名/关系，输出供写 JSON 脚本的**完美剧情构思方案**（**2000–3500 字**，结构化 Markdown，不要 JSON）。
 
 作品/主题：{theme}
 
 ## 分析原则（硬性）
-{sd_analysis_rules}
+{blueprint_analysis_rules}
 - **再用剧集对照校正**：身份/亲属/阵营须与对照表一致；**谐音/ASR 错字须归并为同一人**（见上方「人名谐音/ASR 归并」）
-- **时间戳**：{sd_timestamp_rule}
-- **画面要点**：性别/表情/动作/场景/昼夜**必须与锚点表同段抽帧一致**；禁止写「场景N」，改用 **时间段+地点**
+- **时间戳**：{blueprint_timestamp_rule}
+- **画面要点**：性别/表情/动作/场景/昼夜**必须与{blueprint_visual_anchor}一致**；禁止写「场景N」，改用 **时间段+地点**
 - 产出**可执行脚本蓝图**，不是 3–5 段空泛总结
 
 必须按以下标题逐项填写（缺一不可）：
 
 ## 主要人物表
 - **每人只列一行**：用对照表**规范全名**；subtitle 谐音/简称须归并到同一人，括号注明「又名/字幕常写：…」
-- 身份/关系 + **性别** + 外貌/气质（抽帧）；须出现在抽帧或对照表
+- 身份/关系 + **性别** + 外貌/气质（{visual_source_label}）；须出现在{blueprint_evidence_source}或对照表
 - **禁止**因写法不同拆成两个角色（如小月/胡小月/胡晓月均指胡小跃）
 
 ## 开头高潮方案（→ JSON 第 1 段 OST=1）
 - 从**全片**选最爆燃段落；金句原文 + **HH:MM:SS,mmm-HH:MM:SS,mmm** + 画面（时间段+地点+动作）
 - 第 1 段纯原声，禁止旁白
 
-## 原片时间线（按{sd_timeline_label}，供选材）
-- 至少 **12–16 个情节点**；每点：**抽帧时间段 + 事件 + 画面要点**
+## 原片时间线（按{blueprint_timeline_label}，供选材）
+- 至少 **12–16 个情节点**；每点：**时间段 + 事件 + 画面/环境要点**
 - 标注适合 OST=0 串场 vs OST=1 原声
 
 ## 成片叙事顺序方案（→ JSON 的 `_id` 播放顺序 · 重要）
@@ -1879,20 +1993,20 @@ def analyze_subtitle_with_frames(
 - **点评上一段 OST=1**：写清与上一段原声同场 `timestamp`
 
 ## 声画对位注意
-- 抽帧内部不一致处；昼夜光线易错点；声画反差 moment
+- {visual_source_label}内部不一致处；昼夜光线易错点；声画反差 moment
 
-禁忌：不要警员1/说话人1；不要「场景N」编号；不要 `-->` 时间戳；不要编造抽帧未支持的人名/时间戳
+禁忌：不要警员1/说话人1；不要「场景N」编号；不要 `-->` 时间戳；不要编造{blueprint_evidence_source}未支持的人名/时间戳
 """
             system_prompt = (
-                "你是短剧解说策划，擅长字幕×抽帧联合梳理剧集剧情。"
+                f"你是短剧解说策划，擅长字幕×{visual_source_label}联合梳理剧集剧情。"
                 if has_srt_subtitle
-                else "你是短剧解说策划，擅长以抽帧画面梳理剧集剧情。"
+                else f"你是短剧解说策划，擅长以{visual_source_label}梳理剧集剧情。"
             ) + (
-                "须依据字幕/抽帧与剧集人物关系对照输出完整 Markdown 蓝图；"
+                f"须依据字幕/{visual_source_label}与剧集人物关系对照输出完整 Markdown 蓝图；"
                 "谐音/ASR 人名须归并为同一人，关系须准确，不要 JSON，不要中途截断。"
             )
         else:
-            prompt = f"""{append_block}{knowledge_section}{lexicon_section}你是顶级短剧解说策划。请**先熟悉上方「剧集人物关系对照」**，再**同时深读字幕、抽帧画面与「抽帧字幕人物索引」**，交叉验证后输出供写 JSON 脚本的**完美剧情构思方案**（**2000–3500 字**，结构化 Markdown，不要 JSON）。
+            prompt = f"""{append_block}{knowledge_section}{lexicon_section}你是顶级短剧解说策划。请**先熟悉上方「剧集人物关系对照」**，再**同时深读字幕、{visual_source_label}画面与「抽帧字幕人物索引」**，交叉验证后输出供写 JSON 脚本的**完美剧情构思方案**（**2000–3500 字**，结构化 Markdown，不要 JSON）。
 
 作品/主题：{theme}
 
@@ -1971,6 +2085,9 @@ def analyze_subtitle_with_frames(
         frame_subtitle_excerpt=frame_subtitle_excerpt,
         has_srt_subtitle=has_srt_subtitle,
         has_frame_subtitle=has_frame_subtitle,
+        visual_summary=visual_summary,
+        use_video_episode_analysis=use_video_episode_analysis,
+        frame_supplement_summary=frame_supplement_summary,
     )
 
     text_provider = config.app.get("text_llm_provider", "openai").lower()

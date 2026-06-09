@@ -88,3 +88,32 @@ def resolve_frame_analysis_path_for_documentary(
             reuse=reuse,
         )
     return None
+
+
+def resolve_video_episode_analysis_path_for_documentary(
+    output_video_path: str,
+    *,
+    material_source_video_path: str = "",
+    explicit_path: str | None = None,
+) -> str | None:
+    """解析整片视频分析 JSON：显式路径 → 默认落盘路径 → 素材来源视频配对。"""
+    from app.services.documentary.video_episode_analysis import (
+        default_video_episode_analysis_path,
+    )
+
+    explicit = (explicit_path or "").strip()
+    if explicit and os.path.isfile(explicit):
+        return explicit
+
+    output = normalize_material_source_video_path(output_video_path)
+    if output and os.path.isfile(output):
+        default_path = default_video_episode_analysis_path(output)
+        if os.path.isfile(default_path):
+            return default_path
+
+    source = normalize_material_source_video_path(material_source_video_path)
+    if source and os.path.isfile(source) and source != output:
+        source_default = default_video_episode_analysis_path(source)
+        if os.path.isfile(source_default):
+            return source_default
+    return None

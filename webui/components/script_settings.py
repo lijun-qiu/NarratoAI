@@ -622,17 +622,27 @@ def _render_documentary_material_status(tr) -> None:
     from app.services.documentary.documentary_material_resolver import (
         resolve_frame_analysis_path_for_documentary,
         resolve_subtitle_path_for_documentary,
+        resolve_video_episode_analysis_path_for_documentary,
+    )
+    from webui.components.video_episode_analysis_settings import (
+        sync_video_episode_analysis_with_video,
     )
 
     video_path = (st.session_state.get("video_origin_path") or "").strip()
     if not video_path:
         return
 
+    sync_video_episode_analysis_with_video(video_path)
     material_source = (st.session_state.get("doc_material_source_video_path") or "").strip()
     subtitle_path = resolve_subtitle_path_for_documentary(
         video_path,
         material_source_video_path=material_source,
         explicit_path=st.session_state.get("subtitle_path"),
+    )
+    video_episode_path = resolve_video_episode_analysis_path_for_documentary(
+        video_path,
+        material_source_video_path=material_source,
+        explicit_path=st.session_state.get("video_episode_analysis_json_path"),
     )
     analysis_path = resolve_frame_analysis_path_for_documentary(
         video_path,
@@ -641,20 +651,25 @@ def _render_documentary_material_status(tr) -> None:
         reuse=True,
     )
 
-    cols = st.columns(2)
+    cols = st.columns(3)
     with cols[0]:
         if subtitle_path and os.path.isfile(subtitle_path):
             st.success(f"字幕: {os.path.basename(subtitle_path)}")
         else:
             st.warning("字幕: 未就绪")
     with cols[1]:
+        if video_episode_path and os.path.isfile(video_episode_path):
+            st.success(f"视频分析: {os.path.basename(video_episode_path)}")
+        else:
+            st.warning("视频分析: 未就绪")
+    with cols[2]:
         if analysis_path and os.path.isfile(analysis_path):
             st.success(f"抽帧分析: {os.path.basename(analysis_path)}")
         else:
             st.warning("抽帧分析: 未就绪")
 
     st.caption(
-        f"可在下方从默认目录选用字幕与抽帧分析；转录、抽帧、校准也可在「{tr('Material Preprocess')}」中完成。"
+        f"视频分析 JSON 会按当前视频自动配对；也可在「{tr('Material Preprocess')}」中生成或补全。"
     )
 
 
@@ -670,17 +685,38 @@ def render_documentary_subtitle_options(tr, doc_settings, *, compact: bool = Fal
 
 
 def _render_short_drama_frame_analysis_block(tr) -> None:
-    """短剧解说：抽帧分析 JSON 选用/导入（独立于折叠面板，始终可见）。"""
+    """短剧解说：整片视频分析 / 抽帧分析 JSON 状态（自动配对当前视频）。"""
     from app.services.documentary.documentary_material_resolver import (
         resolve_frame_analysis_path_for_documentary,
+        resolve_video_episode_analysis_path_for_documentary,
+    )
+    from webui.components.video_episode_analysis_settings import (
+        sync_video_episode_analysis_with_video,
     )
 
     consume_pending_reuse_frame_analysis()
     video_path = (st.session_state.get("video_origin_path") or "").strip()
     if video_path:
+        sync_video_episode_analysis_with_video(video_path)
         sync_frame_analysis_with_video(video_path)
 
     material_source = (st.session_state.get("doc_material_source_video_path") or "").strip()
+    video_episode_explicit = (
+        st.session_state.get("video_episode_analysis_json_path") or ""
+    ).strip() or None
+    video_episode_resolved = resolve_video_episode_analysis_path_for_documentary(
+        video_path,
+        material_source_video_path=material_source,
+        explicit_path=video_episode_explicit,
+    )
+    st.markdown("**整片视频分析 JSON**（构思蓝图优先）")
+    if video_episode_resolved and os.path.isfile(video_episode_resolved):
+        source = "已确认选用" if video_episode_explicit else "自动配对"
+        st.success(f"{source}: `{os.path.basename(video_episode_resolved)}`")
+        st.session_state["video_episode_analysis_json_path"] = video_episode_resolved
+    else:
+        st.info("请先在「素材预处理 → 整片视频分析」生成 JSON，生成后将自动配对当前视频。")
+
     explicit_path = (st.session_state.get("frame_analysis_json_path") or "").strip() or None
     resolved_path = resolve_frame_analysis_path_for_documentary(
         video_path,
@@ -714,8 +750,8 @@ def short_drama_summary(tr):
     st.session_state.setdefault("narration_workflow_mode", "summary")
     config.app.setdefault("narration_workflow_mode", "summary")
     st.caption(
-        "推荐流程：完成字幕转录与抽帧分析 → 下方选用抽帧 JSON 与字幕 → "
-        "**① 自动生成** 或 **手动填写/修正** 剧情构思方案 → **② 生成 JSON 脚本**（有方案后无需字幕/抽帧）。"
+        "推荐流程：完成字幕转录与「整片视频分析」→ 下方选用字幕 → "
+        "**① 自动生成** 或 **手动填写/修正** 剧情构思方案 → **② 生成 JSON 脚本**（有方案后无需重复分析）。"
     )
     _render_short_drama_frame_analysis_block(tr)
     st.divider()
@@ -732,10 +768,10 @@ def short_drama_summary(tr):
     doc_settings = get_documentary_settings()
     default_enabled = bool(doc_settings.get("enable_subtitle_enrichment", True))
     st.checkbox(
-        "结合抽帧分析（有 JSON 时与字幕交叉验证，参照逐帧精剪）",
+        "结合视频/抽帧分析（优先整片视频分析 JSON，与字幕交叉验证）",
         value=st.session_state.get("sd_enable_frame_analysis", default_enabled),
         key="sd_enable_frame_analysis",
-        help="勾选后须先确认选用抽帧分析 JSON；取消勾选则仅用字幕生成（兼容旧流程）",
+        help="勾选后优先使用「素材预处理 → 整片视频分析」JSON；若无则回退抽帧 JSON；取消勾选则仅用字幕",
     )
     return render_subtitle_narration_panel(
         tr,
@@ -1168,6 +1204,9 @@ def render_subtitle_narration_panel(
 def _compute_plot_blueprint_fingerprint(params, script_path: str) -> str:
     subtitle_path = _resolve_active_subtitle_path()
     analysis_path = (st.session_state.get("frame_analysis_json_path") or "").strip()
+    video_episode_analysis_path = (
+        st.session_state.get("video_episode_analysis_json_path") or ""
+    ).strip()
     enable_frame = True
     if script_path == "summary":
         enable_frame = bool(st.session_state.get("sd_enable_frame_analysis", True))
@@ -1176,6 +1215,7 @@ def _compute_plot_blueprint_fingerprint(params, script_path: str) -> str:
         video_path=(params.video_origin_path or "").strip(),
         subtitle_path=subtitle_path,
         analysis_path=analysis_path,
+        video_episode_analysis_path=video_episode_analysis_path,
         video_theme=str(st.session_state.get("video_theme") or ""),
         append_prompt=str(st.session_state.get("append_custom_prompt") or ""),
         enable_frame_analysis=enable_frame,

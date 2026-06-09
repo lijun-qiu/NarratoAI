@@ -20,8 +20,13 @@ from app.services.SDE.short_drama_explanation import analyze_subtitle, generate_
 from app.services.subtitle_text import read_subtitle_text
 from app.services.documentary.documentary_settings import get_documentary_settings
 from app.services.documentary.documentary_material_resolver import (
-    resolve_frame_analysis_path_for_documentary,
     normalize_material_source_video_path,
+    resolve_frame_analysis_path_for_documentary,
+    resolve_video_episode_analysis_path_for_documentary,
+)
+from app.services.documentary.video_episode_analysis import (
+    build_video_episode_analysis_markdown,
+    load_video_episode_analysis_artifact,
 )
 from app.services.documentary.documentary_subtitle_enrichment import (
     analyze_subtitle_with_frames,
@@ -271,6 +276,22 @@ def _resolve_frame_analysis_for_short_drama(video_path: str) -> str:
         material_source_video_path=material_source,
         explicit_path=explicit_analysis,
         reuse=reuse_frame_analysis,
+    ) or ""
+
+
+def _resolve_video_episode_analysis_for_short_drama(video_path: str) -> str:
+    """解析短剧解说可用的整片视频分析 JSON 路径。"""
+    material_source = _material_source_video_path()
+    explicit_path = (
+        st.session_state.get("video_episode_analysis_json_path") or ""
+    ).strip() or None
+    return (
+        resolve_video_episode_analysis_path_for_documentary(
+            video_path,
+            material_source_video_path=material_source,
+            explicit_path=explicit_path,
+        )
+        or ""
     )
 
 
@@ -295,31 +316,20 @@ def generate_plot_blueprint_short(
                 st.error("请先选择视频文件")
                 return
 
-            enable_frame_analysis = bool(st.session_state.get("sd_enable_frame_analysis", True))
+            enable_visual_analysis = bool(st.session_state.get("sd_enable_frame_analysis", True))
             doc_settings = get_documentary_settings()
             plot_analysis = ""
-            source_label = "字幕×抽帧×剧情联合分析"
+            source_label = "字幕×整片视频分析×剧情联合分析"
             analysis_json_path = ""
+            video_episode_json_path = ""
 
-            if enable_frame_analysis:
-                analysis_json_path = _resolve_frame_analysis_for_short_drama(params.video_origin_path)
-                if not analysis_json_path:
-                    st.error("未找到可用的抽帧分析 JSON，请先完成抽帧或取消勾选「结合抽帧分析」")
-                    return
+            if enable_visual_analysis:
+                video_episode_json_path = _resolve_video_episode_analysis_for_short_drama(
+                    params.video_origin_path
+                )
                 subtitle_content = ""
                 if subtitle_path and os.path.exists(subtitle_path):
                     subtitle_content = read_subtitle_text(subtitle_path).text
-                update_progress(20, "正在整理抽帧分析结果...")
-                frame_summary = _prepare_frame_summary(analysis_json_path, doc_settings)
-                if not (frame_summary or "").strip():
-                    st.error("抽帧分析结果为空，请重新执行「抽帧并分析」")
-                    return
-                update_progress(
-                    40,
-                    "正在分析字幕并对照抽帧构思剧情方案..."
-                    if (subtitle_content or "").strip()
-                    else "正在以抽帧为主构思剧情方案...",
-                )
                 source_duration_sec = 0.0
                 try:
                     source_duration_sec = float(
@@ -327,18 +337,71 @@ def generate_plot_blueprint_short(
                     )
                 except Exception:
                     source_duration_sec = 0.0
-                plot_analysis = analyze_subtitle_with_frames(
-                    subtitle_content=subtitle_content,
-                    frame_markdown=frame_summary,
-                    video_theme=video_theme or "本短剧",
-                    progress_callback=lambda msg: update_progress(55, msg),
-                    documentary_settings=doc_settings,
-                    analysis_style="short_drama",
-                    frame_json_path=analysis_json_path,
-                    append_custom_prompt=str(st.session_state.get("append_custom_prompt") or ""),
-                    for_plot_blueprint=True,
-                    source_duration_sec=source_duration_sec or None,
-                )
+
+                if video_episode_json_path:
+                    update_progress(20, "正在整理整片视频分析结果...")
+                    video_artifact = load_video_episode_analysis_artifact(video_episode_json_path)
+                    video_markdown = build_video_episode_analysis_markdown(video_artifact)
+                    analysis_json_path = _resolve_frame_analysis_for_short_drama(
+                        params.video_origin_path
+                    )
+                    frame_summary = ""
+                    if analysis_json_path:
+                        frame_summary = _prepare_frame_summary(analysis_json_path, doc_settings)
+                    update_progress(
+                        40,
+                        "正在分析字幕并对照整片视频分析构思剧情方案..."
+                        if (subtitle_content or "").strip()
+                        else "正在以整片视频分析为主构思剧情方案...",
+                    )
+                    plot_analysis = analyze_subtitle_with_frames(
+                        subtitle_content=subtitle_content,
+                        frame_markdown=frame_summary,
+                        video_theme=video_theme or "本短剧",
+                        progress_callback=lambda msg: update_progress(55, msg),
+                        documentary_settings=doc_settings,
+                        analysis_style="short_drama",
+                        frame_json_path=analysis_json_path or None,
+                        append_custom_prompt=str(st.session_state.get("append_custom_prompt") or ""),
+                        for_plot_blueprint=True,
+                        source_duration_sec=source_duration_sec or None,
+                        video_episode_json_path=video_episode_json_path,
+                        video_episode_markdown=video_markdown,
+                    )
+                else:
+                    analysis_json_path = _resolve_frame_analysis_for_short_drama(
+                        params.video_origin_path
+                    )
+                    if not analysis_json_path:
+                        st.error(
+                            "未找到整片视频分析 JSON。请先在「素材预处理 → 整片视频分析」完成分析；"
+                            "或取消勾选「结合视频/抽帧分析」后仅用字幕生成。"
+                        )
+                        return
+                    update_progress(20, "正在整理抽帧分析结果...")
+                    frame_summary = _prepare_frame_summary(analysis_json_path, doc_settings)
+                    if not (frame_summary or "").strip():
+                        st.error("抽帧分析结果为空，请重新执行「抽帧并分析」")
+                        return
+                    source_label = "字幕×抽帧×剧情联合分析"
+                    update_progress(
+                        40,
+                        "正在分析字幕并对照抽帧构思剧情方案..."
+                        if (subtitle_content or "").strip()
+                        else "正在以抽帧为主构思剧情方案...",
+                    )
+                    plot_analysis = analyze_subtitle_with_frames(
+                        subtitle_content=subtitle_content,
+                        frame_markdown=frame_summary,
+                        video_theme=video_theme or "本短剧",
+                        progress_callback=lambda msg: update_progress(55, msg),
+                        documentary_settings=doc_settings,
+                        analysis_style="short_drama",
+                        frame_json_path=analysis_json_path,
+                        append_custom_prompt=str(st.session_state.get("append_custom_prompt") or ""),
+                        for_plot_blueprint=True,
+                        source_duration_sec=source_duration_sec or None,
+                    )
             else:
                 subtitle_content = ""
                 if subtitle_path and os.path.exists(subtitle_path):
@@ -389,6 +452,7 @@ def generate_plot_blueprint_short(
                 meta={
                     "source_label": source_label,
                     "analysis_path": analysis_json_path,
+                    "video_episode_analysis_path": video_episode_json_path,
                     "subtitle_path": subtitle_path,
                 },
             )

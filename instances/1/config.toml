@@ -20,7 +20,7 @@ llm_alt_base_url = "https://api.4022543.xyz/v1"
 hide_config = true
 video_clip_json_path = "D:\\我的\\视频剪辑\\NarratoAI\\resource\\scripts\\2026-0607-231519.json"
 llm_qwen_use_alt_gateway = false
-narration_workflow_mode = "film_tv"
+narration_workflow_mode = "summary"
 
 [azure]
 speech_key = ""

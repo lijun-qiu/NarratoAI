@@ -1965,6 +1965,7 @@ class PlotBlueprintValidationTests(unittest.TestCase):
             source_duration_ms=38 * 60 * 1000 + 13 * 1000,
             frame_max_ms=38 * 60 * 1000 + 13 * 1000,
             min_chars=2000,
+            relaxed=False,
         )
         self.assertFalse(result["ok"])
         self.assertTrue(
@@ -1993,10 +1994,11 @@ class PlotBlueprintValidationTests(unittest.TestCase):
             frame_max_ms=40 * 60 * 1000,
             settings={"ost1_duration_min": 8, "ost1_duration_max": 18},
             min_chars=2000,
+            relaxed=False,
         )
         self.assertFalse(result["ok"])
         self.assertTrue(
-            any("过短" in issue for issue in result.get("issues") or [])
+            any("较短" in issue or "过短" in issue for issue in result.get("issues") or [])
         )
 
     def test_validate_plot_blueprint_rejects_huxiaoyue_as_female(self):
@@ -2019,6 +2021,7 @@ class PlotBlueprintValidationTests(unittest.TestCase):
             text,
             frame_max_ms=40 * 60 * 1000,
             min_chars=2000,
+            relaxed=False,
         )
         self.assertFalse(result["ok"])
         self.assertTrue(
@@ -2182,6 +2185,92 @@ class OpeningClimaxReplayTests(unittest.TestCase):
         ]
         updated = apply_opening_climax_chronological_replay(items, enabled=True)
         self.assertEqual(2, len(updated))
+
+
+class ShortDramaScriptOptimizerTests(unittest.TestCase):
+    def test_enforce_opening_head_ost1_limit(self):
+        from app.services.short_drama_script_optimizer import enforce_opening_head_ost1_limit
+
+        items = [
+            {"_id": 1, "OST": 1, "picture": "开篇", "narration": "播放原片1", "timestamp": "00:19:51,659-00:19:55,659"},
+            {"_id": 2, "OST": 1, "picture": "交枪", "narration": "播放原片2", "timestamp": "00:01:04,719-00:01:08,879"},
+            {"_id": 3, "OST": 0, "picture": "中景", "narration": "宝子们，我们开始看。", "timestamp": "00:00:01,000-00:00:18,000"},
+        ]
+        updated = enforce_opening_head_ost1_limit(items, head_count=3, max_ost1=1)
+        ost1_ids = [int(item["_id"]) for item in updated if int(item.get("OST", 0)) == 1]
+        self.assertEqual([1], ost1_ids)
+
+    def test_enforce_scene_ost1_after_narration(self):
+        from app.services.short_drama_script_optimizer import enforce_scene_ost1_after_narration
+
+        items = [
+            {"_id": 4, "OST": 1, "narration": "播放原片4", "timestamp": "00:09:55,878-00:10:00,878"},
+            {"_id": 5, "OST": 1, "narration": "播放原片5", "timestamp": "00:10:23,000-00:10:28,000"},
+        ]
+        updated = enforce_scene_ost1_after_narration(items)
+        self.assertEqual(0, int(updated[1].get("OST", 0)))
+
+    def test_format_ost1_max_segments_rule(self):
+        from app.services.short_drama_settings import (
+            format_ost1_max_segments_rule,
+            resolve_ost1_max_segments,
+        )
+
+        self.assertEqual(0, resolve_ost1_max_segments({"ost1_max_segments": 0}))
+        self.assertIn("不设固定", format_ost1_max_segments_rule({"ost1_max_segments": 0}))
+        self.assertIn("≤8 段", format_ost1_max_segments_rule({"ost1_max_segments": 8}))
+
+    def test_convert_excess_ost1_skips_when_unlimited(self):
+        from app.services.short_drama_script_optimizer import convert_excess_ost1_to_narration
+
+        items = [
+            {"_id": i, "OST": 1, "narration": f"播放原片{i}"}
+            for i in range(1, 6)
+        ]
+        updated = convert_excess_ost1_to_narration(items, ost1_max=0)
+        self.assertEqual(5, sum(1 for item in updated if int(item.get("OST", 0)) == 1))
+
+    def test_convert_excess_ost1_keeps_lowest_id(self):
+        from app.services.short_drama_script_optimizer import convert_excess_ost1_to_narration
+
+        items = [
+            {"_id": 1, "OST": 1, "picture": "开篇", "narration": "播放原片1", "timestamp": "00:19:51,659-00:19:55,659"},
+            {"_id": 6, "OST": 1, "picture": "仓库", "narration": "播放原片2", "timestamp": "00:02:38,242-00:02:42,242"},
+            {"_id": 12, "OST": 1, "picture": "审讯", "narration": "播放原片4", "timestamp": "00:09:55,878-00:10:00,878"},
+        ]
+        updated = convert_excess_ost1_to_narration(items, ost1_max=1)
+        ost1_ids = [int(item["_id"]) for item in updated if int(item.get("OST", 0)) == 1]
+        self.assertEqual([1], ost1_ids)
+        self.assertEqual(3, len(updated))
+
+    def test_remove_picture_echo_narrations(self):
+        from app.services.short_drama_script_optimizer import (
+            is_picture_echo_narration,
+            remove_picture_echo_narrations,
+        )
+
+        self.assertTrue(
+            is_picture_echo_narration(
+                "随后，特写：楚青桐神情严肃，语气沉重。",
+                "特写：楚青桐神情严肃，语气沉重",
+            )
+        )
+        items = [
+            {
+                "_id": 2,
+                "OST": 0,
+                "picture": "特写：楚青桐神情严肃，语气沉重",
+                "narration": "随后，特写：楚青桐神情严肃，语气沉重。",
+                "timestamp": "00:01:08,929-00:01:13,929",
+            }
+        ]
+        updated = remove_picture_echo_narrations(items)
+        self.assertFalse(
+            is_picture_echo_narration(
+                updated[0]["narration"],
+                updated[0]["picture"],
+            )
+        )
 
 
 class FrameCharacterNamingTests(unittest.TestCase):

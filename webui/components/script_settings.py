@@ -47,7 +47,7 @@ from app.services.documentary.documentary_settings import (
     get_documentary_settings,
     compute_ost1_segment_bounds,
 )
-from app.services.short_drama_settings import get_short_drama_settings
+from app.services.short_drama_settings import get_short_drama_settings, save_short_drama_settings_to_config
 from app.services.film_tv_settings import (
     FILM_TV_DEFAULTS,
     get_film_tv_settings,
@@ -697,6 +697,41 @@ def _render_short_drama_video_analysis_block(tr) -> None:
         st.info("请先在「素材预处理 → 整片视频分析」生成 JSON，生成后将自动配对当前视频。")
 
 
+def _render_short_drama_ost_settings(tr) -> None:
+    """短剧原声段数等可配置规则。"""
+    base = get_short_drama_settings()
+    with st.expander("短剧原声规则（可配置）", expanded=False):
+        st.caption(
+            "原声段数不设固定值：0 表示按蓝图场景自由取舍；"
+            "设为 10、15 等数字则后处理将超过上限的多余原声转为解说。"
+        )
+        default_cap = int(st.session_state.get(
+            "sd_ost1_max_segments",
+            base.get("ost1_max_segments", 0) or 0,
+        ))
+        ost1_cap = st.number_input(
+            "原声 OST=1 段数上限",
+            min_value=0,
+            max_value=30,
+            value=default_cap,
+            step=1,
+            key="sd_ost1_max_segments",
+            help="0 = 不限制；>0 = 硬上限",
+        )
+        col_save, col_hint = st.columns([1, 2])
+        with col_save:
+            if st.button("保存到 config.toml", key="sd_save_ost1_max_segments"):
+                settings = dict(base)
+                settings["ost1_max_segments"] = int(ost1_cap)
+                if save_short_drama_settings_to_config(settings):
+                    st.success("已保存 [short_drama].ost1_max_segments")
+        with col_hint:
+            if int(ost1_cap) <= 0:
+                st.info("当前：不限制原声段数，按场景爆燃点增减")
+            else:
+                st.info(f"当前：全片原声最多 {int(ost1_cap)} 段")
+
+
 def short_drama_summary(tr):
     """短剧解说 渲染视频主题和提示词（整片视频分析 + 字幕）。"""
     st.session_state.setdefault("narration_workflow_mode", "summary")
@@ -706,6 +741,7 @@ def short_drama_summary(tr):
         "**① 自动生成** 或 **手动填写/修正** 剧情构思方案 → **② 生成 JSON 脚本**（有方案后无需重复分析）。"
     )
     _render_short_drama_video_analysis_block(tr)
+    _render_short_drama_ost_settings(tr)
     st.divider()
     _render_documentary_material_status(tr)
     with st.expander("字幕（从默认目录选择）", expanded=False):

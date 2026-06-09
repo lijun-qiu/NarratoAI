@@ -1187,10 +1187,18 @@ class DocumentaryFrameExtractionService:
             documentary_settings=cfg,
         )
         extra_lines: list[str] = []
-        from app.services.documentary.frame_reference_images import resolve_reference_collage_mode
+        from app.services.documentary.frame_reference_images import (
+            collage_max_heads_per_sheet,
+            resolve_reference_collage_mode,
+            split_character_references_into_collage_sheets,
+        )
 
         resolved_refs = character_references or []
         use_collage = resolve_reference_collage_mode(cfg, head_count=len(resolved_refs))
+        collage_sheets = split_character_references_into_collage_sheets(
+            resolved_refs,
+            max_per_sheet=collage_max_heads_per_sheet(cfg),
+        )
         ref_section = ""
         if reference_carryover_prompt.strip():
             extra_lines.append(reference_carryover_prompt.strip())
@@ -1202,6 +1210,7 @@ class DocumentaryFrameExtractionService:
                 drama_label=drama_label or (video_theme or cfg.get("default_video_theme") or "").strip(),
                 character_collage=use_collage,
                 reference_image_count=reference_image_count or None,
+                collage_sheets=collage_sheets if use_collage else None,
             )
             if ref_section.strip():
                 extra_lines.append(ref_section.strip())

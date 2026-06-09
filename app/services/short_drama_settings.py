@@ -13,21 +13,29 @@ import toml
 from loguru import logger
 
 SHORT_DRAMA_DEFAULTS: Dict[str, Any] = {
-    # 解说 : 原声成片时长 ≈ 3 : 7
-    "narration_percent": 30,
-    "original_audio_percent": 70,
-    "narration_ratio_tolerance": 0.10,
+    # 解说为主：原声仅作短促点缀
+    "narration_percent": 85,
+    "original_audio_percent": 15,
+    "narration_ratio_tolerance": 0.12,
     "narration_script_temperature": 0.4,
     # 成片总时长目标（分钟）
     "target_output_minutes_min": 8,
     "target_output_minutes_max": 13,
-    # 单段最小时长（秒）
-    "ost1_duration_min": 8,
-    "ost1_duration_max": 18,
+    # 原声 OST=1：仅情绪顶点，单段 ≤5 秒
+    "ost1_duration_min": 2,
+    "ost1_duration_max": 5,
+    # 原声 OST=1 段数上限：0=不限制（按蓝图场景取舍）；>0 为后处理硬上限
+    "ost1_max_segments": 0,
+    # 播放顺序开头若干段内最多 1 段 OST=1（避免开篇连放两段原声）
+    "opening_head_max_ost1": 1,
+    "opening_head_segment_count": 3,
+    "enable_opening_climax_chronological_replay": True,
     "ost0_duration_min": 5,
-    "max_consecutive_ost1": 4,
-    "narration_chars_min": 20,
-    "narration_chars_max": 120,
+    "max_consecutive_ost1": 1,
+    "ost0_lead_before_ost1_sec": 5,
+    "narration_chars_min": 40,
+    "narration_chars_max": 150,
+    "max_ershi_per_script": 2,
     # 原声段 picture 旁白烧录（白字黑描边，短剧竖屏可读）
     "enable_picture_narration": True,
     "picture_narration_font_size": 28,
@@ -136,6 +144,22 @@ def get_short_drama_settings(overrides: Optional[Dict[str, Any]] = None) -> Dict
     return settings
 
 
+def resolve_ost1_max_segments(settings: Optional[Dict[str, Any]] = None) -> int:
+    """返回配置的原声段数上限；0 表示不限制。"""
+    return int(get_short_drama_settings(settings).get("ost1_max_segments", 0) or 0)
+
+
+def format_ost1_max_segments_rule(settings: Optional[Dict[str, Any]] = None) -> str:
+    """生成提示词/说明中的原声段数规则文案。"""
+    cap = resolve_ost1_max_segments(settings)
+    if cap <= 0:
+        return (
+            "不设固定段数上限，按蓝图场景爆燃点按需增减"
+            "（仍须解说为主，单段≤时长上限）"
+        )
+    return f"全片 ≤{cap} 段"
+
+
 def compute_short_drama_ost_bounds(
     total_items: int,
     settings: Optional[Dict[str, Any]] = None,
@@ -181,10 +205,13 @@ def get_short_drama_script_prompt_params(
         "narration_chars_min": str(int(cfg.get("narration_chars_min", 20))),
         "narration_chars_max": str(int(cfg.get("narration_chars_max", 120))),
         "max_consecutive_ost1": str(int(cfg.get("max_consecutive_ost1", 4))),
-        "ost1_duration_min": str(int(cfg.get("ost1_duration_min", 8))),
-        "ost1_duration_max": str(int(cfg.get("ost1_duration_max", 18))),
+        "ost1_duration_min": str(int(cfg.get("ost1_duration_min", 2))),
+        "ost1_duration_max": str(int(cfg.get("ost1_duration_max", 5))),
+        "ost1_max_segments": str(resolve_ost1_max_segments(cfg)),
+        "ost1_max_segments_rule": format_ost1_max_segments_rule(cfg),
         "ost0_duration_min": str(int(cfg.get("ost0_duration_min", 5))),
         "picture_narration_max_chars": str(int(cfg.get("picture_narration_max_chars", 16))),
+        "max_ershi_per_script": str(int(cfg.get("max_ershi_per_script", 2))),
     }
 
 

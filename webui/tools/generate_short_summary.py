@@ -33,10 +33,15 @@ from app.services.documentary.documentary_subtitle_enrichment import (
     analyze_subtitle_with_frames,
     truncate_subtitle_content,
 )
-from app.services.documentary.opening_climax_resolver import apply_opening_climax_fix
+from app.services.documentary.opening_climax_resolver import (
+    apply_opening_climax_chronological_replay,
+    apply_opening_climax_fix,
+)
 from app.services.short_drama_settings import (
+    format_ost1_max_segments_rule,
     get_short_drama_script_prompt_params,
     get_short_drama_settings,
+    save_short_drama_settings_to_config,
 )
 from app.services.short_drama_script_optimizer import (
     optimize_short_drama_script_items,
@@ -172,6 +177,14 @@ def _material_source_video_path() -> str:
     )
 
 
+def _resolve_short_drama_settings_for_session() -> dict:
+    """合并 config 与当前 UI 会话中的短剧解说覆盖项。"""
+    overrides: dict = {}
+    if "sd_ost1_max_segments" in st.session_state:
+        overrides["ost1_max_segments"] = int(st.session_state["sd_ost1_max_segments"])
+    return get_short_drama_settings(overrides or None)
+
+
 def _build_output_duration_hint(*, sd_settings: dict | None = None) -> str:
     cfg = sd_settings or get_short_drama_settings()
     narr_pct = int(cfg.get("narration_percent", 30))
@@ -186,12 +199,11 @@ def _build_output_duration_hint(*, sd_settings: dict | None = None) -> str:
     max_run = int(cfg.get("max_consecutive_ost1", 4))
     return (
         f"- **成片总时长目标 {min_min}–{max_min} 分钟**（按 `_id` 播放顺序累加各段时长估算）\n"
-        f"- **不限制段数**；解说 vs 原声成片时长约 **{narr_pct}:{orig_pct}**\n"
-        f"- **每段须完整表达一条脉络**，禁止过短碎段：\n"
-        f"  - OST=0 解说每段 **{narr_chars_min}–{narr_chars_max} 字**（估算 ≥{ost0_min} 秒）\n"
-        f"  - OST=1 原声每段 **{ost1_min}–{ost1_max} 秒**，覆盖整句对白\n"
-        f"- 同场可连续 **{max_run} 段 OST=1** 成块播完，再接 OST=0 串场/点评\n"
-        f"- 情节点之间用 OST=0 串场；同一场戏内可连续多段 OST=1\n"
+        f"- **解说为主**：解说 vs 原声成片时长约 **{narr_pct}:{orig_pct}**\n"
+        f"- OST=0 解说每段 **{narr_chars_min}–{narr_chars_max} 字**（估算 ≥{ost0_min} 秒）\n"
+        f"- **开篇**：播放顺序前 3 段内 **最多 1 段** OST=1（爆燃钩子）；第 2 段起先解说\n"
+        f"- **场景原声**：OST=0 解说铺垫 → OST=1 金句（≤{ost1_max} 秒），按蓝图场景取舍\n"
+        f"- 原声段数：{format_ost1_max_segments_rule(cfg)}；`picture`/`timestamp`/`original_line` 须同镜\n"
     )
 
 
@@ -246,22 +258,20 @@ def _log_short_drama_validation_report(
     logger.info("\n".join(lines))
 
 
-def _build_blueprint_execution_note(*, has_video_analysis: bool) -> str:
+def _build_blueprint_execution_note(
+    *,
+    plot_blueprint: str = "",
+    has_video_analysis: bool = False,
+) -> str:
     """第二步 JSON 生成：蓝图落实要点（写入 prompt blueprint_execution 块）。"""
-    lines = [
-        "## 蓝图执行要点（JSON 脚本须严格落实）",
-        "- **成片叙事顺序方案**：按表中 `_id` 顺序排列 JSON items，不得擅自调换爆点与正叙节奏",
-        "- **开头高潮方案**：第 1 段 OST=1 须取自该方案标注的字幕窗 timestamp",
-        "- **建议保留原声 OST=1**：清单中的每条须落实为 OST=1 item，timestamp 与蓝图字幕窗一致",
-        "- **原片时间线**：每条事件的**视频格**对齐画面描述，**字幕窗**对齐 OST=1 timestamp",
-        "- OST=0 解说：在情节点之间承上启下，简练埋伏，引出下一段原声",
-    ]
-    if has_video_analysis:
-        lines.append(
-            "- **picture 旁白**：参照整片视频分析同格 `旁白`/`环境`，"
-            "≤配置字数、双引号包裹、禁止复述对白"
-        )
-    return "\n".join(lines)
+    from app.services.short_drama_blueprint_script import (
+        build_blueprint_script_execution_note,
+    )
+
+    return build_blueprint_script_execution_note(
+        plot_blueprint=plot_blueprint,
+        has_video_analysis=has_video_analysis,
+    )
 
 
 def _load_video_episode_script_reference(
@@ -353,9 +363,9 @@ def generate_plot_blueprint_short(
                 video_markdown = build_video_episode_analysis_markdown(video_artifact)
                 update_progress(
                     40,
-                    "正在分析字幕并对照整片视频分析构思剧情方案..."
+                    "正在联合分析人物关系表、字幕与整片视频分析做场景分段..."
                     if (subtitle_content or "").strip()
-                    else "正在以整片视频分析为主构思剧情方案...",
+                    else "正在联合分析人物关系表与整片视频分析做场景分段...",
                 )
                 plot_analysis = analyze_subtitle_with_frames(
                     subtitle_content=subtitle_content,
@@ -519,6 +529,7 @@ def generate_script_short_sunmmary(
                     video_episode_script_reference
                 )
                 subtitle_frame_analysis = _build_blueprint_execution_note(
+                    plot_blueprint=plot_analysis,
                     has_video_analysis=has_video_analysis,
                 )
                 if has_video_analysis:
@@ -554,7 +565,7 @@ def generate_script_short_sunmmary(
             except Exception as duration_err:
                 logger.warning(f"无法读取原片时长: {duration_err}")
 
-            sd_settings = get_short_drama_settings()
+            sd_settings = _resolve_short_drama_settings_for_session()
             output_duration_hint = _build_output_duration_hint(sd_settings=sd_settings)
             prompt_extra = {
                 "output_duration_hint": output_duration_hint,
@@ -712,21 +723,59 @@ def generate_script_short_sunmmary(
                 logger.error(f"JSON结构错误，缺少items字段: {narration_dict}")
                 st.stop()
 
+            frame_analysis_path = (
+                str(video_episode_json_path or "").strip()
+                or _resolve_video_episode_analysis_for_short_drama(
+                    params.video_origin_path
+                )
+            )
+
             narration_dict["items"] = apply_opening_climax_fix(
                 narration_dict["items"],
                 subtitle_content=subtitle_content,
-                subtitle_frame_analysis=subtitle_frame_analysis,
+                subtitle_frame_analysis=plot_analysis,
                 append_custom_prompt=str(st.session_state.get("append_custom_prompt") or ""),
-                frame_analysis_path="",
+                frame_analysis_path=frame_analysis_path,
                 settings=doc_settings,
-                enabled=False,
+                enabled=True,
             )
 
-            sd_settings = get_short_drama_settings()
+            sd_settings = _resolve_short_drama_settings_for_session()
             narration_dict["items"] = optimize_short_drama_script_items(
                 narration_dict["items"],
                 subtitle_content=subtitle_content,
-                frame_analysis_path="",
+                frame_analysis_path=frame_analysis_path,
+                plot_blueprint=plot_analysis,
+                settings=sd_settings,
+            )
+
+            narration_dict["items"] = apply_opening_climax_fix(
+                narration_dict["items"],
+                subtitle_content=subtitle_content,
+                subtitle_frame_analysis=plot_analysis,
+                append_custom_prompt=str(st.session_state.get("append_custom_prompt") or ""),
+                frame_analysis_path=frame_analysis_path,
+                settings=doc_settings,
+                enabled=True,
+            )
+
+            replay_settings = {**doc_settings, **sd_settings}
+            narration_dict["items"] = apply_opening_climax_chronological_replay(
+                narration_dict["items"],
+                settings=replay_settings,
+                enabled=bool(
+                    sd_settings.get("enable_opening_climax_chronological_replay", True)
+                ),
+            )
+
+            from app.services.short_drama_timestamp_alignment import (
+                align_script_items_to_source_material,
+            )
+
+            narration_dict["items"] = align_script_items_to_source_material(
+                narration_dict["items"],
+                subtitle_content=subtitle_content,
+                plot_blueprint=plot_analysis,
                 settings=sd_settings,
             )
 
@@ -734,6 +783,8 @@ def generate_script_short_sunmmary(
                 ts_validation = validate_short_drama_script_timestamps(
                     narration_dict.get("items") or [],
                     sd_settings,
+                    subtitle_content=subtitle_content,
+                    plot_blueprint=plot_analysis,
                 )
                 if ts_validation["ok"]:
                     break
@@ -748,7 +799,8 @@ def generate_script_short_sunmmary(
                 narration_dict["items"] = repair_short_drama_script_timestamps(
                     narration_dict["items"],
                     subtitle_content=subtitle_content,
-                    frame_analysis_path="",
+                    frame_analysis_path=frame_analysis_path,
+                    plot_blueprint=plot_analysis,
                     settings=sd_settings,
                 )
                 _log_short_drama_validation_report(
@@ -761,6 +813,8 @@ def generate_script_short_sunmmary(
                     ts_validation=validate_short_drama_script_timestamps(
                         narration_dict.get("items") or [],
                         sd_settings,
+                        subtitle_content=subtitle_content,
+                        plot_blueprint=plot_analysis,
                     ),
                     item_count=len(narration_dict.get("items") or []),
                 )
@@ -772,6 +826,8 @@ def generate_script_short_sunmmary(
             final_ts_validation = validate_short_drama_script_timestamps(
                 narration_dict.get("items") or [],
                 sd_settings,
+                subtitle_content=subtitle_content,
+                plot_blueprint=plot_analysis,
             )
             _log_short_drama_validation_report(
                 stage="后处理完成",

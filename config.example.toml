@@ -244,6 +244,8 @@ target_output_minutes_max = 13
 # 单段最小时长（秒）
 ost1_duration_min = 8
 ost1_duration_max = 18
+# 原声 OST=1 段数上限：0=不限制（按场景）；>0 为后处理硬上限
+ost1_max_segments = 0
 ost0_duration_min = 5
 max_consecutive_ost1 = 4
 narration_chars_min = 20
@@ -426,6 +428,12 @@ picture_wrap_double_quotes = true
     picture_narration_duration = 2.0
     # OST=1 原片播放时的主字幕颜色（对白/ASR 转写，与白色解说字幕区分）
     original_subtitle_color = "#FFE066"
+
+[video_episode_analysis]
+# 整片视频分析：上传前转码（更清晰默认：640p/CRF28，短片优先 720p/CRF26，单段上限 24MB）
+max_upload_mb = 24.0
+chunk_seconds = 300.0
+short_video_high_profile_sec = 300.0
 
 [transcription]
     enable_fallback = true

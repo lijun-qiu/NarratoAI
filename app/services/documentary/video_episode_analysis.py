@@ -22,8 +22,16 @@ from app.services.documentary.frame_analysis_pairing import analysis_artifact_di
 from app.services.documentary.frame_reference_images import (
     prepare_reference_prefix_images,
     resolve_reference_collage_mode,
+    split_character_references_into_collage_sheets,
+    collage_max_heads_per_sheet,
 )
 from app.services.drama_character_registry import resolve_media_path
+from app.services.documentary.video_episode_constants import (
+    SEGMENT_INTERVAL_SECONDS,
+    get_upload_transcode_profile,
+    get_video_episode_upload_settings,
+    resolve_upload_profile_chain,
+)
 from app.services.prompts.documentary.video_episode_analysis import (
     build_reference_carryover_naming_block,
     build_video_episode_analysis_prompt,
@@ -33,9 +41,6 @@ from app.services.prompts.documentary.video_episode_analysis import (
 from app.utils import utils
 
 VIDEO_EPISODE_ANALYSIS_ARTIFACT_VERSION = "documentary-video-episode-analysis-v6"
-SEGMENT_INTERVAL_SECONDS = 10
-_DEFAULT_MAX_UPLOAD_MB = 12.0
-_DEFAULT_CHUNK_SECONDS = 300.0
 _MIN_CHUNK_SECONDS = 60.0
 _VIDEO_ANALYSIS_TIMEOUT = 900.0
 _MAX_CHUNK_RETRIES = 3
@@ -56,18 +61,18 @@ VIDEO_EPISODE_FIELD_COMMENTS: dict[str, str] = {
     "chunk_count": "上传分段总数（长片按约5分钟/段切分）",
     "completed_chunk_count": "已成功完成的分段数",
     "failed_chunk_indices": "失败分段索引列表（0 起），可点击补全重试",
-    "segment_interval_seconds": "情节片段固定时间窗长度（秒），当前为 10",
-    "segment_split_policy": "切分策略标识（fixed_10s=固定10秒一格）",
+    "segment_interval_seconds": f"情节片段固定时间窗长度（秒），当前为 {SEGMENT_INTERVAL_SECONDS}",
+    "segment_split_policy": f"切分策略标识（fixed_{SEGMENT_INTERVAL_SECONDS}s=固定{SEGMENT_INTERVAL_SECONDS}秒一格）",
     "episodic_segment_count": "episodic_segments 条数",
     "coverage_warnings": "时间窗/片段约束校验告警（非空表示模型输出曾偏离固定格子）",
     "overall_summary": "本集/本段核心剧情概括（约200字内）",
     "key_conflict": "本集/本段最核心的矛盾冲突（一句话）",
-    "episodic_segments": "固定10秒情节片段列表（全片时间轴绝对时间）",
+    "episodic_segments": f"固定{SEGMENT_INTERVAL_SECONDS}秒情节片段列表（全片时间轴绝对时间）",
     "episodic_segments.segment_id": "片段序号，从 1 起",
     "episodic_segments.title": "片段标题（4-6字）",
     "episodic_segments.time_range": "片内绝对时间窗，格式 HH:MM:SS-HH:MM:SS，须与固定格子一致",
-    "episodic_segments.key_events": "该10秒内关键事件（一句话）",
-    "episodic_segments.narration": "纪录片旁白（第三人称，20-50字，可用于后期配音）",
+    "episodic_segments.key_events": f"该{SEGMENT_INTERVAL_SECONDS}秒内关键事件（一句话）",
+    "episodic_segments.narration": "纪录片旁白（第三人称，15-35字，可用于后期配音）",
     "episodic_segments.environment_description": "场景环境（地点、光线、氛围、布景等，15-40字）",
     "episodic_segments.involved_characters": "该片段涉及人物（规范姓名或「剧中未明确交代」）",
     "important_dialogues": "重要台词列表",
@@ -123,6 +128,56 @@ def _chunks_meta(chunks: list[dict[str, Any]]) -> list[dict[str, float]]:
     ]
 
 
+def is_checkpoint_source_compatible(
+    checkpoint: dict[str, Any],
+    *,
+    video_path: str,
+    video_duration_seconds: float,
+) -> bool:
+    """压缩前检查：视频路径/时长/版本是否与检查点一致。"""
+    if not checkpoint:
+        return False
+    if checkpoint.get("artifact_version") != VIDEO_EPISODE_ANALYSIS_ARTIFACT_VERSION:
+        return False
+    if os.path.abspath(str(checkpoint.get("video_path") or "")) != os.path.abspath(video_path):
+        return False
+    if abs(float(checkpoint.get("video_duration_seconds") or 0) - video_duration_seconds) > 1.0:
+        return False
+    return True
+
+
+def describe_checkpoint_incompatibility(
+    checkpoint: dict[str, Any],
+    *,
+    video_path: str,
+    video_duration_seconds: float,
+    chunks: list[dict[str, Any]] | None = None,
+) -> str:
+    if not checkpoint:
+        return "无检查点"
+    if checkpoint.get("artifact_version") != VIDEO_EPISODE_ANALYSIS_ARTIFACT_VERSION:
+        return "分析版本已更新，旧检查点失效"
+    if os.path.abspath(str(checkpoint.get("video_path") or "")) != os.path.abspath(video_path):
+        return "视频文件与检查点不一致"
+    if abs(float(checkpoint.get("video_duration_seconds") or 0) - video_duration_seconds) > 1.0:
+        return "视频时长与检查点不一致"
+    if chunks is not None:
+        if int(checkpoint.get("total_chunks") or 0) != len(chunks):
+            return f"分段数量变化（检查点 {checkpoint.get('total_chunks')} ≠ 当前 {len(chunks)}）"
+        saved_meta = checkpoint.get("chunks_meta") or []
+        current_meta = _chunks_meta(chunks)
+        if len(saved_meta) != len(current_meta):
+            return "分段边界数量不一致"
+        for saved, current in zip(saved_meta, current_meta):
+            if not isinstance(saved, dict):
+                return "检查点分段元数据损坏"
+            if abs(float(saved.get("offset_seconds") or 0) - current["offset_seconds"]) > 0.5:
+                return "分段起始时间与检查点不一致"
+            if abs(float(saved.get("duration_seconds") or 0) - current["duration_seconds"]) > 0.5:
+                return "分段时长与检查点不一致"
+    return "未知原因"
+
+
 def is_checkpoint_compatible(
     checkpoint: dict[str, Any],
     *,
@@ -152,6 +207,19 @@ def is_checkpoint_compatible(
         if abs(float(saved.get("duration_seconds") or 0) - current["duration_seconds"]) > 0.5:
             return False
     return True
+
+
+def checkpoint_needs_resume(checkpoint: dict[str, Any] | None) -> bool:
+    """是否仍有压缩或模型分析未完成的工作。"""
+    if not checkpoint:
+        return False
+    total = int(checkpoint.get("total_chunks") or 0)
+    meta = checkpoint.get("chunks_meta") or []
+    if total > 0 and len(meta) < total:
+        return True
+    chunk_total = total or max(len(meta), 1)
+    summary = summarize_checkpoint_progress(checkpoint, chunk_total)
+    return summary["failed"] + summary["pending"] > 0
 
 
 def summarize_checkpoint_progress(
@@ -318,7 +386,7 @@ def _prepare_chunk_reference_context(
     character_references: list[dict[str, str]] | None,
     relationship_diagram_path: str,
 ) -> tuple[list[str], str]:
-    """首段附带头像/关系图；后续段仅 prompt 沿用规则。"""
+    """每段上传均附带头像/关系图（拼图每张最多 6 人），便于逐格识脸。"""
     refs = [
         {"name": str(item.get("name") or "").strip(), "path": str(item.get("path") or "").strip()}
         for item in (character_references or [])
@@ -330,27 +398,32 @@ def _prepare_chunk_reference_context(
 
     settings = {
         "frame_reference_use_collage": True,
-        "frame_reference_token_saver": True,
+        "frame_reference_token_saver": False,
+        "frame_reference_attach_mode": "every_batch",
         "frame_reference_max_edge": 384,
         "frame_reference_individual_max_heads": 6,
+        "frame_reference_collage_max_heads": 6,
         "default_video_theme": drama_title,
     }
     head_paths = [item["path"] for item in refs if os.path.isfile(item["path"])]
     use_collage = resolve_reference_collage_mode(settings, head_count=len(head_paths))
+    max_per_sheet = collage_max_heads_per_sheet(settings)
+    collage_sheets = split_character_references_into_collage_sheets(refs, max_per_sheet=max_per_sheet)
 
-    if chunk_index == 0:
-        prefix_paths, _carryover = prepare_reference_prefix_images(
-            batch_index=0,
-            relationship_diagram_path=rel_path,
-            character_references=refs,
-            settings=settings,
-        )
+    prefix_paths, _carryover = prepare_reference_prefix_images(
+        batch_index=chunk_index,
+        relationship_diagram_path=rel_path,
+        character_references=refs,
+        settings=settings,
+    )
+    if prefix_paths:
         naming_block = build_video_episode_vision_reference_prompt_section(
             drama_label=drama_title,
             character_references=refs,
             relationship_diagram_attached=bool(rel_path),
             reference_image_count=len(prefix_paths),
             character_collage=use_collage and len(head_paths) >= 2,
+            collage_sheets=collage_sheets if use_collage else None,
         )
         return prefix_paths, naming_block
 
@@ -537,6 +610,389 @@ def validate_episodic_segments(
     return warnings
 
 
+_CONTINUATION_ENV_MARKERS = ("延续上段", "承接上段", "同上", "环境延续", "画面延续")
+_SCENE_CHANGE_MARKERS = (
+    "场景切换",
+    "硬切",
+    "转场",
+    "切至",
+    "切换至",
+    "镜头切",
+    "另起",
+    "回忆",
+    "闪回",
+    "画面切",
+    "转镜",
+    "切到",
+    "来到",
+    "转至",
+    "切换",
+    "翌日",
+    "次日",
+)
+
+
+def _is_environment_continuation(text: str) -> bool:
+    blob = (text or "").strip()
+    if not blob:
+        return True
+    return any(marker in blob for marker in _CONTINUATION_ENV_MARKERS)
+
+
+def _has_scene_change_marker(*texts: str) -> bool:
+    blob = " ".join(str(item or "").strip() for item in texts if item)
+    return any(marker in blob for marker in _SCENE_CHANGE_MARKERS)
+
+
+def _character_sets_fully_changed(
+    previous: list[str],
+    current: list[str],
+) -> bool:
+    prev = {name for name in previous if name}
+    curr = {name for name in current if name}
+    if not prev or not curr:
+        return False
+    return not (prev & curr)
+
+
+def _resolve_concrete_environment(
+    segments: list[dict[str, Any]],
+    index: int,
+) -> str:
+    """向上查找最近一条非「延续上段」的环境描述。"""
+    for pos in range(index, -1, -1):
+        env = str(segments[pos].get("environment_description") or "").strip()
+        if env and not _is_environment_continuation(env):
+            return env
+    return ""
+
+
+def _environments_suggest_same_scene(previous_env: str, current_env: str) -> bool:
+    prev = (previous_env or "").strip()
+    curr = (current_env or "").strip()
+    if _is_environment_continuation(curr):
+        return True
+    if _is_environment_continuation(prev):
+        return not _has_scene_change_marker(curr)
+    if not prev or not curr:
+        return False
+    if prev == curr:
+        return True
+    indoor_markers = ("室内", "房间", "屋内", "餐桌", "窗前")
+    if any(marker in prev for marker in indoor_markers) and any(
+        marker in curr for marker in indoor_markers
+    ):
+        if not _has_scene_change_marker(curr):
+            return True
+    return False
+
+
+def build_upload_chunk_boundary_seconds(
+    chunks_meta: list[dict[str, Any]] | None,
+) -> list[int]:
+    """上传分段之间的衔接时刻（秒，不含 0 与片尾）。"""
+    if not chunks_meta:
+        return []
+    boundaries: list[int] = []
+    for index, meta in enumerate(chunks_meta):
+        if index >= len(chunks_meta) - 1 or not isinstance(meta, dict):
+            continue
+        offset = float(meta.get("offset_seconds") or 0)
+        duration = float(meta.get("duration_seconds") or 0)
+        if duration > 0:
+            boundaries.append(int(round(offset + duration)))
+    return boundaries
+
+
+_PER_GRID_CONTINUITY_NOTE_RE = re.compile(
+    r"本格原标注\s*([^。]+)。"
+)
+_PER_GRID_KEY_EVENTS_PREFIX_RE = re.compile(
+    r"^（(?:承接|延续)上段[^）]*）(?:；)?"
+)
+
+
+def revert_per_grid_continuity_overrides(
+    segments: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """撤销旧版「逐格强制承接」对人物/事件的改写。"""
+    reverted: list[dict[str, Any]] = []
+    for segment in segments:
+        current = dict(segment)
+        note = str(current.get("continuity_note") or "").strip()
+        if note.startswith("待核对：") and "本格原标注" in note:
+            match = _PER_GRID_CONTINUITY_NOTE_RE.search(note)
+            if match:
+                restored = [
+                    name.strip()
+                    for name in match.group(1).split("、")
+                    if name.strip()
+                ]
+                if restored:
+                    current["involved_characters"] = restored
+            key_events = str(current.get("key_events") or "").strip()
+            cleaned = _PER_GRID_KEY_EVENTS_PREFIX_RE.sub("", key_events).strip()
+            if cleaned:
+                current["key_events"] = cleaned
+            current.pop("continuity_note", None)
+        reverted.append(current)
+    return reverted
+
+
+def _find_segment_index_at_or_before(
+    segments: list[dict[str, Any]],
+    boundary_sec: int,
+) -> int | None:
+    """边界时刻之前（含）结束的最后一格。"""
+    best_index: int | None = None
+    best_end = -1
+    for index, segment in enumerate(segments):
+        _start, end = _parse_time_range_bounds(str(segment.get("time_range") or ""))
+        if end <= boundary_sec and end > best_end:
+            best_end = end
+            best_index = index
+    return best_index
+
+
+def _find_segment_index_at_or_after(
+    segments: list[dict[str, Any]],
+    boundary_sec: int,
+) -> int | None:
+    """边界时刻起（含）的第一格。"""
+    for index, segment in enumerate(segments):
+        start, _end = _parse_time_range_bounds(str(segment.get("time_range") or ""))
+        if start >= boundary_sec:
+            return index
+    return None
+
+
+def infer_chunks_meta_from_artifact(
+    *,
+    video_duration_seconds: float,
+    chunk_count: int,
+    chunk_seconds: float | None = None,
+) -> list[dict[str, Any]]:
+    """旧 JSON 无 chunks_meta 时，按上传策略估算分段边界。"""
+    if chunk_seconds is None:
+        chunk_seconds = float(
+            get_video_episode_upload_settings().get("chunk_seconds", 300.0)
+        )
+    if chunk_count <= 1 or video_duration_seconds <= 0:
+        return []
+    meta: list[dict[str, Any]] = []
+    start = 0.0
+    while start < video_duration_seconds - 0.5 and len(meta) < chunk_count:
+        duration = min(chunk_seconds, video_duration_seconds - start)
+        meta.append(
+            {
+                "offset_seconds": round(start, 3),
+                "duration_seconds": round(duration, 3),
+            }
+        )
+        start += duration
+    return meta
+
+
+def _text_mentions_any_character(text: str, names: list[str]) -> bool:
+    blob = str(text or "")
+    return any(name and name in blob for name in names)
+
+
+def _should_fix_boundary_characters(
+    *,
+    prev_chars: list[str],
+    curr_chars: list[str],
+    key_events: str,
+    narration: str,
+    title: str,
+    environment: str,
+) -> bool:
+    """同场景连续且文本未明确引入新人物时，可安全校正人物名单。"""
+    if not prev_chars:
+        return False
+    if not curr_chars:
+        return True
+    if not _character_sets_fully_changed(prev_chars, curr_chars):
+        return False
+    if _has_scene_change_marker(key_events, narration, title, environment):
+        return False
+    text_blob = " ".join([key_events, narration, title, environment])
+    curr_only = [name for name in curr_chars if name not in prev_chars]
+    if curr_only and _text_mentions_any_character(text_blob, curr_only):
+        return False
+    return True
+
+
+def _apply_boundary_character_fix(
+    segment: dict[str, Any],
+    *,
+    prev_chars: list[str],
+    original_chars: list[str],
+    boundary_label: str,
+) -> dict[str, Any]:
+    current = dict(segment)
+    current["involved_characters"] = list(prev_chars)
+    if original_chars and original_chars != prev_chars:
+        current["continuity_note"] = (
+            f"上传分段边界 {boundary_label} 已校正人物：原标注 "
+            f"{'、'.join(original_chars)} → 与上一段末 {'、'.join(prev_chars)} 一致"
+            f"（同场景连续，分段衔接误换人）"
+        )
+    return current
+
+
+def repair_upload_chunk_boundary_continuity(
+    segments: list[dict[str, Any]],
+    *,
+    chunk_boundary_seconds: list[int] | None = None,
+    chunks_meta: list[dict[str, Any]] | None = None,
+    max_grids_after_boundary: int = 3,
+) -> tuple[list[dict[str, Any]], list[str]]:
+    """
+    仅在约 300s 上传分段边界检查衔接：
+    - 不修改段内普通 5 秒格
+    - 边界后首几格若同场景连续、未切镜、且文本未引入新人物 → 人物校正为上一段末
+    - 无法确认时仅 continuity_note + coverage_warning，不改写
+    """
+    if not segments:
+        return [], []
+
+    boundaries = list(chunk_boundary_seconds or [])
+    if not boundaries and chunks_meta:
+        boundaries = build_upload_chunk_boundary_seconds(chunks_meta)
+    if not boundaries:
+        return list(segments), []
+
+    result = revert_per_grid_continuity_overrides(segments)
+    warnings: list[str] = []
+
+    for boundary_sec in boundaries:
+        before_index = _find_segment_index_at_or_before(result, boundary_sec)
+        after_index = _find_segment_index_at_or_after(result, boundary_sec)
+        if before_index is None or after_index is None or before_index >= after_index:
+            continue
+
+        previous = result[before_index]
+        current = dict(result[after_index])
+        prev_chars = [
+            str(name).strip()
+            for name in (previous.get("involved_characters") or [])
+            if str(name).strip()
+        ]
+        curr_chars = [
+            str(name).strip()
+            for name in (current.get("involved_characters") or [])
+            if str(name).strip()
+        ]
+        prev_env = str(previous.get("environment_description") or "")
+        curr_env = str(current.get("environment_description") or "")
+        resolved_prev_env = _resolve_concrete_environment(result, before_index) or prev_env
+        key_events = str(current.get("key_events") or "")
+        narration = str(current.get("narration") or "")
+        title = str(current.get("title") or "")
+
+        same_scene = _environments_suggest_same_scene(resolved_prev_env, curr_env)
+        if _is_environment_continuation(curr_env) and not _has_scene_change_marker(
+            key_events, narration, title, curr_env
+        ):
+            same_scene = True
+
+        if not same_scene:
+            continue
+
+        boundary_label = _format_timestamp(boundary_sec)
+        prev_range = previous.get("time_range") or ""
+
+        for offset in range(max(1, max_grids_after_boundary)):
+            grid_index = after_index + offset
+            if grid_index >= len(result):
+                break
+            current = dict(result[grid_index])
+            curr_chars = [
+                str(name).strip()
+                for name in (current.get("involved_characters") or [])
+                if str(name).strip()
+            ]
+            key_events = str(current.get("key_events") or "")
+            narration = str(current.get("narration") or "")
+            title = str(current.get("title") or "")
+            curr_env = str(current.get("environment_description") or "")
+
+            grid_same_scene = _environments_suggest_same_scene(resolved_prev_env, curr_env)
+            if _is_environment_continuation(curr_env) and not _has_scene_change_marker(
+                key_events, narration, title, curr_env
+            ):
+                grid_same_scene = True
+            if offset > 0 and not grid_same_scene:
+                break
+
+            needs_fix = (
+                prev_chars
+                and (
+                    not curr_chars
+                    or _character_sets_fully_changed(prev_chars, curr_chars)
+                )
+                and _should_fix_boundary_characters(
+                    prev_chars=prev_chars,
+                    curr_chars=curr_chars,
+                    key_events=key_events,
+                    narration=narration,
+                    title=title,
+                    environment=curr_env,
+                )
+            )
+            if not needs_fix:
+                if offset == 0:
+                    # 首格无法自动校正：文本已引入新人物或已切镜，仅告警
+                    if (
+                        curr_chars
+                        and prev_chars
+                        and _character_sets_fully_changed(prev_chars, curr_chars)
+                        and not _has_scene_change_marker(key_events, narration, title, curr_env)
+                    ):
+                        curr_range = current.get("time_range") or ""
+                        warnings.append(
+                            f"上传分段边界 {boundary_label}: 上一段末 `{prev_range}` 人物 "
+                            f"{'、'.join(prev_chars)} → 下一段 `{curr_range}` 人物 "
+                            f"{'、'.join(curr_chars)}，环境似连续且文本提及新人物，请人工核对"
+                        )
+                        current["continuity_note"] = (
+                            f"上传分段边界 {boundary_label}：上一段末 {'、'.join(prev_chars)}，"
+                            f"本格 {'、'.join(curr_chars)}； narration/事件已提及新人物或需切镜说明，未自动校正"
+                        )
+                        result[grid_index] = current
+                break
+
+            original_chars = list(curr_chars)
+            curr_range = current.get("time_range") or ""
+            fixed = _apply_boundary_character_fix(
+                current,
+                prev_chars=prev_chars,
+                original_chars=original_chars,
+                boundary_label=boundary_label,
+            )
+            result[grid_index] = fixed
+            warnings.append(
+                f"上传分段边界 {boundary_label}: `{curr_range}` 人物 "
+                f"{'、'.join(original_chars) if original_chars else '（空）'} → "
+                f"已校正为 {'、'.join(prev_chars)}（同场景连续）"
+            )
+
+    return result, warnings
+
+
+def repair_episodic_segment_continuity(
+    segments: list[dict[str, Any]],
+    *,
+    chunks_meta: list[dict[str, Any]] | None = None,
+) -> tuple[list[dict[str, Any]], list[str]]:
+    """兼容旧调用：仅做上传分段边界检查，不再逐格强制承接。"""
+    return repair_upload_chunk_boundary_continuity(
+        segments,
+        chunks_meta=chunks_meta,
+    )
+
+
 def normalize_video_episode_analysis_payload(payload: dict[str, Any]) -> dict[str, Any]:
     """补齐字段并规范列表结构。"""
     normalized: dict[str, Any] = {
@@ -567,8 +1023,7 @@ def normalize_video_episode_analysis_payload(payload: dict[str, Any]) -> dict[st
             except (TypeError, ValueError):
                 segment_id = index
             time_range = str(item.get("time_range") or "").strip().replace("—", "-")
-            normalized["episodic_segments"].append(
-                {
+            entry: dict[str, Any] = {
                     "segment_id": segment_id,
                     "title": str(item.get("title") or "").strip(),
                     "time_range": time_range,
@@ -580,7 +1035,10 @@ def normalize_video_episode_analysis_payload(payload: dict[str, Any]) -> dict[st
                     or "剧中未明确交代",
                     "involved_characters": char_list,
                 }
-            )
+            note = str(item.get("continuity_note") or "").strip()
+            if note:
+                entry["continuity_note"] = note
+            normalized["episodic_segments"].append(entry)
 
     dialogues = payload.get("important_dialogues")
     if isinstance(dialogues, list):
@@ -682,6 +1140,25 @@ def load_video_episode_analysis_artifact(path: str) -> dict[str, Any]:
     if not isinstance(raw, dict):
         raise ValueError(f"整片视频分析 JSON 格式无效: {path}")
     analysis = normalize_video_episode_analysis_payload(raw)
+    segments = list(analysis.get("episodic_segments") or [])
+    if segments:
+        chunks_meta = raw.get("chunks_meta") if isinstance(raw.get("chunks_meta"), list) else None
+        if not chunks_meta and int(raw.get("chunk_count") or 0) > 1:
+            chunks_meta = infer_chunks_meta_from_artifact(
+                video_duration_seconds=float(raw.get("video_duration_seconds") or 0),
+                chunk_count=int(raw.get("chunk_count") or 0),
+            )
+        repaired, continuity_warnings = repair_upload_chunk_boundary_continuity(
+            segments,
+            chunks_meta=chunks_meta,
+        )
+        analysis["episodic_segments"] = repaired
+        if continuity_warnings:
+            existing = list(analysis.get("coverage_warnings") or raw.get("coverage_warnings") or [])
+            for item in continuity_warnings:
+                if item not in existing:
+                    existing.append(item)
+            analysis["coverage_warnings"] = existing
     for key in (
         "artifact_version",
         "video_path",
@@ -710,12 +1187,14 @@ def _sample_items_uniformly(items: list[Any], max_count: int) -> list[Any]:
 
 def _format_episodic_segment_markdown(segment: dict[str, Any]) -> str:
     characters = "、".join(segment.get("involved_characters") or []) or "剧中未明确交代"
+    note = str(segment.get("continuity_note") or "").strip()
+    note_line = f"\n  - 连续性：{note}" if note else ""
     return (
         f"- `{segment.get('time_range', '')}` **{segment.get('title', '')}** · "
         f"{segment.get('key_events', '')}\n"
         f"  - 旁白：{segment.get('narration', '')}\n"
         f"  - 环境：{segment.get('environment_description', '')}\n"
-        f"  - 人物：{characters}"
+        f"  - 人物：{characters}{note_line}"
     )
 
 
@@ -801,6 +1280,90 @@ def summarize_video_episode_markdown(markdown: str, max_chars: int) -> str:
     return text[: max_chars - 24].rstrip() + "\n…（整片视频分析摘要已截断）"
 
 
+_UNNAMED_CHARACTER_LABEL = "剧中未明确交代"
+
+
+def extract_video_episode_character_lexicon(payload: dict[str, Any]) -> dict[str, Any]:
+    """从整片视频分析 JSON 汇总规范人物名与重要台词摘录。"""
+    normalized = normalize_video_episode_analysis_payload(payload)
+    names: set[str] = set()
+    snippets: list[str] = []
+
+    for ref in payload.get("character_references") or []:
+        if not isinstance(ref, dict):
+            continue
+        name = str(ref.get("name") or "").strip()
+        if name and name != _UNNAMED_CHARACTER_LABEL:
+            names.add(name)
+
+    for segment in normalized.get("episodic_segments") or []:
+        if not isinstance(segment, dict):
+            continue
+        for raw_name in segment.get("involved_characters") or []:
+            name = str(raw_name or "").strip()
+            if name and name != _UNNAMED_CHARACTER_LABEL:
+                names.add(name)
+
+    for item in normalized.get("important_dialogues") or []:
+        if not isinstance(item, dict):
+            continue
+        speaker = str(item.get("speaker") or "").strip()
+        quote = str(item.get("quote") or "").strip()
+        ts = str(item.get("timestamp") or "").strip()
+        if speaker and speaker != _UNNAMED_CHARACTER_LABEL:
+            names.add(speaker)
+        if quote:
+            label = speaker or "?"
+            snippets.append(f"[{ts or '?'}] {label}：「{quote}」")
+
+    return {"names": names, "subtitle_snippets": snippets}
+
+
+def build_video_episode_character_lexicon_markdown(
+    payload: dict[str, Any],
+    *,
+    max_chars: int = 4000,
+) -> tuple[str, dict[str, Any]]:
+    """生成供构思蓝图参照的整片视频分析人物索引 Markdown。"""
+    empty: dict[str, Any] = {"names": set(), "subtitle_snippets": []}
+    if not isinstance(payload, dict) or not payload:
+        return "", empty
+
+    lexicon = extract_video_episode_character_lexicon(payload)
+    names = sorted(str(name) for name in lexicon.get("names") or set())
+    snippets = list(lexicon.get("subtitle_snippets") or [])
+
+    if len(snippets) > 1:
+        target = max(8, min(len(snippets), max(1200, max_chars - 800) // 80))
+        if len(snippets) <= target:
+            sampled = snippets
+        else:
+            step = (len(snippets) - 1) / max(target - 1, 1)
+            picked: list[int] = []
+            for index in range(target):
+                idx = min(len(snippets) - 1, int(round(index * step)))
+                if idx not in picked:
+                    picked.append(idx)
+            sampled = [snippets[i] for i in picked]
+    else:
+        sampled = snippets
+
+    lines = [
+        "## 整片视频分析人物索引（只读 · 规范姓名以此为准）",
+        "- **出现人物（据视频分析 involved_characters / speaker）**："
+        + ("、".join(names) if names else "（未识别到具名人物）"),
+        "- **人名须与上方索引及剧集对照表一致**；禁止 ASR 谐音（胡晓月→胡小跃、罗伯→罗博等）",
+        "- **重要台词摘录（important_dialogues）**：",
+    ]
+    for snippet in sampled:
+        lines.append(f"  - {snippet}")
+
+    text = "\n".join(lines)
+    if len(text) > max_chars:
+        text = text[: max_chars - 20].rstrip() + "\n…（索引已截断）"
+    return text, lexicon
+
+
 def video_episode_summary_usable(summary: str) -> bool:
     text = (summary or "").strip()
     return bool(text) and text not in {"（无整片视频分析）", "（无）"}
@@ -811,7 +1374,7 @@ def normalize_video_grid_range(value: str) -> str:
 
 
 def collect_video_episode_time_bounds(payload: dict[str, Any]) -> dict[str, Any]:
-    """从整片视频分析汇总时间边界与固定 10 秒格列表。"""
+    """从整片视频分析汇总时间边界与固定时间格列表。"""
     segments = payload.get("episodic_segments") or []
     segment_ranges: list[str] = []
     segment_bounds_ms: list[tuple[int, int]] = []
@@ -850,23 +1413,24 @@ def build_video_episode_schedule_index(
     *,
     max_rows: int = 96,
 ) -> str:
-    """构思蓝图用：固定 10 秒格索引表（须逐格引用）。"""
+    """构思蓝图用：固定时间格索引表（须逐格引用）。"""
     segments = payload.get("episodic_segments") or []
     if not segments:
         return ""
     sampled = _sample_items_uniformly(segments, max_rows)
     lines = [
-        "### 视频分析固定时间格索引（蓝图「视频格」须从此表逐字引用）",
-        "| 视频格 time_range | 标题 | 关键事件 |",
-        "|---|---|---|",
+        "### 视频分析固定时间格索引（段内各格独立；上传分段边界见 coverage_warnings）",
+        "| 视频格 time_range | 标题 | 人物 | 关键事件 |",
+        "|---|---|---|---|",
     ]
     for segment in sampled:
         if not isinstance(segment, dict):
             continue
         time_range = normalize_video_grid_range(str(segment.get("time_range") or ""))
         title = str(segment.get("title") or "").strip()[:12]
-        events = str(segment.get("key_events") or "").strip()[:36]
-        lines.append(f"| `{time_range}` | {title} | {events} |")
+        events = str(segment.get("key_events") or "").strip()[:32]
+        chars = "、".join(segment.get("involved_characters") or [])[:20] or "—"
+        lines.append(f"| `{time_range}` | {title} | {chars} | {events} |")
     if len(segments) > len(sampled):
         lines.append(
             f"\n> 全片共 **{len(segments)}** 格，上表均匀采样 **{len(sampled)}** 格；"
@@ -912,11 +1476,12 @@ def build_plot_blueprint_narrative_granularity_rules(
     ost1_duration_min: int = 8,
     ost1_duration_max: int = 18,
 ) -> str:
-    """构思蓝图：完整情节段粒度规则（禁止按 10 秒格/单句对白碎切）。"""
+    """构思蓝图：完整情节段粒度规则（禁止按固定视频格/单句对白碎切）。"""
+    grid_label = f"{SEGMENT_INTERVAL_SECONDS} 秒"
     return (
         "## 情节段粒度（硬性 · 禁止碎切）\n"
         "- **每条 = 一段完整内容**：一场戏、一个冲突回合或一条清晰叙事线（通常 **30 秒–3 分钟** 原片跨度）\n"
-        "- **禁止**按每个 10 秒视频格各写一行；**禁止**按每条 SRT 字幕各写一行\n"
+        f"- **禁止**按每个 {grid_label}视频格各写一行；**禁止**按每条 SRT 字幕各写一行\n"
         "- **原片时间线**仅 **10–14 条**完整情节段，不是 30+ 条碎点\n"
         f"- **OST=1 字幕窗**：合并相邻对白为 **{ost1_duration_min}–{ost1_duration_max} 秒**连续区间；"
         f"单句不足 {ost1_duration_min} 秒须并入同场前后对白\n"
@@ -931,9 +1496,10 @@ def build_plot_blueprint_video_time_rules(
     ost1_duration_min: int = 8,
     ost1_duration_max: int = 18,
 ) -> str:
+    grid_label = f"{SEGMENT_INTERVAL_SECONDS} 秒"
     return (
         "## 双时间轴对齐规则（硬性 · 精准控制）\n"
-        "- **视频格**（画面/剧情）：起止须对齐索引表连续 10 秒格；**一场戏可跨多格**（如 `00:09:40-00:10:10`）\n"
+        f"- **视频格**（画面/剧情）：起止须对齐索引表连续 {grid_label}格；**一场戏可跨多格**（如 `00:09:40-00:10:10`）\n"
         "- **字幕窗**（对白/OST=1）：只能使用 SRT 索引中的 `HH:MM:SS,mmm-HH:MM:SS,mmm`（毫秒级）\n"
         "- **原片时间线**每条 = **一段完整情节**；格式："
         "`视频格 \\`00:01:20-00:01:50\\` · 【本段讲什么】事件摘要 · 字幕窗 \\`…\\`（无对白写「无对白」）`\n"
@@ -1008,23 +1574,22 @@ def _transcode_for_upload(
     output_path: str,
     start_seconds: float = 0.0,
     duration_seconds: float | None = None,
-    high_fidelity: bool = False,
+    profile: str = "standard",
 ) -> None:
     os.makedirs(os.path.dirname(output_path), exist_ok=True)
+    cfg = get_upload_transcode_profile(profile)
+    width = int(cfg.get("width") or 640)
+    fps = int(cfg.get("fps") or 15)
+    crf = str(cfg.get("crf") or 28)
+    audio_bitrate = str(cfg.get("audio_bitrate") or "48k")
+    preset = str(cfg.get("preset") or "fast")
+    video_filter = f"scale={width}:-2,fps={fps}"
     cmd = ["ffmpeg", "-y"]
     if start_seconds > 0:
         cmd.extend(["-ss", str(start_seconds)])
     cmd.extend(["-i", video_path])
     if duration_seconds and duration_seconds > 0:
         cmd.extend(["-t", str(duration_seconds)])
-    if high_fidelity:
-        video_filter = "scale=640:-2,fps=15"
-        crf = "28"
-        audio_bitrate = "48k"
-    else:
-        video_filter = "scale=480:-2,fps=12"
-        crf = "32"
-        audio_bitrate = "32k"
     cmd.extend(
         [
             "-vf",
@@ -1032,7 +1597,7 @@ def _transcode_for_upload(
             "-c:v",
             "libx264",
             "-preset",
-            "veryfast",
+            preset,
             "-crf",
             crf,
             "-c:a",
@@ -1050,16 +1615,22 @@ def _transcode_for_upload(
 def build_time_segment_plan(
     duration_seconds: float,
     *,
-    chunk_seconds: float = _DEFAULT_CHUNK_SECONDS,
+    chunk_seconds: float | None = None,
 ) -> list[tuple[float, float]]:
     """按时长切分上传计划：(start_seconds, segment_duration)。"""
+    upload_cfg = get_video_episode_upload_settings()
+    chunk_len = float(
+        chunk_seconds
+        if chunk_seconds is not None
+        else upload_cfg.get("chunk_seconds", 300.0)
+    )
     duration = max(0.0, float(duration_seconds))
     if duration <= 0:
         return []
     segments: list[tuple[float, float]] = []
     start = 0.0
     while start < duration - 0.5:
-        segment_duration = min(chunk_seconds, duration - start)
+        segment_duration = min(chunk_len, duration - start)
         segments.append((start, segment_duration))
         start += segment_duration
     return segments
@@ -1072,22 +1643,29 @@ def _transcode_chunk_within_size_limit(
     start_seconds: float,
     segment_duration: float,
     max_upload_mb: float,
-    high_fidelity: bool = False,
+    profile_chain: tuple[str, ...] | None = None,
 ) -> float:
-    """转码单段视频，若仍超限则继续缩短时长。"""
+    """转码单段视频；按档位链尝试，仍超限则缩短时长。"""
+    profiles = profile_chain or resolve_upload_profile_chain(short_video=False)
     current_duration = segment_duration
     while current_duration >= _MIN_CHUNK_SECONDS:
-        _transcode_for_upload(
-            video_path,
-            output_path=output_path,
-            start_seconds=start_seconds,
-            duration_seconds=current_duration,
-            high_fidelity=high_fidelity,
-        )
-        size_mb = os.path.getsize(output_path) / (1024 * 1024)
-        if size_mb <= max_upload_mb:
-            return current_duration
-        os.remove(output_path)
+        for profile in profiles:
+            _transcode_for_upload(
+                video_path,
+                output_path=output_path,
+                start_seconds=start_seconds,
+                duration_seconds=current_duration,
+                profile=profile,
+            )
+            size_mb = os.path.getsize(output_path) / (1024 * 1024)
+            if size_mb <= max_upload_mb:
+                prof = get_upload_transcode_profile(profile)
+                logger.debug(
+                    f"上传转码档位 {profile}: {prof.get('width')}p "
+                    f"crf={prof.get('crf')} · {size_mb:.2f}MB"
+                )
+                return current_duration
+            os.remove(output_path)
         current_duration = max(_MIN_CHUNK_SECONDS, current_duration / 2)
     raise ValueError(
         f"无法将视频片段压缩到 {max_upload_mb:.1f}MB 以内 "
@@ -1098,11 +1676,21 @@ def _transcode_chunk_within_size_limit(
 def _plan_video_chunks(
     video_path: str,
     *,
-    max_upload_mb: float = _DEFAULT_MAX_UPLOAD_MB,
-    chunk_seconds: float = _DEFAULT_CHUNK_SECONDS,
+    max_upload_mb: float | None = None,
+    chunk_seconds: float | None = None,
     work_dir: str,
     progress_callback: Callable[[float, str], None] | None = None,
+    checkpoint: dict[str, Any] | None = None,
+    resume: bool = False,
+    on_chunk_compressed: Callable[[list[dict[str, Any]], int], None] | None = None,
 ) -> list[dict[str, Any]]:
+    upload_cfg = get_video_episode_upload_settings()
+    if max_upload_mb is None:
+        max_upload_mb = float(upload_cfg.get("max_upload_mb", 24.0))
+    if chunk_seconds is None:
+        chunk_seconds = float(upload_cfg.get("chunk_seconds", 300.0))
+    short_profile_sec = float(upload_cfg.get("short_video_high_profile_sec", 300.0))
+
     progress = progress_callback or (lambda _p, _m: None)
     progress(6, "正在读取视频时长...")
     duration = _probe_duration_seconds(video_path)
@@ -1110,44 +1698,93 @@ def _plan_video_chunks(
         raise ValueError(f"无法读取视频时长: {video_path}")
 
     duration_label = _format_timestamp(duration)
-    high_fidelity = duration <= 300
+    short_video = duration <= short_profile_sec
+    profile_chain = resolve_upload_profile_chain(short_video=short_video)
+    saved_meta = (checkpoint or {}).get("chunks_meta") or [] if resume else []
 
     if duration <= chunk_seconds:
         progress(8, f"正在压缩视频（时长 {duration_label}，单段上传）...")
         full_preview = os.path.join(work_dir, "upload_full.mp4")
+        if (
+            resume
+            and saved_meta
+            and os.path.isfile(full_preview)
+            and os.path.getsize(full_preview) > 1024
+        ):
+            meta = saved_meta[0]
+            progress(14, "压缩完成 · 复用已缓存单段上传文件")
+            chunk = {
+                "path": full_preview,
+                "offset_seconds": float(meta.get("offset_seconds") or 0),
+                "duration_seconds": float(meta.get("duration_seconds") or 0),
+            }
+            if on_chunk_compressed:
+                on_chunk_compressed([chunk], 0)
+            return [chunk]
         actual_duration = _transcode_chunk_within_size_limit(
             video_path,
             output_path=full_preview,
             start_seconds=0.0,
             segment_duration=duration,
             max_upload_mb=max_upload_mb,
-            high_fidelity=high_fidelity,
+            profile_chain=profile_chain,
         )
         size_mb = os.path.getsize(full_preview) / (1024 * 1024)
         logger.info(
             f"整片视频分析：单段上传 {actual_duration:.0f}s / {size_mb:.2f}MB"
         )
         progress(14, f"压缩完成 · {size_mb:.1f}MB · 单段上传")
-        return [
-            {
-                "path": full_preview,
-                "offset_seconds": 0.0,
-                "duration_seconds": actual_duration,
-            }
-        ]
+        chunk = {
+            "path": full_preview,
+            "offset_seconds": 0.0,
+            "duration_seconds": actual_duration,
+        }
+        if on_chunk_compressed:
+            on_chunk_compressed([chunk], 0)
+        return [chunk]
 
-    planned_segments = build_time_segment_plan(duration, chunk_seconds=chunk_seconds)
-    total_planned = max(1, len(planned_segments))
+    estimated_total = max(
+        int(checkpoint.get("total_chunks") or 0) if checkpoint else 0,
+        len(build_time_segment_plan(duration, chunk_seconds=chunk_seconds)),
+        1,
+    )
     chunks: list[dict[str, Any]] = []
     start = 0.0
     index = 0
+
+    while index < len(saved_meta):
+        meta = saved_meta[index]
+        if not isinstance(meta, dict):
+            break
+        chunk_path = os.path.join(work_dir, f"upload_chunk_{index:02d}.mp4")
+        if not os.path.isfile(chunk_path) or os.path.getsize(chunk_path) <= 1024:
+            break
+        offset_seconds = float(meta.get("offset_seconds") or 0)
+        duration_seconds = float(meta.get("duration_seconds") or 0)
+        chunks.append(
+            {
+                "path": chunk_path,
+                "offset_seconds": offset_seconds,
+                "duration_seconds": duration_seconds,
+            }
+        )
+        start = offset_seconds + duration_seconds
+        index += 1
+        compress_progress = 8 + int(6 * index / max(estimated_total, index + 1))
+        progress(
+            compress_progress,
+            f"第 {index}/{estimated_total} 段已压缩 · 复用缓存 "
+            f"（{_format_timestamp(offset_seconds)} 起，约 {duration_seconds:.0f}s）",
+        )
+
     while start < duration - 0.5:
         planned_duration = min(chunk_seconds, duration - start)
         chunk_path = os.path.join(work_dir, f"upload_chunk_{index:02d}.mp4")
-        compress_progress = 8 + int(6 * index / total_planned)
+        total_display = max(estimated_total, index + 1)
+        compress_progress = 8 + int(6 * index / total_display)
         progress(
             compress_progress,
-            f"正在压缩第 {index + 1}/{total_planned} 段 "
+            f"正在压缩第 {index + 1}/{total_display} 段 "
             f"（{_format_timestamp(start)} 起，约 {planned_duration:.0f}s）...",
         )
         actual_duration = _transcode_chunk_within_size_limit(
@@ -1156,7 +1793,7 @@ def _plan_video_chunks(
             start_seconds=start,
             segment_duration=planned_duration,
             max_upload_mb=max_upload_mb,
-            high_fidelity=high_fidelity,
+            profile_chain=profile_chain,
         )
         size_mb = os.path.getsize(chunk_path) / (1024 * 1024)
         logger.info(
@@ -1170,8 +1807,11 @@ def _plan_video_chunks(
                 "duration_seconds": actual_duration,
             }
         )
+        if on_chunk_compressed:
+            on_chunk_compressed(chunks, index)
         start += actual_duration
         index += 1
+        estimated_total = max(estimated_total, index)
     progress(14, f"压缩完成 · 共 {len(chunks)} 段待上传分析")
     return chunks
 
@@ -1221,6 +1861,7 @@ class VideoEpisodeAnalysisService:
         base_url: str,
         progress: Callable[[float, str], None],
         analyze_progress: int,
+        previous_chunk_partial: dict[str, Any] | None = None,
     ) -> tuple[dict[str, Any], int]:
         chunk_duration_seconds = float(chunk.get("duration_seconds") or 0)
         chunk_offset_seconds = float(chunk.get("offset_seconds") or 0)
@@ -1251,6 +1892,7 @@ class VideoEpisodeAnalysisService:
                 chunk_duration_seconds=chunk_duration_seconds,
                 segment_schedule_block=schedule_block,
                 character_naming_block=naming_block,
+                previous_chunk_partial=previous_chunk_partial,
             )
         chunk_max_tokens = max(
             8000,
@@ -1260,11 +1902,11 @@ class VideoEpisodeAnalysisService:
         last_error: Exception | None = None
         for attempt in range(1, _MAX_CHUNK_RETRIES + 1):
             try:
-                if reference_paths and chunk_index == 0:
+                if reference_paths and chunk_index >= 0:
                     progress(
                         analyze_progress,
                         f"第 {chunk_index + 1}/{total_chunks} 段 · "
-                        f"附带 {len(reference_paths)} 张头像参照 · 调用模型中"
+                        f"附带 {len(reference_paths)} 张参照图 · 调用模型中"
                         + (f"（重试 {attempt}/{_MAX_CHUNK_RETRIES}）" if attempt > 1 else "")
                         + "...",
                     )
@@ -1310,7 +1952,7 @@ class VideoEpisodeAnalysisService:
         vision_model_name: str | None = None,
         vision_api_key: str | None = None,
         vision_base_url: str | None = None,
-        max_upload_mb: float = _DEFAULT_MAX_UPLOAD_MB,
+        max_upload_mb: float | None = None,
         progress_callback: Callable[[float, str], None] | None = None,
         output_path: str | None = None,
         resume: bool = True,
@@ -1328,6 +1970,9 @@ class VideoEpisodeAnalysisService:
 
         progress(2, f"正在初始化 · 模型 {model_name}")
 
+        save_path = output_path or default_video_episode_analysis_path(video_path)
+        checkpoint_path = default_checkpoint_path(save_path)
+
         work_dir = os.path.join(utils.storage_dir(), "temp", "video_episode_upload", sanitize_video_stem(video_path))
         os.makedirs(work_dir, exist_ok=True)
 
@@ -1335,13 +1980,97 @@ class VideoEpisodeAnalysisService:
         duration_label = _format_timestamp(video_duration_seconds)
         progress(4, f"视频时长 {duration_label}，准备压缩上传...")
 
+        upload_cfg = get_video_episode_upload_settings()
+        if max_upload_mb is None:
+            max_upload_mb = float(upload_cfg.get("max_upload_mb", 24.0))
+        std_prof = get_upload_transcode_profile("standard")
+        logger.info(
+            f"整片视频上传转码：max_upload_mb={max_upload_mb} · "
+            f"chunk_seconds={upload_cfg.get('chunk_seconds', 300.0)} · "
+            f"长片默认 {std_prof['width']}p crf={std_prof['crf']}"
+        )
+
+        checkpoint: dict[str, Any] | None = None
+        chunk_results: dict[str, dict[str, Any]] = {}
+        if resume:
+            checkpoint = load_video_episode_checkpoint(checkpoint_path)
+            if checkpoint and is_checkpoint_source_compatible(
+                checkpoint,
+                video_path=video_path,
+                video_duration_seconds=video_duration_seconds,
+            ):
+                chunk_results = {
+                    str(key): value
+                    for key, value in (checkpoint.get("chunk_results") or {}).items()
+                    if isinstance(value, dict)
+                }
+                meta_len = len(checkpoint.get("chunks_meta") or [])
+                summary = summarize_checkpoint_progress(
+                    checkpoint,
+                    int(checkpoint.get("total_chunks") or 0) or max(meta_len, 1),
+                )
+                if meta_len or summary["completed"] or summary["failed"]:
+                    progress(
+                        5,
+                        f"续跑补全 · 已压缩 {meta_len} 段"
+                        + (
+                            f" · 已分析 {summary['completed']}/{summary['total']} 段"
+                            if summary["completed"] or summary["failed"]
+                            else ""
+                        )
+                        + (f" · 失败 {summary['failed']} 段" if summary["failed"] else ""),
+                    )
+            elif checkpoint:
+                reason = describe_checkpoint_incompatibility(
+                    checkpoint,
+                    video_path=video_path,
+                    video_duration_seconds=video_duration_seconds,
+                )
+                logger.warning(f"整片视频分析检查点不可用（{reason}），将从头分析")
+                progress(5, f"检查点不可用（{reason}），将从头分析")
+                checkpoint = None
+                chunk_results = {}
+        else:
+            checkpoint = None
+            chunk_results = {}
+            if os.path.isfile(checkpoint_path):
+                try:
+                    os.remove(checkpoint_path)
+                except OSError as exc:
+                    logger.warning(f"无法删除旧检查点 {checkpoint_path}: {exc}")
+
+        def _persist_checkpoint(*, total_chunks: int | None = None) -> None:
+            save_video_episode_checkpoint(
+                checkpoint_path,
+                {
+                    "artifact_version": VIDEO_EPISODE_ANALYSIS_ARTIFACT_VERSION,
+                    "video_path": os.path.abspath(video_path),
+                    "video_duration_seconds": round(video_duration_seconds, 3),
+                    "total_chunks": total_chunks if total_chunks is not None else len(chunks),
+                    "chunks_meta": _chunks_meta(chunks),
+                    "chunk_results": chunk_results,
+                    "updated_at": datetime.now().isoformat(),
+                },
+            )
+
+        chunks: list[dict[str, Any]] = []
+
+        def _on_chunk_compressed(compressed_chunks: list[dict[str, Any]], _index: int) -> None:
+            nonlocal chunks
+            chunks = list(compressed_chunks)
+            _persist_checkpoint(total_chunks=max(int((checkpoint or {}).get("total_chunks") or 0), len(chunks)))
+
         chunks = _plan_video_chunks(
             video_path,
             max_upload_mb=max_upload_mb,
             work_dir=work_dir,
             progress_callback=progress,
+            checkpoint=checkpoint,
+            resume=bool(resume and checkpoint),
+            on_chunk_compressed=_on_chunk_compressed,
         )
         total_chunks = len(chunks)
+        _persist_checkpoint(total_chunks=total_chunks)
         logger.info(
             f"整片视频分析：时长 {duration_label}，"
             f"共 {total_chunks} 段上传（max_upload_mb={max_upload_mb}）"
@@ -1363,49 +2092,37 @@ class VideoEpisodeAnalysisService:
             base_url=base_url,
         )
 
-        save_path = output_path or default_video_episode_analysis_path(video_path)
-        checkpoint_path = default_checkpoint_path(save_path)
-        chunk_results: dict[str, dict[str, Any]] = {}
-        checkpoint: dict[str, Any] | None = None
-        if resume:
-            checkpoint = load_video_episode_checkpoint(checkpoint_path)
-            if checkpoint and is_checkpoint_compatible(
+        if resume and checkpoint and not is_checkpoint_compatible(
+            checkpoint,
+            video_path=video_path,
+            video_duration_seconds=video_duration_seconds,
+            chunks=chunks,
+        ):
+            reason = describe_checkpoint_incompatibility(
                 checkpoint,
                 video_path=video_path,
                 video_duration_seconds=video_duration_seconds,
                 chunks=chunks,
-            ):
-                chunk_results = {
-                    str(key): value
-                    for key, value in (checkpoint.get("chunk_results") or {}).items()
-                    if isinstance(value, dict)
-                }
-                summary = summarize_checkpoint_progress(checkpoint, total_chunks)
-                if summary["completed"] or summary["failed"]:
-                    progress(
-                        15,
-                        f"续跑补全 · 已完成 {summary['completed']}/{total_chunks} 段"
-                        + (f"，失败 {summary['failed']} 段" if summary["failed"] else "")
-                        + (f"，待处理 {summary['pending']} 段" if summary["pending"] else ""),
-                    )
-            elif checkpoint:
-                logger.warning("整片视频分析检查点与当前视频/分段计划不兼容，将从头分析")
-                checkpoint = None
+            )
+            logger.warning(f"压缩完成后检查点分段边界不一致（{reason}），模型结果将不续用")
+            progress(15, f"分段边界变化（{reason}），已压缩段仍可用，模型分析从头校验")
+            chunk_results = {}
 
-        def _persist_checkpoint() -> None:
-            save_video_episode_checkpoint(
-                checkpoint_path,
-                {
-                    "artifact_version": VIDEO_EPISODE_ANALYSIS_ARTIFACT_VERSION,
-                    "video_path": os.path.abspath(video_path),
-                    "video_duration_seconds": round(video_duration_seconds, 3),
-                    "total_chunks": total_chunks,
-                    "chunks_meta": _chunks_meta(chunks),
-                    "chunk_results": chunk_results,
-                    "updated_at": datetime.now().isoformat(),
-                },
+        summary = summarize_checkpoint_progress(checkpoint, total_chunks) if checkpoint else {
+            "completed": 0,
+            "failed": 0,
+            "pending": total_chunks,
+            "total": total_chunks,
+        }
+        if summary["completed"] or summary["failed"]:
+            progress(
+                15,
+                f"续跑补全 · 已完成 {summary['completed']}/{total_chunks} 段"
+                + (f"，失败 {summary['failed']} 段" if summary["failed"] else "")
+                + (f"，待处理 {summary['pending']} 段" if summary["pending"] else ""),
             )
 
+        last_successful_partial: dict[str, Any] | None = None
         for index, chunk in enumerate(chunks):
             chunk_key = str(index)
             existing = chunk_results.get(chunk_key)
@@ -1414,6 +2131,7 @@ class VideoEpisodeAnalysisService:
                 and existing.get("status") == "completed"
                 and existing.get("partial")
             ):
+                last_successful_partial = existing["partial"]
                 segment_count = len((existing.get("partial") or {}).get("episodic_segments") or [])
                 done_progress = 16 + int(68 * (index + 1) / max(total_chunks, 1))
                 progress(
@@ -1446,12 +2164,14 @@ class VideoEpisodeAnalysisService:
                     base_url=base_url,
                     progress=progress,
                     analyze_progress=analyze_progress,
+                    previous_chunk_partial=last_successful_partial,
                 )
                 chunk_results[chunk_key] = {
                     "status": "completed",
                     "partial": parsed_partial,
                     "retry_count": retry_count,
                 }
+                last_successful_partial = parsed_partial
             except Exception as exc:
                 logger.warning(f"整片视频分析第 {index + 1} 段失败: {exc}")
                 chunk_results[chunk_key] = {
@@ -1513,6 +2233,11 @@ class VideoEpisodeAnalysisService:
             analysis.get("episodic_segments") or [],
             full_schedule,
         )
+        repaired_segments, continuity_warnings = repair_upload_chunk_boundary_continuity(
+            analysis.get("episodic_segments") or [],
+            chunks_meta=_chunks_meta(chunks),
+        )
+        analysis["episodic_segments"] = repaired_segments
         merged_segment_count = len(analysis.get("episodic_segments") or [])
         progress(92, f"正在对齐固定 {SEGMENT_INTERVAL_SECONDS} 秒时间窗（共 {merged_segment_count} 条）...")
         coverage_warnings = validate_episodic_segments(
@@ -1520,6 +2245,13 @@ class VideoEpisodeAnalysisService:
             video_duration_seconds=video_duration_seconds,
             expected_time_ranges=full_schedule,
         )
+        if continuity_warnings:
+            logger.warning(
+                "整片视频分析连续性告警: " + " | ".join(continuity_warnings[:5])
+            )
+            for item in continuity_warnings:
+                if item not in coverage_warnings:
+                    coverage_warnings.append(item)
         if coverage_warnings:
             logger.warning(
                 "整片视频分析片段约束告警: " + " | ".join(coverage_warnings[:5])
@@ -1551,8 +2283,9 @@ class VideoEpisodeAnalysisService:
             "chunk_count": total_chunks,
             "completed_chunk_count": completed_chunks,
             "failed_chunk_indices": failed_chunk_indices,
+            "chunks_meta": _chunks_meta(chunks),
             "segment_interval_seconds": SEGMENT_INTERVAL_SECONDS,
-            "segment_split_policy": "fixed_10s",
+            "segment_split_policy": f"fixed_{SEGMENT_INTERVAL_SECONDS}s",
             "episodic_segment_count": len(analysis.get("episodic_segments") or []),
             "coverage_warnings": coverage_warnings,
             **analysis,

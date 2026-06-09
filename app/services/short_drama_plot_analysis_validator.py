@@ -1,7 +1,7 @@
 #!/usr/bin/env python
 # -*- coding: UTF-8 -*-
 
-"""短剧「字幕×抽帧联合剧情构思」输出校验。"""
+"""短剧「字幕×整片视频分析联合剧情构思」输出校验。"""
 
 from __future__ import annotations
 
@@ -13,7 +13,7 @@ from loguru import logger
 from app.services.short_drama_drama_knowledge import find_name_mistakes_in_text
 from app.services.short_drama_settings import get_short_drama_settings
 
-_REQUIRED_SECTIONS = (
+_REQUIRED_SECTIONS_LEGACY = (
     "## 主要人物表",
     "## 开头高潮方案",
     "## 原片时间线",
@@ -22,6 +22,28 @@ _REQUIRED_SECTIONS = (
     "## 解说 OST=0 脉络规划",
     "## 声画对位注意",
 )
+
+_SCENE_SECTION_HEADERS = ("## 全片场景分段", "## 原片时间线")
+
+
+def _has_scene_section(content: str) -> bool:
+    return any(header in content for header in _SCENE_SECTION_HEADERS)
+
+
+def _count_scene_segments(content: str) -> int:
+    for header in _SCENE_SECTION_HEADERS:
+        section = _extract_section(content, header)
+        if not section:
+            continue
+        heading_hits = len(re.findall(r"(?m)^###\s+场景", section))
+        if heading_hits:
+            return heading_hits
+        bullet_hits = len(
+            re.findall(r"(?m)^\s*(?:[-*]|\d+\.)\s+.*(?:视频格|时间段|HH:MM:SS)", section)
+        )
+        if bullet_hits:
+            return bullet_hits
+    return 0
 
 _SCENE_INDEX_RE = re.compile(r"场景\s*\d+")
 _SRT_ARROW_TS_RE = re.compile(
@@ -141,47 +163,59 @@ def validate_short_drama_plot_analysis(
     drama_known_names: set[str] | None = None,
     settings: dict[str, Any] | None = None,
     min_chars: int = 2000,
+    use_video_episode_analysis: bool = False,
+    relaxed: bool = True,
 ) -> dict[str, Any]:
     """校验联合剧情构思 Markdown；返回 ok / issues / warnings。"""
     content = (text or "").strip()
     issues: list[str] = []
     warnings: list[str] = []
+    min_chars_required = max(1200, int(min_chars * 0.55)) if relaxed else min_chars
 
-    if len(content) < min_chars:
-        issues.append(f"篇幅过短（{len(content)} 字），要求不少于 {min_chars} 字")
+    if len(content) < min_chars_required:
+        issues.append(f"篇幅过短（{len(content)} 字），要求不少于 {min_chars_required} 字")
 
     if content and not content.rstrip().endswith(("。", "！", "？", "」", "）", ".", "!", "?")):
-        if len(content) > min_chars * 0.8:
-            warnings.append("输出疑似被截断（末尾未完整收束），请补全 OST=1 与声画对位章节")
+        if len(content) > min_chars_required * 0.8:
+            warnings.append("输出疑似被截断（末尾未完整收束）")
 
-    for header in _REQUIRED_SECTIONS:
-        if header not in content:
-            issues.append(f"缺少必填章节：{header}")
+    if "## 主要人物表" not in content:
+        issues.append("缺少必填章节：## 主要人物表")
+    if not _has_scene_section(content):
+        issues.append("缺少必填章节：## 全片场景分段（或 ## 原片时间线）")
+
+    scene_count = _count_scene_segments(content)
+    if relaxed:
+        if scene_count and scene_count < 6:
+            warnings.append(f"场景分段偏少（约 {scene_count} 段），建议按完整情节场切分 10 段以上")
+    elif not relaxed:
+        for header in _REQUIRED_SECTIONS_LEGACY:
+            if header not in content:
+                issues.append(f"缺少必填章节：{header}")
 
     scene_hits = _SCENE_INDEX_RE.findall(content)
-    if scene_hits:
+    if scene_hits and not relaxed:
         issues.append(
-            "禁止引用抽帧采样编号「场景 N」（如 "
+            "禁止引用采样编号「场景 N」（如 "
             + "、".join(sorted(set(scene_hits))[:5])
             + "），请改用原片时间段+地点描述"
         )
 
     if _SRT_ARROW_TS_RE.search(content):
-        issues.append(
-            "时间戳须用剪辑格式 HH:MM:SS,mmm-HH:MM:SS,mmm，禁止 SRT 箭头 `-->`"
-        )
+        warnings.append("时间戳建议用剪辑格式 HH:MM:SS,mmm-HH:MM:SS,mmm，避免 SRT 箭头 `-->`")
 
     invalid_ost = _INVALID_OST_RE.findall(content)
-    if invalid_ost:
+    if invalid_ost and not relaxed:
         issues.append("存在非法 OST 标记（仅允许 OST=0 或 OST=1）")
 
     min_ost1 = _estimate_min_ost1_entries(settings)
     ost1_count = _count_ost1_entries(content)
     if ost1_count < min_ost1:
-        issues.append(
-            f"建议保留原声 OST=1 条目过少（约 {ost1_count} 条），"
-            f"8 分钟成片原声约 70% 时建议至少 {min_ost1} 条（含时间戳）"
+        msg = (
+            f"建议保留原声 OST=1 条目偏少（约 {ost1_count} 条），"
+            f"后续写脚本时可参考 ≥{min_ost1} 条"
         )
+        (warnings if relaxed else issues).append(msg)
 
     cfg = settings or get_short_drama_settings()
     ost1_dur_min = float(cfg.get("ost1_duration_min", 8) or 8)
@@ -198,14 +232,13 @@ def validate_short_drama_plot_analysis(
         if sec > ost1_dur_max + 2
     ]
     if short_ts:
-        issues.append(
-            f"蓝图 OST=1 时间戳过短（{len(short_ts)} 处 < {ost1_dur_min:.0f}s，"
-            f"如 {short_ts[:3]}），须合并为 {ost1_dur_min:.0f}–{ost1_dur_max:.0f}s 连续对白块"
+        warnings.append(
+            f"部分 OST=1 时间戳较短（{len(short_ts)} 处 < {ost1_dur_min:.0f}s），"
+            "写脚本时可酌情合并同场对白"
         )
     if long_ts:
         warnings.append(
-            f"蓝图 OST=1 时间戳偏长（{len(long_ts)} 处 > {ost1_dur_max:.0f}s），"
-            f"建议拆分为多条或缩短至配置上限"
+            f"部分 OST=1 时间戳偏长（{len(long_ts)} 处 > {ost1_dur_max:.0f}s）"
         )
 
     lex = lexicon or {}
@@ -213,22 +246,29 @@ def validate_short_drama_plot_analysis(
     snippets = [str(x) for x in lex.get("subtitle_snippets") or []]
     drama_names = {str(x) for x in (drama_known_names or set()) if str(x).strip()}
 
+    lexicon_label = (
+        "整片视频分析人物索引"
+        if use_video_episode_analysis
+        else "抽帧字幕索引"
+    )
+
     for mistake in find_name_mistakes_in_text(content):
         issues.append(mistake)
 
     allowed_names = known_names | drama_names
+    name_check = warnings if relaxed else issues
     if allowed_names:
         for name in sorted(_collect_referenced_names(content)):
             if not _name_in_lexicon(name, allowed_names, snippets):
-                issues.append(
-                    f"人物「{name}」未出现在剧集对照表或抽帧字幕索引中，"
+                name_check.append(
+                    f"人物「{name}」未出现在人物关系表或{lexicon_label}中，"
                     "请核对是否张冠李戴或臆造姓名"
                 )
     elif known_names:
         for name in sorted(_collect_referenced_names(content)):
             if not _name_in_lexicon(name, known_names, snippets):
-                issues.append(
-                    f"人物「{name}」未出现在抽帧字幕索引中，"
+                name_check.append(
+                    f"人物「{name}」未出现在{lexicon_label}中，"
                     "请核对是否张冠李戴或臆造姓名"
                 )
 
@@ -239,6 +279,7 @@ def validate_short_drama_plot_analysis(
         "warnings": warnings,
         "ost1_count": ost1_count,
         "min_ost1_expected": min_ost1,
+        "scene_count": scene_count,
         "char_count": len(content),
     }
 
@@ -248,11 +289,12 @@ def format_plot_analysis_validation_report(validation: dict[str, Any]) -> str:
     lines = [
         "",
         "-" * 72,
-        f"【短剧联合构思校验】{status}",
+        f"【短剧构思校验】{status}",
         "-" * 72,
         f"字数: {validation.get('char_count', 0)}",
-        f"OST=1 条目（含时间戳）: {validation.get('ost1_count', 0)} "
-        f"/ 建议 ≥{validation.get('min_ost1_expected', 0)}",
+        f"场景分段: {validation.get('scene_count', 0)} 段",
+        f"OST=1 参考条目: {validation.get('ost1_count', 0)} "
+        f"（写脚本建议 ≥{validation.get('min_ost1_expected', 0)}）",
     ]
     for issue in validation.get("issues") or []:
         lines.append(f"问题: {issue}")

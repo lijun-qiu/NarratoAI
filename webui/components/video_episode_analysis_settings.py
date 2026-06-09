@@ -11,7 +11,7 @@ from app.services.documentary.documentary_material_resolver import (
     resolve_video_episode_analysis_path_for_documentary,
 )
 from app.services.documentary.video_episode_analysis import (
-    VideoEpisodeAnalysisService,
+    checkpoint_needs_resume,
     default_checkpoint_path,
     default_video_episode_analysis_path,
     load_video_episode_analysis_artifact,
@@ -76,6 +76,8 @@ def render_video_episode_analysis_panel(tr, params) -> None:
         "/ important_dialogues 等 JSON。"
         "适合快速把握剧情；精细剪辑时间轴仍建议用「抽帧分析」。"
         "分析时会显示压缩、分段上传、模型调用与合并保存等步骤进度。"
+        "上传前默认转码为 **640p·CRF28**（短片优先 720p·CRF26，单段≤24MB）；"
+        "可在 config.toml `[video_episode_analysis]` 调整 `max_upload_mb`。"
         "人物命名会复用「抽帧分析」中上传的头像参照（请在抽帧分析面板勾选人物并上传头像）。"
     )
 
@@ -94,18 +96,20 @@ def render_video_episode_analysis_panel(tr, params) -> None:
         st.session_state["video_episode_analysis_json_path"] = active_path
     checkpoint_path = default_checkpoint_path(active_path if active_path else default_path)
     checkpoint = load_video_episode_checkpoint(checkpoint_path)
-    if checkpoint:
+    if checkpoint and checkpoint_needs_resume(checkpoint):
         summary = summarize_checkpoint_progress(
             checkpoint,
-            int(checkpoint.get("total_chunks") or 0),
+            int(checkpoint.get("total_chunks") or 0)
+            or max(len(checkpoint.get("chunks_meta") or []), 1),
         )
-        incomplete = summary["failed"] + summary["pending"]
-        if incomplete > 0:
-            st.warning(
-                f"存在未完成的整片分析进度：已完成 {summary['completed']}/{summary['total']} 段，"
-                f"失败 {summary['failed']} 段，待处理 {summary['pending']} 段。"
-                " 可直接补全，无需从头重新生成。"
-            )
+        compressed = len(checkpoint.get("chunks_meta") or [])
+        total = int(checkpoint.get("total_chunks") or 0) or summary["total"]
+        st.warning(
+            f"存在未完成的整片分析进度：已压缩 {compressed}/{total} 段，"
+            f"已分析 {summary['completed']}/{total} 段，"
+            f"失败 {summary['failed']} 段，待处理 {summary['pending']} 段。"
+            " 请点击「补全未完成分析」续跑；「分析整片视频」将清除进度从头开始。"
+        )
 
     if os.path.isfile(active_path):
         st.success(f"已有分析结果: {active_path}")
@@ -126,16 +130,21 @@ def render_video_episode_analysis_panel(tr, params) -> None:
     col_analyze, col_resume = st.columns(2)
     with col_analyze:
         if st.button("分析整片视频", key="doc_analyze_video_episode_btn", use_container_width=True):
-            analyze_video_episode_docu(params, resume=True)
+            analyze_video_episode_docu(
+                params,
+                resume=False,
+                output_path=active_path if active_path else default_path,
+            )
     with col_resume:
-        resume_disabled = not checkpoint or VideoEpisodeAnalysisService.count_incomplete_chunks(
-            checkpoint,
-            int(checkpoint.get("total_chunks") or 0) if checkpoint else 0,
-        ) <= 0
+        resume_disabled = not checkpoint_needs_resume(checkpoint)
         if st.button(
             "补全未完成分析",
             key="doc_resume_video_episode_btn",
             use_container_width=True,
             disabled=resume_disabled,
         ):
-            analyze_video_episode_docu(params, resume=True)
+            analyze_video_episode_docu(
+                params,
+                resume=True,
+                output_path=active_path if active_path else default_path,
+            )

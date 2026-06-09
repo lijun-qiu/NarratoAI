@@ -29,7 +29,7 @@ def _normalize_progress_value(progress: float | int) -> int:
     return max(0, min(100, int(round(value))))
 
 
-def analyze_video_episode_docu(params, *, resume: bool = True) -> None:
+def analyze_video_episode_docu(params, *, resume: bool = True, output_path: str = "") -> None:
     """整片视频分析，输出单集剧情 JSON；支持从检查点续跑补全。"""
     progress_bar = st.progress(0)
     percent_text = st.empty()
@@ -77,7 +77,11 @@ def analyze_video_episode_docu(params, *, resume: bool = True) -> None:
             if character_references
             else " · 未上传头像（人名不确定时将标注剧中未明确交代）"
         )
-        update_progress(0, f"开始分析《{drama_title}》· {os.path.basename(video_path)}{ref_hint}")
+        update_progress(
+            0,
+            f"{'续跑补全' if resume else '开始分析'}《{drama_title}》· "
+            f"{os.path.basename(video_path)}{ref_hint}",
+        )
 
         service = VideoEpisodeAnalysisService()
         artifact = asyncio.run(
@@ -88,6 +92,7 @@ def analyze_video_episode_docu(params, *, resume: bool = True) -> None:
                 character_references=character_references,
                 relationship_diagram_path=relationship_diagram_path,
                 progress_callback=update_progress,
+                output_path=(output_path or "").strip() or None,
                 resume=resume,
             )
         )

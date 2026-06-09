@@ -382,14 +382,18 @@ def build_batch_vision_reference_prompt_section(
     drama_label: str = "",
     character_collage: bool = False,
     reference_image_count: int | None = None,
+    collage_sheets: list[list[dict[str, str]]] | None = None,
 ) -> str:
     """构建关系图 + 人物头像参照的 prompt 说明（均排在视频关键帧之前）。"""
+    from app.services.documentary.frame_reference_images import REFERENCE_COLLAGE_MAX_HEADS_PER_SHEET
+
     rel_path = resolve_media_path(relationship_diagram_path)
     refs = [item for item in (character_references or []) if isinstance(item, dict)]
+    sheets = collage_sheets or []
     if reference_image_count is not None:
         prefix_count = reference_image_count
     else:
-        head_images = 1 if character_collage and len(refs) >= 2 else len(refs)
+        head_images = len(sheets) if sheets else (1 if character_collage and len(refs) >= 2 else len(refs))
         prefix_count = (1 if rel_path else 0) + head_images
     if prefix_count <= 0:
         return ""
@@ -410,7 +414,27 @@ def build_batch_vision_reference_prompt_section(
         image_index += 1
 
     if refs:
-        if character_collage and len(refs) >= 2:
+        if character_collage and sheets:
+            total_sheets = len(sheets)
+            global_idx = 1
+            for sheet_index, sheet in enumerate(sheets, start=1):
+                numbered = "、".join(
+                    f"#{global_idx + idx}{str(item.get('name') or '').strip()}"
+                    for idx, item in enumerate(sheet)
+                    if item.get("name")
+                )
+                global_idx += len(sheet)
+                if len(sheet) == 1:
+                    name = str(sheet[0].get("name") or "").strip()
+                    lines.append(f"**图 #{image_index}**：人物定妆照 **{name}**（第 {sheet_index}/{total_sheets} 张参照图）。")
+                else:
+                    lines.append(
+                        f"**图 #{image_index}**：人物定妆照拼图 **第 {sheet_index}/{total_sheets} 张**"
+                        f"（每张拼图最多 {REFERENCE_COLLAGE_MAX_HEADS_PER_SHEET} 人；本张从左到右依次为 {numbered}），"
+                        "须**逐脸放大对照**关键帧后写规范姓名。"
+                    )
+                image_index += 1
+        elif character_collage and len(refs) >= 2:
             numbered = "、".join(
                 f"#{index + 1}{str(item.get('name') or '').strip()}"
                 for index, item in enumerate(refs)
@@ -422,7 +446,7 @@ def build_batch_vision_reference_prompt_section(
             )
             image_index += 1
         else:
-            lines.append("以下定妆照按顺序对应剧中人物，**用于识别关键帧中的面孔**：")
+            lines.append("以下定妆照按顺序对应剧中人物，**须逐脸对照**关键帧中的面孔：")
             for item in refs:
                 name = str(item.get("name") or "").strip()
                 lines.append(f"- **{name}** — 参照图 #{image_index}")
@@ -432,7 +456,8 @@ def build_batch_vision_reference_prompt_section(
     lines.extend(
         [
             f"从第 **{prefix_count + 1}** 张起共 **{video_frame_count}** 张为本批次视频关键帧。",
-            "关键帧中**脸/侧脸清晰**且与定妆照面部相似度约70%以上匹配 → **必须**写规范姓名 `姓名(男/女)`，禁止便衣男/年轻男子/警员等代称；",
+            "关键帧中**脸/侧脸清晰**且与定妆照逐脸对照、面部相似度约80%以上匹配 → **必须**写规范姓名 `姓名(男/女)`，禁止便衣男/年轻男子/警员等代称；",
+            "**每一张关键帧须独立识脸**，禁止把上一帧人物照抄到下一帧；",
             "仅脸不可辨、背对、远景模糊或确实无法匹配时，才用未名人员或带服装特征的暂称；",
             "**禁止**因关系表/定妆照列表而默认全员在场；**禁止**凭字幕称呼猜人。",
         ]

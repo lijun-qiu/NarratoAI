@@ -112,6 +112,43 @@ def resolve_obvious_character_relations(drama_id: str) -> tuple[ObviousCharacter
     return ()
 
 
+def build_plot_blueprint_character_relationship_table_section(
+    theme: str,
+    settings: dict[str, Any] | None = None,
+    *,
+    use_video_episode_analysis: bool = False,
+) -> tuple[str, set[str]]:
+    """构思蓝图：注入文字版人物关系表（完整 Markdown，与视频分析/字幕联合分析）。"""
+    if not _is_subtitle_analysis_enabled(settings):
+        return "", set()
+
+    max_chars = int(
+        (settings or {}).get("subtitle_analysis_drama_knowledge_max_chars", 10000) or 10000
+    )
+    work = (theme or "本剧").strip()
+    visual_ref = (
+        "整片视频分析人物索引"
+        if use_video_episode_analysis
+        else "抽帧字幕人物索引"
+    )
+    material_ref = "整片视频分析" if use_video_episode_analysis else "字幕/抽帧"
+    header = f"""## 人物关系表（文字 · **分析前必读** · 与{material_ref}联合分析）
+
+以下为 **{work}** 官方人物关系表，请**先通读本表**再写「主要人物表」与时间线：
+- 写蓝图时须**同时对照**本表、{material_ref} 与字幕，交叉验证人名/关系/阵营
+- {material_ref}出现的人名须能在本表中找到对应身份与关系
+- **谐音/ASR 错字须归并为同一人**（小月/胡小月/胡晓月→胡小跃，秦峰→秦枫，罗伯→罗博，老叶→叶天佑）
+- **禁止张冠李戴**：勿把 A 的台词、遭遇、关系写成 B（如秦枫≠刘天也，文江燕是刘天也妹妹）
+- **关系须与本表一致**：三兄妹为秦枫、刘天也、文江燕；叶天佑是局长、秦枫/胡小跃/麦洪超的师傅"""
+    return _build_drama_knowledge_block(
+        theme=theme,
+        settings=settings,
+        max_chars=max_chars,
+        header=header,
+        log_label="人物关系表",
+    )
+
+
 def build_frame_obvious_relationship_hint(drama_id: str = "") -> str:
     """抽帧 prompt：已写入姓名的两人之间可补明显关系。"""
     relations = resolve_obvious_character_relations(drama_id)
@@ -230,6 +267,8 @@ def _build_drama_knowledge_block(
 def build_short_drama_drama_knowledge_section(
     theme: str,
     settings: dict[str, Any] | None = None,
+    *,
+    use_video_episode_analysis: bool = False,
 ) -> tuple[str, set[str]]:
     """
     返回 (注入 prompt 的 Markdown 块, 知识库人物名集合)。
@@ -242,11 +281,17 @@ def build_short_drama_drama_knowledge_section(
         (settings or {}).get("subtitle_analysis_drama_knowledge_max_chars", 10000) or 10000
     )
     work = (theme or "本剧").strip()
-    header = f"""## 剧集人物关系对照（**分析前必读** · 熟悉后再对照字幕/抽帧）
+    visual_ref = (
+        "整片视频分析人物索引"
+        if use_video_episode_analysis
+        else "抽帧字幕人物索引"
+    )
+    material_ref = "整片视频分析" if use_video_episode_analysis else "字幕/抽帧"
+    header = f"""## 剧集人物关系对照（**分析前必读** · 熟悉后再对照{material_ref}）
 
 以下为 **{work}** 官方人物关系与身份，请**先通读本节**再写「主要人物表」与时间线：
-- 字幕/抽帧出现的人名须在本对照或下方「抽帧字幕人物索引」中可对应
-- **谐音/ASR 错字须归并为同一人**（小月/胡小月→胡小跃，秦峰→秦枫，罗伯→罗博，老叶→叶天佑）；人物表每人只列规范名一条
+- {material_ref}出现的人名须在本对照或下方「{visual_ref}」中可对应
+- **谐音/ASR 错字须归并为同一人**（小月/胡小月/胡晓月→胡小跃，秦峰→秦枫，罗伯→罗博，老叶→叶天佑）；人物表每人只列规范名一条
 - **禁止张冠李戴**：勿把 A 的台词、遭遇、关系写成 B（如秦枫≠刘天也，文江燕是刘天也妹妹）
 - **关系须准确**：三兄妹为秦枫、刘天也、文江燕（文琴养子女）；叶天佑是局长、秦枫/胡小跃/麦洪超的师傅
 - 硬字幕简称（如老叶）须与对照表核对后再写入人物表"""
@@ -302,17 +347,24 @@ def find_name_mistakes_in_text(text: str) -> list[str]:
 def build_plot_blueprint_name_unification_section(
     theme: str = "",
     settings: dict[str, Any] | None = None,
+    *,
+    use_video_episode_analysis: bool = False,
 ) -> str:
-    """构思蓝图：抽帧/字幕谐音、ASR 错字、简称归并为同一人物。"""
+    """构思蓝图：整片视频分析/抽帧与字幕谐音、ASR 错字、简称归并为同一人物。"""
     path = _resolve_knowledge_path(theme, settings)
     if not path and not any(
         keyword in (theme or "").lower() for keyword, _ in _DEFAULT_KNOWLEDGE_BY_THEME
     ):
+        source_hint = (
+            "整片视频分析 important_dialogues / involved_characters"
+            if use_video_episode_analysis
+            else "抽帧 subtitle_entries、硬字幕、observation"
+        )
         lines = [
             "## 人名谐音/简称归并（硬性）",
-            "- 抽帧 subtitle_entries、硬字幕、observation 中的**谐音/ASR 错字/简称**，"
+            f"- {source_hint} 中的**谐音/ASR 错字/简称**，"
             "若明显指同一人，须**归并为同一角色**，人物表只列一条",
-            "- 人物表、时间线、OST 清单用**规范全名**；引用原声台词时可保留抽帧原文",
+            "- 人物表、时间线、OST 清单用**规范全名**；引用原声台词时可保留 SRT 原文",
             "- **禁止**因写法不同拆成两个角色（如「小月」与「胡小跃」不得各占一行）",
         ]
         return "\n".join(lines)
@@ -321,17 +373,24 @@ def build_plot_blueprint_name_unification_section(
         f"- **{canonical}** ← {(' / '.join(aliases))}"
         for canonical, aliases in PLOT_BLUEPRINT_NAME_ALIAS_GROUPS
     ]
+    index_label = (
+        "整片视频分析人物索引"
+        if use_video_episode_analysis
+        else "抽帧字幕人物索引"
+    )
+    visual_source = "整片视频分析" if use_video_episode_analysis else "抽帧"
     return "\n".join(
         [
             "## 人名谐音/ASR 归并（硬性 · 同一人）",
-            "分析抽帧与字幕索引时，下列写法**一律视为同一人**；"
+            f"分析{visual_source}与字幕索引时，下列写法**一律视为同一人**；"
             "**主要人物表只写规范名一条**，括号内可注「又名/字幕常写：…」：",
             *alias_lines,
             "- **叶天佑（老叶）≠ 伟业**：不同人物，禁止合并",
             "- **秦枫 ≠ 刘天也 ≠ 文江燕**：禁止因关系相近而合并",
-            "- 时间线、OST 清单、叙事顺序中的**说话人/当事人**用规范名；"
-            "「建议保留原声」条目内**台词原文**可保留抽帧 subtitle_entries 原字（如「小月」）",
-            "- 抽帧 observation 与 subtitle 人名冲突时：以**关系对照表 + 上下文**归并到同一人，勿新增虚构角色",
+            "- 时间线、OST 清单、叙事顺序中的**说话人/当事人**须用**规范名**（以「"
+            + index_label
+            + "」为准）；「建议保留原声」条目内**台词原文**可保留 SRT 原字（如「小月」）",
+            f"- {visual_source} 与 SRT 人名冲突时：以**{index_label} + 关系对照表**归并到同一人，勿新增虚构角色",
         ]
     )
 

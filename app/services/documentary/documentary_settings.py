@@ -78,6 +78,7 @@ DOCUMENTARY_DEFAULTS: Dict[str, Any] = {
     "frame_reference_max_edge": 384,
     "frame_reference_use_collage": True,
     "frame_reference_individual_max_heads": 6,
+    "frame_reference_collage_max_heads": 6,
     # 抽帧视觉分析：默认不注入剧集人物关系知识库（避免脑补全剧名场面）
     "enable_frame_analysis_drama_knowledge": False,
     # 抽帧 scene_segments 硬性规则：仅可见画面、同批同景合并、跨场景重叠剔除
@@ -112,7 +113,7 @@ FAZU2_WRONG_CHARACTER_NAMES: tuple[tuple[str, str], ...] = (
 FRAME_UNKNOWN_CHARACTER_MALE = "未名人员(男)"
 FRAME_UNKNOWN_CHARACTER_FEMALE = "未名人员(女)"
 FRAME_UNKNOWN_CHARACTER_UNKNOWN = "未名人员(不明)"
-FRAME_FACE_MATCH_SIMILARITY_HINT = "面部相似度约70%以上即可认定匹配（不必完全一致）"
+FRAME_FACE_MATCH_SIMILARITY_HINT = "须逐脸对照定妆照，五官轮廓高度一致（约80%以上），禁止模糊猜测"
 
 # 剧情人物参考（写每段前须与当段抽帧/字幕核对，勿凭印象套性别）
 FAZU2_CHARACTER_ROLES: tuple[tuple[str, str, str], ...] = (

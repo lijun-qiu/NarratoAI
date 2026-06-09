@@ -24,6 +24,7 @@ from app.services.documentary.documentary_subtitle_enrichment import (
 )
 from app.services.documentary.frame_analysis_compact import _collect_top_level_segments
 from app.services.documentary.frame_analysis_pairing import load_analysis_artifact
+from app.services.short_drama_timestamp_alignment import detect_picture_line_incoherence
 from app.services.srt_utils import (
     dialogue_match_key,
     find_subtitle_span_for_line,
@@ -63,7 +64,7 @@ _OPENING_SECTION_RE = re.compile(
     re.IGNORECASE | re.DOTALL,
 )
 _EPISODE_SUMMARY_RE = re.compile(
-    r"##\s*本集主线摘要.*?(?=\n##\s|\Z)",
+    r"##\s*(?:本集主线摘要|剧情主线摘要).*?(?=\n##\s|\Z)",
     re.IGNORECASE | re.DOTALL,
 )
 _OST1_SECTION_RE = re.compile(
@@ -126,6 +127,10 @@ def _opening_span_limits(settings: Optional[dict[str, Any]] = None) -> tuple[int
     min_ms = int(float(cfg.get("ost1_duration_min", 8) or 8) * 1000)
     hard_max = cfg.get("ost1_duration_hard_max", cfg.get("ost1_duration_max", 18))
     max_ms = int(float(hard_max or 18) * 1000)
+    min_ms = max(1000, min_ms)
+    max_ms = max(max_ms, min_ms + 200)
+    if max_ms <= 6000:
+        return min_ms, max_ms
     min_ms = max(min_ms, 8_000)
     max_ms = max(max_ms, min_ms + 1_000, 10_000)
     return min_ms, min_ms if max_ms < min_ms else max_ms
@@ -317,7 +322,7 @@ def parse_episode_blueprint(markdown: str) -> dict[str, Any]:
             if item_range not in timestamp_ranges:
                 timestamp_ranges.append(item_range)
 
-    return {
+    result = {
         "quotes": quotes,
         "timestamp_ranges": timestamp_ranges,
         "section": opening_section,
@@ -327,6 +332,9 @@ def parse_episode_blueprint(markdown: str) -> dict[str, Any]:
         "ost1_opening_items": ost1_opening_items,
         "plot_expects_late_climax": _plot_expects_late_climax(episode_summary, opening_section, reason),
     }
+    from app.services.short_drama_blueprint_script import enrich_blueprint_parse_from_scenes
+
+    return enrich_blueprint_parse_from_scenes(text, result)
 
 
 def _plot_expects_late_climax(*text_parts: str) -> bool:
@@ -1116,19 +1124,19 @@ def _first_item_needs_opening_fix(
             if current_picture != resolved.picture and not _picture_has_jump_cues(current_picture):
                 return True
 
+    if detect_picture_line_incoherence(
+        str(first.get("picture") or ""),
+        str(first.get("original_line") or ""),
+    ):
+        return True
+
     if resolved.original_line:
         current_key = dialogue_match_key(
             str(first.get("original_line") or first.get("narration") or "")
         )
         target_key = dialogue_match_key(resolved.original_line)
         if current_key and target_key and current_key != target_key:
-            try:
-                current_start, _ = parse_timestamp_range(str(first.get("timestamp") or ""))
-                target_start, _ = parse_timestamp_range(resolved.timestamp)
-            except Exception:
-                return True
-            if abs(current_start - target_start) > 5000:
-                return True
+            return True
 
     try:
         current_start, _ = parse_timestamp_range(str(first.get("timestamp") or ""))
@@ -1329,7 +1337,23 @@ def apply_opening_climax_chronological_replay(
     except Exception:
         return ordered
 
+    opening_head_count = int(
+        (settings or {}).get("opening_head_segment_count", 3) or 3
+    )
+    if opening_start_ms < 5 * 60 * 1000:
+        logger.info(
+            "开篇爆燃 timestamp 过早（可能未对位），跳过正叙复现插入"
+        )
+        return ordered
+
     insert_idx = _find_chronological_replay_insert_index(ordered, opening_start_ms)
+    if insert_idx < opening_head_count:
+        logger.info(
+            f"正叙复现插入点仍在开头区（第 {insert_idx + 1} 段前），"
+            "跳过以避免连放两段开篇原声"
+        )
+        return ordered
+
     replay = _build_opening_climax_replay_item(opening)
     updated = ordered[:insert_idx] + [replay] + ordered[insert_idx:]
     updated = _renumber_script_item_ids(updated)

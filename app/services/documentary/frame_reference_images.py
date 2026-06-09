@@ -20,6 +20,7 @@ from app.utils import utils
 
 ATTACH_MODE_EVERY_BATCH = "every_batch"
 ATTACH_MODE_FIRST_BATCH = "first_batch"
+REFERENCE_COLLAGE_MAX_HEADS_PER_SHEET = 6
 
 
 def resolve_reference_collage_mode(
@@ -39,7 +40,7 @@ def resolve_reference_collage_mode(
     if cfg.get("frame_reference_force_individual_heads"):
         return False
 
-    max_individual = max(1, int(cfg.get("frame_reference_individual_max_heads", 6) or 6))
+    max_individual = max(1, int(cfg.get("frame_reference_individual_max_heads", REFERENCE_COLLAGE_MAX_HEADS_PER_SHEET) or REFERENCE_COLLAGE_MAX_HEADS_PER_SHEET))
     prefer_collage = bool(cfg.get("frame_reference_use_collage", True))
     token_saver = bool(cfg.get("frame_reference_token_saver", True))
 
@@ -74,10 +75,41 @@ def should_attach_reference_images(
         return True
     # 拼图仅多 1 张图；少量分张也负担可控 → 每批附上以保证逐脸对照
     if head_count > 0:
-        max_individual = max(1, int(cfg.get("frame_reference_individual_max_heads", 6) or 6))
+        max_individual = max(1, int(cfg.get("frame_reference_individual_max_heads", REFERENCE_COLLAGE_MAX_HEADS_PER_SHEET) or REFERENCE_COLLAGE_MAX_HEADS_PER_SHEET))
         if use_collage or head_count <= max_individual:
             return True
     return batch_index == 0
+
+
+def collage_max_heads_per_sheet(settings: dict[str, Any] | None) -> int:
+    cfg = settings or {}
+    return max(
+        1,
+        int(
+            cfg.get(
+                "frame_reference_collage_max_heads",
+                cfg.get("frame_reference_individual_max_heads", REFERENCE_COLLAGE_MAX_HEADS_PER_SHEET),
+            )
+            or REFERENCE_COLLAGE_MAX_HEADS_PER_SHEET
+        ),
+    )
+
+
+def split_character_references_into_collage_sheets(
+    character_references: list[dict[str, str]] | None,
+    *,
+    max_per_sheet: int = REFERENCE_COLLAGE_MAX_HEADS_PER_SHEET,
+) -> list[list[dict[str, str]]]:
+    """将头像参照拆成多组，每组最多 max_per_sheet 张（避免整板拼图过小难辨认）。"""
+    valid = [
+        {"name": str(item.get("name") or "").strip(), "path": str(item.get("path") or "").strip()}
+        for item in (character_references or [])
+        if isinstance(item, dict) and item.get("name") and item.get("path") and os.path.isfile(str(item.get("path")))
+    ]
+    if not valid:
+        return []
+    cap = max(1, int(max_per_sheet))
+    return [valid[index : index + cap] for index in range(0, len(valid), cap)]
 
 
 def build_reference_carryover_prompt(
@@ -92,13 +124,13 @@ def build_reference_carryover_prompt(
     work = (drama_label or "本剧").strip()
     lines = [
         "## 视觉参照沿用（本批不再重复发送参照图）",
-        f"首批已提供 **{work}** 人物定妆照；本批写规范姓名仍须**对照该批关键帧可见面孔**与首批参照达到约70%面部相似度。",
+        f"首批已提供 **{work}** 人物定妆照；本批写规范姓名仍须**对照该批关键帧可见面孔**与参照达到较高面部相似度（约80%以上）。",
     ]
     if relationship_diagram_attached:
         lines.append("- 关系图仅作谐音/关系**校正**，不可凭关系图猜人")
     if names:
         lines.append(
-            f"- 定妆照人物（{ '、'.join(names) }）须面孔相似度约70%以上匹配后才可写规范名；"
+            f"- 定妆照人物（{ '、'.join(names) }）须逐脸对照、相似度约80%以上匹配后才可写规范名；"
             f"硬字幕/SRT 称呼（二师兄、老叶等）**不得**猜人"
         )
     lines.append(f"- 无依据时用「{FRAME_UNKNOWN_CHARACTER_MALE}」「{FRAME_UNKNOWN_CHARACTER_FEMALE}」")
@@ -237,7 +269,7 @@ def prepare_reference_prefix_images(
     cache_key = utils.md5(
         "|".join(
             [
-                "frame-ref-v2",
+                "frame-ref-v3",
                 str(max_edge),
                 str(use_collage),
                 str(len(head_paths)),
@@ -261,27 +293,42 @@ def prepare_reference_prefix_images(
                 prefix_paths.append(_save_jpeg(_load_resized_rgb(rel_path, max_edge * 2), rel_only))
 
     if refs:
-        if head_paths:
-            head_max_edge = max_edge
-            if not use_collage:
-                head_max_edge = max(head_max_edge, 512)
-            elif len(head_paths) > 6:
-                head_max_edge = min(640, max_edge + (len(head_paths) - 6) * 28)
-            if use_collage and len(head_paths) >= 2:
-                collage_path = _prepare_collage_path(
-                    label="heads",
-                    source_paths=head_paths,
-                    max_edge=head_max_edge,
-                    cache_key=cache_key,
+        max_per_sheet = collage_max_heads_per_sheet(cfg)
+        head_sheets = split_character_references_into_collage_sheets(refs, max_per_sheet=max_per_sheet)
+        head_max_edge = max(max_edge, 512) if use_collage else max(max_edge, 512)
+
+        if use_collage and head_sheets:
+            for sheet_index, sheet_refs in enumerate(head_sheets):
+                sheet_paths = [item["path"] for item in sheet_refs]
+                sheet_names = "_".join(
+                    utils.md5(item["name"])[:6] for item in sheet_refs[:max_per_sheet]
                 )
-                if collage_path:
-                    prefix_paths.append(collage_path)
-            else:
-                for index, path in enumerate(head_paths):
-                    single_cache = os.path.join(_reference_cache_dir(), f"{cache_key}_head_{index}.jpg")
+                if len(sheet_paths) == 1:
+                    single_cache = os.path.join(
+                        _reference_cache_dir(),
+                        f"{cache_key}_head_s{sheet_index}_{sheet_names}.jpg",
+                    )
                     if os.path.isfile(single_cache):
                         prefix_paths.append(single_cache)
                     else:
-                        prefix_paths.append(_save_jpeg(_load_resized_rgb(path, head_max_edge), single_cache))
+                        prefix_paths.append(
+                            _save_jpeg(_load_resized_rgb(sheet_paths[0], head_max_edge), single_cache)
+                        )
+                else:
+                    collage_path = _prepare_collage_path(
+                        label=f"heads_sheet_{sheet_index}_{sheet_names}",
+                        source_paths=sheet_paths,
+                        max_edge=head_max_edge,
+                        cache_key=f"{cache_key}_s{sheet_index}",
+                    )
+                    if collage_path:
+                        prefix_paths.append(collage_path)
+        elif head_paths:
+            for index, path in enumerate(head_paths):
+                single_cache = os.path.join(_reference_cache_dir(), f"{cache_key}_head_{index}.jpg")
+                if os.path.isfile(single_cache):
+                    prefix_paths.append(single_cache)
+                else:
+                    prefix_paths.append(_save_jpeg(_load_resized_rgb(path, head_max_edge), single_cache))
 
     return prefix_paths, ""

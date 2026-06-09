@@ -38,19 +38,23 @@ from app.services.documentary.documentary_plot_blueprint_validator import (
     validate_plot_blueprint,
 )
 from app.services.short_drama_drama_knowledge import (
+    build_plot_blueprint_character_relationship_table_section,
     build_plot_blueprint_name_unification_section,
     build_short_drama_drama_knowledge_section,
+    correct_name_mistakes_in_text,
     find_name_mistakes_in_text,
 )
 from app.services.short_drama_settings import get_short_drama_settings
 from app.services.documentary.video_episode_analysis import (
     build_video_episode_analysis_markdown,
+    build_video_episode_character_lexicon_markdown,
     build_video_episode_time_bounds_section,
     collect_video_episode_time_bounds,
     load_video_episode_analysis_artifact,
     summarize_video_episode_markdown,
     video_episode_summary_usable,
 )
+from app.services.documentary.video_episode_constants import SEGMENT_INTERVAL_SECONDS
 from app.services.srt_utils import SrtEntry, entries_to_srt, parse_srt, _time_str_to_ms
 from app.utils import utils
 
@@ -1366,6 +1370,62 @@ def _frame_summary_usable(frame_summary: str) -> bool:
     return bool(text) and text not in {"（无抽帧描述）", "（无）"}
 
 
+_PERSON_HOME_IN_SCENE_RE = re.compile(r"([一-龥]{2,8})家中")
+_HOME_GENERIC_SKIP_NAMES = frozenset(
+    {"国家", "作家", "专家", "大家", "居家", "自家", "国家", "商家", "厂家"}
+)
+
+
+def build_plot_blueprint_location_naming_rules() -> str:
+    """场景分段蓝图：地点命名约束（禁止无依据的「某某家中」）。"""
+    return """## 场景地点命名（硬性）
+- **禁止臆测归属**：SRT / 整片视频分析 **未明确写出**「某某家/某某住处」时，**不得**写「罗博家中」「秦枫家中」「胡小跃家中」等
+- **室内归属不明**：场景标题用 **「室内·家中」** 或 **「室内·私宅（归属未明）」**；正文写「胡小跃与罗博在一处室内用餐…」，不要替素材认定是谁家
+- **允许写明的场所**：字幕或 `environment_description` **原文出现**的可写（如「秦枫家」「罗马酒店」「警局审讯室」「龙湾祠堂」）
+- **公共/职能场所**：警局、审讯室、会议室、天台、祠堂、广场、街道等 — 须有画面/字幕依据，勿张冠李戴
+- **错误示例**：仅见两人室内吃饭 → ❌「罗博家中」；✅「室内·家中」+ 叙述「罗博招待胡小跃…」
+"""
+
+
+def collect_verified_home_location_tokens(
+    *,
+    srt_text: str = "",
+    visual_summary: str = "",
+) -> set[str]:
+    """从素材原文收集可写「某某家/家中」的已验证表述。"""
+    blob = f"{srt_text or ''}\n{visual_summary or ''}"
+    tokens: set[str] = set()
+    for match in re.finditer(r"([一-龥]{2,6})家(?:中|里|的)?", blob):
+        name = match.group(1)
+        if name in _HOME_GENERIC_SKIP_NAMES:
+            continue
+        tokens.add(f"{name}家")
+        tokens.add(f"{name}家中")
+    return tokens
+
+
+def sanitize_blueprint_home_locations(
+    text: str,
+    *,
+    verified_tokens: set[str] | None = None,
+) -> str:
+    """将无素材依据的「某某家中」改为中性「室内·家中」。"""
+    if not (text or "").strip():
+        return text
+    allowed = verified_tokens or set()
+
+    def _replace(match: re.Match[str]) -> str:
+        name = match.group(1)
+        if name in _HOME_GENERIC_SKIP_NAMES:
+            return match.group(0)
+        token = f"{name}家中"
+        if token in allowed or f"{name}家" in allowed:
+            return token
+        return "室内·家中"
+
+    return _PERSON_HOME_IN_SCENE_RE.sub(_replace, text)
+
+
 def build_plot_blueprint_material_principles(
     *,
     has_srt_subtitle: bool = False,
@@ -1377,7 +1437,7 @@ def build_plot_blueprint_material_principles(
     """构思蓝图：整片视频分析或抽帧为主（画面/剧情），SRT 为辅（对白/时间戳）。"""
     if use_video_episode_analysis:
         visual_line = (
-            "- **整片视频分析（主·画面/剧情/10秒格）**：下方 `<video_episode_analysis>` 的 "
+            f"- **整片视频分析（主·画面/剧情/{SEGMENT_INTERVAL_SECONDS}秒格）**：下方 `<video_episode_analysis>` 的 "
             "`episodic_segments`（time_range / key_events / narration / environment_description）"
             "为剧情主线与画面环境第一依据"
         )
@@ -1389,7 +1449,7 @@ def build_plot_blueprint_material_principles(
     if has_srt_subtitle:
         srt_line = (
             "- **SRT 字幕（对白/时间戳主）**：下方 `<subtitles>` 为原始 SRT；"
-            "剧情主线、台词原文、OST=1 时间戳**以 SRT 为准**"
+            "剧情主线、场景关键对白、时间戳**以 SRT 为准**"
         )
     else:
         srt_line = ""
@@ -1406,10 +1466,18 @@ def build_plot_blueprint_material_principles(
                 "subtitle_entries.text / burned_in_subtitle"
             )
     elif has_srt_subtitle:
-        frame_sub_line = ""
+        frame_sub_line = (
+            "- **视频分析对白索引（辅）**：「整片视频分析人物索引」中的 speaker / "
+            "important_dialogues 用于声画对位；与 SRT 冲突时**台词/时间戳以 SRT 为准**"
+            if use_video_episode_analysis
+            else ""
+        )
     else:
         frame_sub_line = (
-            "- **对白字幕（暂无）**：未提供 SRT，且抽帧 JSON 中未提取到 subtitle_entries / 硬字幕；"
+            "- **对白字幕（暂无）**：未提供 SRT；时间戳与对白须从整片视频分析 "
+            "important_dialogues 推断，禁止编造"
+            if use_video_episode_analysis
+            else "- **对白字幕（暂无）**：未提供 SRT，且抽帧 JSON 中未提取到 subtitle_entries / 硬字幕；"
             "时间戳与对白须从抽帧 scene_segments 时间段与 observation 推断，禁止编造"
         )
 
@@ -1419,25 +1487,30 @@ def build_plot_blueprint_material_principles(
     name_unification = build_plot_blueprint_name_unification_section(
         theme=theme,
         settings=settings,
+        use_video_episode_analysis=use_video_episode_analysis,
     )
-    cfg = settings or get_documentary_compact_settings()
-    lead_sec = int(cfg.get("ost0_lead_before_ost1_sec", 10) or 10)
     evidence_line = (
-        "情节点须能在整片视频分析与字幕中找到依据；禁止编造未支持的场景、台词或时间戳"
+        "每个场景描述须能在整片视频分析与字幕中找到依据；禁止编造未支持的情节"
         if use_video_episode_analysis
-        else "情节点须能在抽帧与字幕中找到依据；禁止编造未支持的场景、台词或时间戳"
+        else "每个场景描述须能在抽帧与字幕中找到依据；禁止编造未支持的情节"
     )
-    return f"""## 素材优先级（构思蓝图 · 硬性）
+    return f"""## 蓝图目标（硬性）
+- **主任务**：结合**人物关系表 + SRT 字幕 + {("整片视频分析" if use_video_episode_analysis else "抽帧摘要")}**，对**整段视频**做**场景分段**，并**详细描述每个场景发生的事**
+- **不是**写 OST 清单或成片剪辑顺序；后者在后续「生成脚本 JSON」步骤再做
+
+## 素材优先级
 {visual_line}
-- **剧集人物关系对照（辅）**：理解剧情、校正人名/关系/阵营；**不得覆盖或否定画面中已出现的信息**
+- **人物关系表（文字 · 必读）**：校正人名、身份、亲属/阵营/对立关系
 {subtitle_lines}
 - {evidence_line}
 
-## OST=0 取画时间（声画对位 · 硬性）
-- **`_id` 播放顺序 ≠ 原片时间顺序**；但 OST=0 的 `timestamp` 必须对准**本段解说所描述/引出的画面**
-- **铺垫引出下一段 OST=1**：OST=0 的 `timestamp` **起点** = 下一段 OST=1 开始时间 **− 约 {lead_sec} 秒**（从抽帧取该时段画面）；禁止全片 OST=0 堆在片头同一区间
-- **原声播完后的 OST=0 点评**：`timestamp` 取**上一段 OST=1** 同场景区间
-- 规划「成片叙事顺序」时每条 OST=0 须写清：**对应原片 HH:MM:SS,mmm 起点（相对下一段/上一段 OST=1）**
+{build_plot_blueprint_location_naming_rules()}
+
+## 整片视频分析 {SEGMENT_INTERVAL_SECONDS} 秒格
+- **段内每格独立**：同一段约 300s 上传视频内，各 time_range 按该 5 秒窗口实际画面填写，**不要**整段机械「承接上格」
+- **上传分段边界**：约 5 分钟/300 秒切多段上传时，**仅各段连接处**须衔接；同场景误换人会自动校正，见 `continuity_note` / `coverage_warnings`
+- 蓝图场景分段应**跨多格合并**为一场戏（约 30 秒–3 分钟），勿按每 {SEGMENT_INTERVAL_SECONDS} 秒机械切场景
+- 读视频分析时若见边界 `continuity_note` 或 `coverage_warnings`，**以字幕与连续画面为准**
 
 {name_unification}
 """
@@ -1484,8 +1557,12 @@ def _append_plot_blueprint_material_sections(
         else:
             subtitle_block = (
                 "<subtitles>\n"
-                "<!-- 暂无 SRT 与抽帧内字幕；对白见抽帧摘要与字幕人物索引 -->\n"
-                "</subtitles>"
+                + (
+                    "<!-- 暂无 SRT；对白见整片视频分析人物索引与 important_dialogues -->\n"
+                    if use_video_episode_analysis
+                    else "<!-- 暂无 SRT 与抽帧内字幕；对白见抽帧摘要与字幕人物索引 -->\n"
+                )
+                + "</subtitles>"
             )
         visual_block = ""
         if use_video_episode_analysis:
@@ -1642,8 +1719,8 @@ def analyze_subtitle_with_frames(
             else "请**深读下方整片视频分析（第一依据）**"
         )
         blueprint_analysis_rules = (
-            """- **先通读 SRT 字幕**：梳理剧情主线、对白与关键台词
-- **再对照整片视频分析**：10秒格 time_range、key_events、narration、environment_description 须逐项利用
+            f"""- **先通读 SRT 字幕**：梳理剧情主线、对白与关键台词
+- **再对照整片视频分析**：{SEGMENT_INTERVAL_SECONDS}秒格 time_range、key_events、narration、environment_description 须逐项利用
 - **交叉验证**：台词/时间戳以 SRT 为准，画面/环境/旁白以整片视频分析为准"""
             if has_srt_subtitle
             else """- **先通读整片视频分析**：按 episodic_segments 时间线梳理场景、人物、动作与环境"""
@@ -1695,8 +1772,8 @@ def analyze_subtitle_with_frames(
     if for_plot_blueprint and is_fazu2_compact_settings(cfg):
         min_chars = max(min_chars, 1800)
     max_tokens = max(1024, int(cfg.get("subtitle_analysis_max_tokens", 4096) or 4096))
-    frame_lexicon_block = ""
-    frame_lexicon_data: dict = {}
+    character_lexicon_block = ""
+    character_lexicon_data: dict = {}
     drama_knowledge_block = ""
     drama_known_names: set[str] = set()
     sd_settings = get_short_drama_settings()
@@ -1711,15 +1788,32 @@ def analyze_subtitle_with_frames(
                 max_tokens,
                 int(cfg.get("subtitle_analysis_short_drama_max_tokens", 8192) or 8192),
             )
-        drama_knowledge_block, drama_known_names = build_short_drama_drama_knowledge_section(
-            theme,
-            cfg,
-        )
+        if for_plot_blueprint:
+            drama_knowledge_block, drama_known_names = (
+                build_plot_blueprint_character_relationship_table_section(
+                    theme,
+                    cfg,
+                    use_video_episode_analysis=use_video_episode_analysis,
+                )
+            )
+        else:
+            drama_knowledge_block, drama_known_names = build_short_drama_drama_knowledge_section(
+                theme,
+                cfg,
+                use_video_episode_analysis=use_video_episode_analysis,
+            )
 
     json_path = (frame_json_path or "").strip()
-    if json_path and (is_short_drama or is_fazu2_compact_settings(cfg)):
-        lexicon_max = int(cfg.get("subtitle_analysis_frame_lexicon_chars", 4000) or 4000)
-        frame_lexicon_block, frame_lexicon_data = build_frame_subtitle_lexicon_markdown(
+    lexicon_max = int(cfg.get("subtitle_analysis_frame_lexicon_chars", 4000) or 4000)
+    if use_video_episode_analysis and video_episode_artifact:
+        character_lexicon_block, character_lexicon_data = (
+            build_video_episode_character_lexicon_markdown(
+                video_episode_artifact,
+                max_chars=lexicon_max,
+            )
+        )
+    elif json_path and (is_short_drama or is_fazu2_compact_settings(cfg)):
+        character_lexicon_block, character_lexicon_data = build_frame_subtitle_lexicon_markdown(
             json_path,
             max_chars=lexicon_max,
         )
@@ -1751,18 +1845,51 @@ def analyze_subtitle_with_frames(
             srt_max_ms=int(srt_time_bounds.get("max_ms") or 0) or None,
             srt_min_ms=int(srt_time_bounds.get("min_ms") or 0),
         )
-    analysis_label = "字幕×抽帧×剧情构思" if for_plot_blueprint else "字幕×抽帧对照分析"
+    analysis_label = (
+        (
+            "字幕×整片视频分析×场景分段"
+            if use_video_episode_analysis
+            else "字幕×抽帧×场景分段"
+        )
+        if for_plot_blueprint
+        else (
+            (
+                "字幕×整片视频分析×剧情构思"
+                if use_video_episode_analysis
+                else "字幕×抽帧×剧情构思"
+            )
+            if is_short_drama
+            else (
+                "字幕×整片视频分析对照分析"
+                if use_video_episode_analysis
+                else "字幕×抽帧对照分析"
+            )
+        )
+    )
+    lexicon_log_label = (
+        "视频分析人物索引"
+        if use_video_episode_analysis
+        else "抽帧字幕索引"
+    )
     if for_plot_blueprint:
         srt_info = (
             f"SRT 字幕有（{len(subtitle_excerpt)} 字）"
             if has_srt_subtitle
             else "SRT 字幕无"
         )
-        frame_info = (
-            f"抽帧内字幕有（{len(frame_subtitle_excerpt)} 字）"
-            if has_frame_subtitle
-            else "抽帧内字幕无"
-        )
+        if use_video_episode_analysis:
+            name_count = len(character_lexicon_data.get("names") or [])
+            extra_info = (
+                f"视频分析人物 {name_count} 个"
+                if name_count
+                else "视频分析人物索引无"
+            )
+        else:
+            extra_info = (
+                f"抽帧内字幕有（{len(frame_subtitle_excerpt)} 字）"
+                if has_frame_subtitle
+                else "抽帧内字幕无"
+            )
         visual_input = (
             f"整片视频分析摘要 {len(video_episode_summary)} 字"
             if use_video_episode_analysis
@@ -1770,9 +1897,17 @@ def analyze_subtitle_with_frames(
         )
         logger.info(
             f"{analysis_label}输入：{visual_input}，"
-            f"{srt_info}，{frame_info}，要求输出 ≥{min_chars} 字"
-            + (f"，抽帧字幕索引 {len(frame_lexicon_block)} 字" if frame_lexicon_block else "")
-            + (f"，剧集知识库 {len(drama_knowledge_block)} 字" if drama_knowledge_block else "")
+            f"{srt_info}，{extra_info}，要求输出 ≥{min_chars} 字"
+            + (
+                f"，{lexicon_log_label} {len(character_lexicon_block)} 字"
+                if character_lexicon_block
+                else ""
+            )
+            + (
+                f"，人物关系表 {len(drama_knowledge_block)} 字"
+                if drama_knowledge_block and for_plot_blueprint
+                else (f"，剧集知识库 {len(drama_knowledge_block)} 字" if drama_knowledge_block else "")
+            )
         )
         if not has_subtitle:
             fallback_note = (
@@ -1781,35 +1916,61 @@ def analyze_subtitle_with_frames(
                 else "对白与时间戳只能从抽帧 observation 推断"
             )
             logger.warning(
-                "构思蓝图：未提供 SRT 且抽帧 JSON 无 subtitle_entries / 硬字幕，"
-                + fallback_note
+                "构思蓝图：未提供 SRT"
+                + (
+                    "，须从整片视频分析 important_dialogues 推断对白与时间戳"
+                    if use_video_episode_analysis
+                    else " 且抽帧 JSON 无 subtitle_entries / 硬字幕，"
+                    + fallback_note
+                )
             )
     else:
+        visual_log = (
+            f"整片视频分析摘要 {len(video_episode_summary)} 字"
+            if use_video_episode_analysis
+            else f"抽帧摘要 {len(frame_summary)} 字（采样 {frame_sampling}）"
+        )
         logger.info(
-            f"{analysis_label}输入：抽帧摘要 {len(frame_summary)} 字（采样 {frame_sampling}），"
+            f"{analysis_label}输入：{visual_log}，"
             f"字幕 {'有' if has_subtitle else '无'}"
             + (f"（{source_note}，{len(subtitle_excerpt)} 字）" if has_subtitle else "")
             + f"，要求输出 ≥{min_chars} 字"
-            + (f"，抽帧字幕索引 {len(frame_lexicon_block)} 字" if frame_lexicon_block else "")
+            + (
+                f"，{lexicon_log_label} {len(character_lexicon_block)} 字"
+                if character_lexicon_block
+                else ""
+            )
             + (f"，剧集知识库 {len(drama_knowledge_block)} 字" if drama_knowledge_block else "")
         )
         if has_subtitle and len(subtitle_excerpt) < 100:
+            source_hint = (
+                "请确认 SRT 已选用或整片视频分析 JSON 有效"
+                if use_video_episode_analysis
+                else "请确认 SRT 已选用或抽帧 JSON 含 subtitle_entries"
+            )
             logger.warning(
                 f"字幕内容过短（{len(subtitle_excerpt)} 字，来源 {source_note}），"
-                "请确认 SRT 已选用或抽帧 JSON 含 subtitle_entries"
+                + source_hint
             )
 
     if progress_callback:
         if for_plot_blueprint:
+            rel_hint = "人物关系表、" if drama_knowledge_block.strip() else ""
             if use_video_episode_analysis:
                 if has_srt_subtitle:
-                    progress_callback("正在分析字幕并对照整片视频分析构思剧情方案...")
+                    progress_callback(
+                        f"正在联合分析{rel_hint}字幕与整片视频分析做场景分段..."
+                    )
                 else:
-                    progress_callback("正在以整片视频分析为主构思剧情方案...")
+                    progress_callback(
+                        f"正在联合分析{rel_hint}整片视频分析做场景分段..."
+                    )
             elif has_srt_subtitle:
-                progress_callback("正在分析字幕并对照抽帧构思剧情方案...")
+                progress_callback(
+                    f"正在联合分析{rel_hint}字幕与抽帧做场景分段..."
+                )
             else:
-                progress_callback("正在以抽帧为主构思剧情方案...")
+                progress_callback(f"正在联合分析{rel_hint}抽帧做场景分段...")
         else:
             progress_callback("正在分析字幕并对照画面素材...")
 
@@ -1822,14 +1983,13 @@ def analyze_subtitle_with_frames(
 若已指定开头高潮/爆燃场面，「开头高潮方案」必须写该场面，不得另选。
 
 """
-
     if is_fazu2_compact_settings(cfg):
         min_ost1, max_ost1 = compute_ost1_segment_bounds(settings=cfg)
         ost1_dur_min = int(cfg.get("ost1_duration_min", 8) or 8)
         ost1_dur_max = int(cfg.get("ost1_duration_max", 18) or 18)
         lexicon_section = (
-            f"\n{frame_lexicon_block.strip()}\n\n"
-            if frame_lexicon_block.strip()
+            f"\n{character_lexicon_block.strip()}\n\n"
+            if character_lexicon_block.strip()
             else ""
         )
         knowledge_section = (
@@ -1838,6 +1998,7 @@ def analyze_subtitle_with_frames(
             else ""
         )
         if for_plot_blueprint:
+            min_chars = max(1500, int(min_chars * 0.75))
             principles = build_plot_blueprint_material_principles(
                 has_srt_subtitle=has_srt_subtitle,
                 has_frame_subtitle=has_frame_subtitle,
@@ -1846,69 +2007,48 @@ def analyze_subtitle_with_frames(
                 settings=cfg,
             )
             timestamp_rule = blueprint_timestamp_rule
-            ost1_source = "SRT / 抽帧字幕索引" if has_srt_subtitle else "抽帧/字幕索引"
-            ost1_text_priority = (
-                "优先 SRT 原文，其次 subtitle_entries.text"
-                if has_srt_subtitle
-                else "优先 subtitle_entries.text"
-            )
             prompt = f"""{append_block}{principles}
 {time_bounds_section}
-{knowledge_section}{lexicon_section}你是电视剧「高潮前置型」解说策划。{blueprint_read_hint}，结合剧集人物关系对照理解剧情，输出**脚本生成蓝图**（**1800–3500 字**，结构化 Markdown，不要 JSON）。
+{knowledge_section}{lexicon_section}你是资深剧集内容分析师。{blueprint_read_hint}，**先通读上方人物关系表**，再结合字幕与{visual_source_label}，输出**全片场景分段蓝图**（**2500–6000 字**，结构化 Markdown，不要 JSON）。
 
 作品/主题：{theme}
 
-## 分析原则（硬性）
+## 分析原则
 {blueprint_analysis_rules}
-- **再用剧集对照校正**：人名/关系/阵营与对照表对齐；**谐音/ASR 错字须归并为同一人**（见上方「人名谐音/ASR 归并」）
+- **核心**：按时间顺序切分**完整场景**（一场戏 = 一段），**详细写清每段发生什么**（剧情、动作、冲突、人物关系互动、环境/昼夜）
+- 人名/关系须与**人物关系表**一致；谐音/ASR 错字须归并（胡晓月→胡小跃、罗伯→罗博）；画面/环境须与{visual_source_label}一致
 - **时间戳**：{timestamp_rule}
-- **画面**：须与锚点表同段 observation 一致；性别/职级以**抽帧可见信息**为准（胡小跃=男刑警），勿凭错误 ASR 写成女性
 
-必须按以下标题逐项填写（缺一不可）：
-
-## 本集识别
-- 作品名；是否**全剧第 1 集**（决定转场句用固定句还是自拟）
+必须按以下标题填写：
 
 ## 主要人物表
-- **每人只列一行**：用对照表**规范全名**；subtitle 中的谐音/简称（小月、秦峰、罗伯、老叶等）须归并到同一人，括号注明「又名/字幕常写：…」
-- 身份/关系 + **性别（据抽帧）**；须能在抽帧或对照表中找到依据
-- **禁止**因 ASR 谐音拆成两个角色（如「小月」与「胡小跃」不得各占一行）
+- 本集/本片**实际出现**的人物：规范全名 + 身份/关系 + 性别（对照人物关系表，每人一行；禁止 ASR 谐音拆成两人）
 
-## 开头高潮方案（→ JSON 第 1 段 OST=1）
-- **默认优先**：胡小跃**楼顶跳楼牺牲**（夜色楼顶纵身跃下），金句优先「天就快亮了。」+ **精确时间戳**
-- **禁止**用中段台词顶替跳楼作第 1 段；须与抽帧中该场面时间段一致
-- 动作描述结合抽帧；昼夜/光线须与画面一致
-- **转场句建议**：第2段用「宝子们」+「故事，得从头讲起。」
-- 若用户追加要求已指定开头名场面，本节**只写该场面**
+## 全片场景分段
+按**原片时间顺序**覆盖整段视频，约 **10–25 个场景**（按情节密度划分，勿按 {SEGMENT_INTERVAL_SECONDS} 秒格机械切分）。
 
-## 正叙时间线（→ JSON 主体 OST=0，按片头时间顺序）
-- 至少 **8–12 个情节点**，每点含：**时间段**、人名、事件摘要
-- 标注哪些点适合加小钩子（「您猜怎么着？」等）
+每个场景用三级标题，格式如下（**须写满各字段**）：
 
-## OST=1 金句清单（{min_ost1}–{max_ost1} 条，时间戳须来自{ost1_source}）
-- 每条：说话人 + 台词原文（{ost1_text_priority}）+ **精确时间戳** + 用途
-- **timestamp 须为连续对白块，时长 {ost1_dur_min}–{ost1_dur_max} 秒**；禁止 2–6 秒单句碎段
-- 若单句对白不足 {ost1_dur_min} 秒，须**合并前后相邻字幕**为一条连续 HH:MM:SS,mmm-HH:MM:SS,mmm
+### 场景 1 · `00:00:00-00:01:30` · 地点/环境简述（勿臆测「某某家中」，不明则写「室内·家中」）
+- **出场人物**：
+- **本场景发生的事**：（**不少于 80 字**，详细叙述：谁做了什么、冲突/转折、情绪、与前后情节的因果；综合 SRT + {visual_source_label}）
+- **关键对白**：（原文 1–3 句 + 时间戳；无对白写「无对白」）
+- **画面/环境要点**：（摘自{visual_source_label}：光线、场景、人物动作表情）
 
-## 高潮复现方案（→ JSON 正叙相应位置 · 硬性）
-- 正叙推进到**第 1 段开篇高潮**的原片时刻时，须规划 **1 个 OST=1 复现段**
-- 复现段与第 1 段 **timestamp / 台词 / 画面相同**（picture 可加「【复现】」）；不是另选中段台词
-- 收尾可再次呼应，但**不能替代**正叙中的这次复现
+（依次写场景 2、场景 3 … 直至覆盖全片）
 
-## 高潮之后 + 下集钩子（→ JSON 末段）
-- 本集高潮之后的关键情节（2–3 点）
-- 下集悬念/预告（1–2 句）
+## 剧情主线摘要
+- 用 3–5 句话概括全片故事线与核心冲突
 
-## 声画对位注意
-- 抽帧内部不一致处、易写错的昼夜/光线镜头
-- 正叙开场勿写「第几集」，用「宝子们，一起来看《作品名》。」即可
+## 写脚本参考（可选）
+- 名场面/高潮 moment（时间段 + 一句话说明；如楼顶跳楼等）
+- 人名/关系/声画易错提醒
 
-禁忌：不要警员1/说话人1；不要镜头/导演分析；不要然后/接着；不要编造抽帧未出现的场景或时间戳
+禁忌：不要警员1/说话人1；不要镜头/导演分析；不要编造人物关系表与素材中不存在的人名/情节/时间戳；**不要无依据写「某某家中」**
 """
             system_prompt = (
-                "你是影视解说策划，擅长以抽帧画面梳理高潮前置型短视频脚本。"
-                "输出结构化策划蓝图，时间戳与对白须有据于抽帧；"
-                "谐音/ASR 人名须归并为同一人，不要 JSON。"
+                f"你是剧集内容分析师，擅长结合人物关系表、字幕与{visual_source_label}做全片场景分段与详述。"
+                "输出 Markdown，不要 JSON，不要中途截断。"
             )
         else:
             subtitle_source_hint = (
@@ -2007,8 +2147,8 @@ def analyze_subtitle_with_frames(
         ost1_dur_min = int(sd_settings.get("ost1_duration_min", 8) or 8)
         ost1_dur_max = int(sd_settings.get("ost1_duration_max", 18) or 18)
         lexicon_section = (
-            f"\n{frame_lexicon_block.strip()}\n\n"
-            if frame_lexicon_block.strip()
+            f"\n{character_lexicon_block.strip()}\n\n"
+            if character_lexicon_block.strip()
             else ""
         )
         knowledge_section = (
@@ -2017,6 +2157,7 @@ def analyze_subtitle_with_frames(
             else ""
         )
         if for_plot_blueprint:
+            min_chars = max(1500, int(min_chars * 0.75))
             principles = build_plot_blueprint_material_principles(
                 has_srt_subtitle=has_srt_subtitle,
                 has_frame_subtitle=has_frame_subtitle,
@@ -2026,84 +2167,71 @@ def analyze_subtitle_with_frames(
             )
             prompt = f"""{append_block}{principles}
 {time_bounds_section}
-{knowledge_section}{lexicon_section}你是顶级短剧解说策划。{blueprint_read_hint}，用剧集人物关系对照理解并校正人名/关系，输出供写 JSON 脚本的**完美剧情构思方案**（**2000–3500 字**，结构化 Markdown，不要 JSON）。
+{knowledge_section}{lexicon_section}你是资深剧集内容分析师。{blueprint_read_hint}，**先通读人物关系表**，再联合字幕与{visual_source_label}，输出**全片场景分段蓝图**（**2500–6000 字**，结构化 Markdown，不要 JSON）。
 
 作品/主题：{theme}
 
-## 分析原则（硬性）
+## 分析原则
 {blueprint_analysis_rules}
-- **再用剧集对照校正**：身份/亲属/阵营须与对照表一致；**谐音/ASR 错字须归并为同一人**（见上方「人名谐音/ASR 归并」）
-- **时间戳**：{blueprint_timestamp_rule}
-- **画面要点**：性别/表情/动作/场景/昼夜**必须与{blueprint_visual_anchor}一致**；禁止写「场景N」，改用 **时间段+地点**
-- 产出**可执行脚本蓝图**，不是 3–5 段空泛总结
+- **核心**：按时间顺序切分**完整场景**（一场戏 = 一段），**详细写清每段发生什么**（剧情、动作、冲突、人物关系互动、环境/昼夜）
+- 人名/关系须与**人物关系表**一致；画面/环境须与{visual_source_label}一致；对白摘录须与 SRT 一致
+- 时间戳格式：**HH:MM:SS,mmm-HH:MM:SS,mmm** 或视频格 **HH:MM:SS-HH:MM:SS**（禁止 `-->`）
 
-必须按以下标题逐项填写（缺一不可）：
+必须按以下标题填写：
 
 ## 主要人物表
-- **每人只列一行**：用对照表**规范全名**；subtitle 谐音/简称须归并到同一人，括号注明「又名/字幕常写：…」
-- 身份/关系 + **性别** + 外貌/气质（{visual_source_label}）；须出现在{blueprint_evidence_source}或对照表
-- **禁止**因写法不同拆成两个角色（如小月/胡小月/胡晓月均指胡小跃）
+- 本集/本片**实际出现**的人物：规范全名 + 身份/关系 + 性别（对照人物关系表，每人一行）
 
-## 开头高潮方案（→ JSON 第 1 段 OST=1）
-- 从**全片**选最爆燃段落；金句原文 + **HH:MM:SS,mmm-HH:MM:SS,mmm** + 画面（时间段+地点+动作）
-- 第 1 段纯原声，禁止旁白
+## 全片场景分段
+按**原片时间顺序**覆盖整段视频，约 **10–25 个场景**（按情节密度划分，勿按 {SEGMENT_INTERVAL_SECONDS} 秒格机械切分）。
 
-## 原片时间线（按{blueprint_timeline_label}，供选材）
-- **仅 10–14 条「完整情节段」**（一场戏/一个冲突回合 = 一条），**禁止**按每个 10 秒格或每条 SRT 各写一行
-- 每条须先写 **【本段讲什么】**（1–2 句完整叙事），再写双时间轴：
-  视频格 `HH:MM:SS-HH:MM:SS`（可跨多格，如 00:09:40-00:10:10）· 【本段讲什么】+ 画面/环境 · 字幕窗 `…`（无对白写「无对白」）
-- **视频格**起止须对齐索引表连续格子；**字幕窗**须与 SRT 一致；标注 OST=0 串场 vs OST=1 原声
-- OST=1 标注行的字幕窗须 **{ost1_dur_min}–{ost1_dur_max} 秒**（合并同场连续对白，不要 2–3 秒单句）
+每个场景用三级标题，格式如下（**须写满各字段**）：
 
-## 成片叙事顺序方案（→ JSON 的 `_id` 播放顺序 · 重要）
-- **`_id` = 播放顺序**；`timestamp` = 原片裁剪区间，二者独立
-- 写出 **18–28 个 `_id` 段**规划（含 OST=0/1），每段 = **一段完整叙事**（不是单句台词）
-- 估算能否支撑 **{min_minutes}–{max_minutes} 分钟**成片；每段标注 **OST=0 或 OST=1**
-- 第 1 段倒叙爆点 → 第 2 段「宝子们，我们开始看{theme}。」→ 末段「宝子们，我们下期再见！」
-- OST=1 段 timestamp 须 **{ost1_dur_min}–{ost1_dur_max} 秒**；同场多句对白合并为一块
+### 场景 1 · `00:00:00-00:01:30` · 地点/环境简述（勿臆测「某某家中」，不明则写「室内·家中」）
+- **出场人物**：
+- **本场景发生的事**：（**不少于 80 字**，详细叙述：谁做了什么、冲突/转折、情绪、与前后情节的因果；综合 SRT + {visual_source_label}）
+- **关键对白**：（原文 1–3 句 + 时间戳；无对白写「无对白」）
+- **画面/环境要点**：（摘自{visual_source_label}：光线、场景、人物动作表情）
 
-## 建议保留原声 OST=1（成片原声时长约 70%）
-- **至少 {min_ost1_plot} 条**；每条 = **一段完整原声块**（不是半句话）
-- 格式：说话人 + 台词原文（SRT 逐字，可合并相邻句）+ **字幕窗** + **视频格** + 画面张力 + 用途
-- **字幕窗 {ost1_dur_min}–{ost1_dur_max} 秒**；单句不足 {ost1_dur_min} 秒**必须**并入同场前后对白
-- **禁止** 2–6 秒碎段（如仅「胡小跃是我的徒弟」2 秒须并入前后叶天佑对白）
+（依次写场景 2、场景 3 … 直至覆盖全片）
 
-## 解说 OST=0 脉络规划（成片解说时长约 30%）
-- 每条 ≥20 字，**讲清一段情节因果**；注明原片时间段与承上启下
-- **铺垫下一段 OST=1**：写清取画起点 = 该 OST=1 开始时间 − 约 {int(cfg.get("ost0_lead_before_ost1_sec", 10) or 10)} 秒
-- **点评上一段 OST=1**：写清与上一段原声同场 `timestamp`
+## 剧情主线摘要
+- 用 3–5 句话概括全片故事线与核心冲突
 
-## 声画对位注意
-- {visual_source_label}内部不一致处；昼夜光线易错点；声画反差 moment
+## 写脚本参考（可选）
+- 名场面/高潮 moment（时间段 + 一句话说明）
+- 人名/关系/声画易错提醒
 
-禁忌：不要警员1/说话人1；不要「场景N」编号；不要 `-->` 时间戳；不要编造{blueprint_evidence_source}未支持的人名/时间戳
+禁忌：不要警员1/说话人1；不要编造人物关系表与素材中不存在的人名/情节；**不要无依据写「某某家中」**
 """
             system_prompt = (
-                f"你是短剧解说策划，擅长字幕×{visual_source_label}联合梳理剧集剧情。"
-                if has_srt_subtitle
-                else f"你是短剧解说策划，擅长以{visual_source_label}梳理剧集剧情。"
-            ) + (
-                f"须依据字幕/{visual_source_label}与剧集人物关系对照输出完整 Markdown 蓝图；"
-                "谐音/ASR 人名须归并为同一人，关系须准确，不要 JSON，不要中途截断。"
+                f"你是剧集内容分析师，擅长结合人物关系表、字幕与{visual_source_label}做全片场景分段与详述。"
+                "输出 Markdown，不要 JSON，不要中途截断。"
             )
         else:
-            prompt = f"""{append_block}{knowledge_section}{lexicon_section}你是顶级短剧解说策划。请**先熟悉上方「剧集人物关系对照」**，再**同时深读字幕、{visual_source_label}画面与「抽帧字幕人物索引」**，交叉验证后输出供写 JSON 脚本的**完美剧情构思方案**（**2000–3500 字**，结构化 Markdown，不要 JSON）。
+            character_index_label = (
+                "整片视频分析人物索引"
+                if use_video_episode_analysis
+                else "抽帧字幕人物索引"
+            )
+            visual_material_label = visual_source_label
+            prompt = f"""{append_block}{knowledge_section}{lexicon_section}你是顶级短剧解说策划。请**先通读上方「人物关系表」**，再**同时深读字幕、{visual_material_label}与「{character_index_label}」**，交叉验证后输出供写 JSON 脚本的**完美剧情构思方案**（**2000–3500 字**，结构化 Markdown，不要 JSON）。
 
 作品/主题：{theme}
 
 ## 分析原则（硬性）
-- **先熟悉剧集人物关系对照，再对照字幕/抽帧**：人物身份、亲属、阵营、对立关系须与对照表一致；禁止臆造或张冠李戴
-- **人名与对白以对照表 + 抽帧字幕索引 + 原始字幕为准**：含**全名、小名、昵称、关系称呼**（老叶、小跃、师傅、文妈等），须与字幕原文一致；可映射全名但勿把 A 的台词写成 B
+- **先读人物关系表，再对照字幕/{visual_material_label}**：人物身份、亲属、阵营、对立关系须与人物关系表一致；禁止臆造或张冠李戴
+- **人名与对白以人物关系表 + {character_index_label} + 原始字幕为准**：含**全名、小名、昵称、关系称呼**（老叶、小跃、师傅、文妈等）；**禁止** ASR 谐音（胡晓月→胡小跃、罗伯→罗博）
 - **所有时间戳**必须来自字幕，格式统一为 **HH:MM:SS,mmm-HH:MM:SS,mmm**（用连字符 `-`，**禁止** SRT 箭头 `-->`）
-- **抽帧画面**：人物性别/表情/动作/场景/昼夜光线写入画面要点；**禁止**写「场景1/场景2」等采样编号，改用 **原片时间段+地点**（如 `00:03:20 废弃厂区·灌木潜行`）
-- 字幕与画面冲突：**台词/时间戳以字幕为准**，画面描述以抽帧为准
+- **{visual_material_label}画面**：人物性别/表情/动作/场景/昼夜光线写入画面要点；**禁止**写「场景1/场景2」等采样编号，改用 **原片时间段+地点**
+- 字幕与画面冲突：**台词/时间戳以字幕为准**，画面描述以{visual_material_label}为准
 - 产出**可执行脚本蓝图**，不是 3–5 段空泛总结
 
 必须按以下标题逐项填写（缺一不可）：
 
 ## 主要人物表
-- 姓名（**须出现在剧集对照表或抽帧字幕/索引中**）+ 身份/关系（**与对照表一致**）+ **性别** + 外貌/气质（抽帧）
-- 相似或简称须与对照表一致（如胡小跃禁止写胡小月；秦枫禁止秦峰），**禁止混用不同角色的名字**
+- 姓名（**须出现在人物关系表或{character_index_label}中**）+ 身份/关系（**与人物关系表一致**）+ **性别** + 外貌/气质（{visual_material_label}）
+- 相似或简称须与人物关系表一致（如胡小跃禁止写胡小月/胡晓月；秦枫禁止秦峰；罗博禁止罗伯），**禁止混用不同角色的名字**
 
 ## 开头高潮方案（→ JSON 第 1 段 OST=1）
 - 从**全片**选最爆燃段落；金句原文 + **HH:MM:SS,mmm-HH:MM:SS,mmm** + 画面（时间段+地点+动作）
@@ -2136,8 +2264,8 @@ def analyze_subtitle_with_frames(
 禁忌：不要警员1/说话人1；不要「场景N」编号；不要 `-->` 时间戳；不要编造人名/时间戳
 """
             system_prompt = (
-                "你是短剧解说策划，擅长剧集人物关系梳理与字幕×画面联合分析。"
-                "须先依据提供的剧集人物关系对照熟悉全剧，再输出完整 Markdown 蓝图；"
+                "你是短剧解说策划，擅长结合人物关系表与字幕×画面联合分析。"
+                "须先依据上方人物关系表熟悉全剧，再输出完整 Markdown 蓝图；"
                 "人名、关系、对白归属必须准确，不要 JSON，不要中途截断。"
             )
     else:
@@ -2183,7 +2311,7 @@ def analyze_subtitle_with_frames(
     fazu2 = is_fazu2_compact_settings(cfg)
     validation_settings = cfg if (fazu2 or for_plot_blueprint) else sd_settings
     if for_plot_blueprint:
-        max_attempts = 3
+        max_attempts = 1
     elif is_short_drama:
         max_attempts = 3
     else:
@@ -2207,6 +2335,21 @@ def analyze_subtitle_with_frames(
         if use_video_episode_analysis
         else None
     )
+    character_index_label = (
+        "整片视频分析人物索引"
+        if use_video_episode_analysis
+        else "抽帧字幕人物索引"
+    )
+    canonical_names_list = sorted(
+        str(name) for name in (character_lexicon_data.get("names") or set()) if str(name).strip()
+    )
+    canonical_names_retry_hint = ""
+    if canonical_names_list:
+        canonical_names_retry_hint = (
+            f"- 规范人名须严格使用（来自{character_index_label}）："
+            + "、".join(canonical_names_list[:40])
+            + "\n"
+        )
 
     try:
         for attempt in range(max_attempts):
@@ -2221,7 +2364,16 @@ def analyze_subtitle_with_frames(
                 api_base=base_url,
                 for_script=True,
             )
-            analysis = (result or "").strip()
+            analysis = correct_name_mistakes_in_text((result or "").strip())
+            if for_plot_blueprint:
+                verified_homes = collect_verified_home_location_tokens(
+                    srt_text=srt_text if has_srt_subtitle else "",
+                    visual_summary=visual_summary or frame_summary or "",
+                )
+                analysis = sanitize_blueprint_home_locations(
+                    analysis,
+                    verified_tokens=verified_homes,
+                )
 
             if for_plot_blueprint:
                 last_validation = validate_plot_blueprint(
@@ -2232,29 +2384,31 @@ def analyze_subtitle_with_frames(
                     srt_max_ms=int(srt_time_bounds.get("max_ms") or 0) or None,
                     srt_min_ms=int(srt_time_bounds.get("min_ms") or 0),
                     settings=validation_settings,
-                    lexicon=frame_lexicon_data,
+                    lexicon=character_lexicon_data,
                     drama_known_names=drama_known_names,
                     min_chars=min_chars,
                     require_all_sections=is_short_drama
                     or not is_fazu2_compact_settings(cfg),
                     video_segment_ranges=video_segment_ranges,
                     srt_entries=srt_entries_for_validation or None,
+                    use_video_episode_analysis=use_video_episode_analysis,
+                    relaxed=True,
                 )
                 emit_plot_blueprint_validation_report(last_validation)
                 if last_validation.get("ok"):
                     emit_plot_analysis_full_text(
                         analysis,
-                        title=f"{analysis_label} · 完美剧情构思方案",
+                        title=f"{analysis_label} · 场景分段蓝图",
                     )
                     logger.info(f"{analysis_label}完成，约 {len(analysis)} 字")
                     return analysis
                 if attempt + 1 >= max_attempts:
                     logger.warning(
-                        "构思蓝图校验未完全通过，返回最后一次输出（请人工修正时间戳与画面对位）"
+                        "场景分段蓝图校验未完全通过，返回首次输出（请人工核对场景与人名）"
                     )
                     emit_plot_analysis_full_text(
                         analysis,
-                        title=f"{analysis_label} · 完美剧情构思方案（校验未通过）",
+                        title=f"{analysis_label} · 场景分段蓝图（校验未通过）",
                     )
                     return analysis
                 issue_lines = "\n".join(
@@ -2271,30 +2425,32 @@ def analyze_subtitle_with_frames(
                     else ""
                 )
                 time_source_hint = (
-                    "「原片时间线」仅 **10–14 条完整情节段**（禁止按 10 秒格/单句字幕碎切）；"
-                    "每条写 **视频格**（可跨多格）+ **字幕窗**（OST=1 须 8–18 秒合并对白）；"
+                    "「全片场景分段」须覆盖整片并按情节密度划分（约 10–25 段）；"
+                    "每段「本场景发生的事」不少于 80 字；"
                     if use_video_episode_analysis
-                    else "时间戳须来自「抽帧时间边界与场景锚点」表；画面描述须与锚点表 observation 一致；"
+                    else "「全片场景分段」须覆盖整片；画面描述须与抽帧锚点一致；"
                 )
                 current_prompt = (
                     prompt
                     + f"\n\n## 重试要求（第 {attempt + 2} 次 · 须修正以下问题）\n"
                     f"{issue_lines}\n"
+                    f"{canonical_names_retry_hint}"
                     f"{cap_hint}"
                     f"必须输出完整方案，**不少于 {min_chars} 字**；"
                     f"{time_source_hint}"
-                    "胡小跃/小跃为男性刑警；禁止 OST=1 2–6 秒碎段；"
-                    "每条情节段须讲述一段完整内容，不要拆成几十个短片段。"
+                    "人名须与人物关系表一致；禁止胡晓月/罗伯等 ASR 谐音。"
                 )
                 continue
 
             if is_short_drama:
                 last_validation = validate_short_drama_plot_analysis(
                     analysis,
-                    lexicon=frame_lexicon_data,
+                    lexicon=character_lexicon_data,
                     drama_known_names=drama_known_names,
                     settings=sd_settings,
                     min_chars=min_chars,
+                    use_video_episode_analysis=use_video_episode_analysis,
+                    relaxed=True,
                 )
                 logger.info(format_plot_analysis_validation_report(last_validation))
                 if last_validation.get("ok"):
@@ -2309,7 +2465,7 @@ def analyze_subtitle_with_frames(
                     f"- {item}" for item in (last_validation.get("issues") or [])
                 )
                 dual_time_hint = (
-                    "「原片时间线」须双时间轴：视频格（10秒索引表）+ 字幕窗（SRT）；"
+                    f"「原片时间线」须双时间轴：视频格（{SEGMENT_INTERVAL_SECONDS}秒索引表）+ 字幕窗（SRT）；"
                     if use_video_episode_analysis
                     else ""
                 )
@@ -2317,8 +2473,10 @@ def analyze_subtitle_with_frames(
                     prompt
                     + f"\n\n## 重试要求（第 {attempt + 2} 次 · 须修正以下问题）\n"
                     f"{issue_lines}\n"
+                    f"{canonical_names_retry_hint}"
                     f"必须输出完整方案，**不少于 {min_chars} 字**，"
-                    "按全部标题逐项填写；人名/关系须与剧集对照表一致、对白以字幕为准；"
+                    "按全部标题逐项填写；人名/关系须与人物关系表及"
+                    f"{character_index_label}一致、对白以字幕为准；"
                     f"{dual_time_hint}"
                     "时间戳用 HH:MM:SS,mmm-HH:MM:SS,mmm；禁止「场景N」。"
                 )

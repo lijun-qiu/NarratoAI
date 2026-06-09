@@ -11,16 +11,19 @@ from typing import Any
 from loguru import logger
 
 from app.services.documentary.documentary_settings import FAZU2_CHARACTER_ROLES
+from app.services.documentary.video_episode_constants import SEGMENT_INTERVAL_SECONDS
 from app.services.short_drama_drama_knowledge import find_name_mistakes_in_text
 from app.services.short_drama_plot_analysis_validator import (
     _CLIP_TS_RANGE_RE,
-    _REQUIRED_SECTIONS,
+    _REQUIRED_SECTIONS_LEGACY,
     _SRT_ARROW_TS_RE,
     _SCENE_INDEX_RE,
     _clip_ts_duration_sec,
     _collect_ost1_section_timestamp_durations,
     _count_ost1_entries,
+    _count_scene_segments,
     _estimate_min_ost1_entries,
+    _has_scene_section,
     format_plot_analysis_validation_report,
 )
 
@@ -117,7 +120,7 @@ def _validate_timeline_granularity(
     if total_rows > max_timeline_rows:
         issues.append(
             f"「原片时间线」条目过多（约 {total_rows} 条 > {max_timeline_rows}），"
-            "应按**完整情节段**合并，禁止按每个 10 秒格或每条字幕各写一行"
+            f"应按**完整情节段**合并，禁止按每个 {SEGMENT_INTERVAL_SECONDS} 秒格或每条字幕各写一行"
         )
     short_windows: list[str] = []
     for line in timeline.splitlines():
@@ -228,22 +231,34 @@ def validate_plot_blueprint(
     require_all_sections: bool = True,
     video_segment_ranges: list[str] | None = None,
     srt_entries: list[dict[str, Any]] | None = None,
+    use_video_episode_analysis: bool = False,
+    relaxed: bool = True,
 ) -> dict[str, Any]:
     """校验剧情构思 Markdown；返回 ok / issues / warnings。"""
     content = (text or "").strip()
     issues: list[str] = []
     warnings: list[str] = []
+    min_chars_required = max(1200, int(min_chars * 0.55)) if relaxed else min_chars
 
-    if len(content) < min_chars:
-        issues.append(f"篇幅过短（{len(content)} 字），要求不少于 {min_chars} 字")
+    if len(content) < min_chars_required:
+        issues.append(f"篇幅过短（{len(content)} 字），要求不少于 {min_chars_required} 字")
 
-    if require_all_sections:
-        for header in _REQUIRED_SECTIONS:
+    if relaxed:
+        if "## 主要人物表" not in content:
+            issues.append("缺少必填章节：## 主要人物表")
+        if not _has_scene_section(content):
+            issues.append("缺少必填章节：## 全片场景分段（或 ## 原片时间线）")
+    elif require_all_sections:
+        for header in _REQUIRED_SECTIONS_LEGACY:
             if header not in content:
                 issues.append(f"缺少必填章节：{header}")
 
+    scene_count = _count_scene_segments(content)
+    if relaxed and scene_count and scene_count < 6:
+        warnings.append(f"场景分段偏少（约 {scene_count} 段），建议按完整情节场切分 10 段以上")
+
     scene_hits = _SCENE_INDEX_RE.findall(content)
-    if scene_hits:
+    if scene_hits and not relaxed:
         issues.append(
             "禁止引用抽帧采样编号「场景 N」（如 "
             + "、".join(sorted(set(scene_hits))[:5])
@@ -251,9 +266,7 @@ def validate_plot_blueprint(
         )
 
     if _SRT_ARROW_TS_RE.search(content):
-        issues.append(
-            "时间戳须用剪辑格式 HH:MM:SS,mmm-HH:MM:SS,mmm，禁止 SRT 箭头 `-->`"
-        )
+        warnings.append("时间戳建议用剪辑格式 HH:MM:SS,mmm-HH:MM:SS,mmm，避免 SRT 箭头 `-->`")
 
     hard_cap_ms = frame_max_ms
     if source_duration_ms and source_duration_ms > 0:
@@ -273,6 +286,9 @@ def validate_plot_blueprint(
             else srt_max_ms
         )
 
+    visual_source_label = "整片视频分析" if use_video_episode_analysis else "抽帧"
+    time_cap_label = "原片/视频分析" if use_video_episode_analysis else "原片/抽帧"
+
     if hard_cap_ms:
         cap_label = _format_ms_label(hard_cap_ms)
         for start, end in collect_all_clip_ranges(content):
@@ -284,13 +300,12 @@ def validate_plot_blueprint(
                 continue
             if start_ms < max(0, frame_min_ms - 500):
                 issues.append(
-                    f"时间戳起点 {start} 早于抽帧覆盖范围（"
+                    f"时间戳起点 {start} 早于{visual_source_label}覆盖范围（"
                     f"最早 {_format_ms_label(frame_min_ms)}）"
                 )
             if end_ms > hard_cap_ms + 500:
-                issues.append(
-                    f"时间戳 {start}-{end} 超出原片/抽帧上限 {cap_label}"
-                )
+                msg = f"时间戳 {start}-{end} 超出{time_cap_label}上限 {cap_label}"
+                (warnings if relaxed else issues).append(msg)
             if end_ms <= start_ms:
                 issues.append(f"时间戳区间无效（结束≤开始）：{start}-{end}")
 
@@ -301,10 +316,10 @@ def validate_plot_blueprint(
                 continue
             if point_ms > hard_cap_ms + 500:
                 issues.append(
-                    f"时间点 {single} 超出原片/抽帧上限 {cap_label}"
+                    f"时间点 {single} 超出{time_cap_label}上限 {cap_label}"
                 )
 
-    if dialogue_cap_ms and srt_max_ms and srt_max_ms > 0:
+    if dialogue_cap_ms and srt_max_ms and srt_max_ms > 0 and not relaxed:
         srt_cap_label = _format_ms_label(dialogue_cap_ms)
         for header in (
             "## 建议保留原声 OST=1",
@@ -343,32 +358,34 @@ def validate_plot_blueprint(
     short_ts = [round(sec, 1) for sec in ts_durations if 0 < sec < ost1_dur_min]
     long_ts = [round(sec, 1) for sec in ts_durations if sec > ost1_dur_max + 2]
     if short_ts:
-        issues.append(
-            f"蓝图 OST=1 时间戳过短（{len(short_ts)} 处 < {ost1_dur_min:.0f}s，"
-            f"如 {short_ts[:4]}），须合并相邻 subtitle_entries 为 "
-            f"{ost1_dur_min:.0f}–{ost1_dur_max:.0f}s 连续对白块"
+        msg = (
+            f"部分 OST=1 时间戳较短（{len(short_ts)} 处 < {ost1_dur_min:.0f}s，"
+            f"如 {short_ts[:4]}），写脚本时可酌情合并同场对白"
         )
+        (warnings if relaxed else issues).append(msg)
     if long_ts:
         warnings.append(
-            f"蓝图 OST=1 时间戳偏长（{len(long_ts)} 处 > {ost1_dur_max:.0f}s）"
+            f"部分 OST=1 时间戳偏长（{len(long_ts)} 处 > {ost1_dur_max:.0f}s）"
         )
 
     min_ost1 = _estimate_min_ost1_entries(cfg)
     ost1_count = _count_ost1_entries(content)
     if ost1_count < min_ost1:
-        issues.append(
-            f"建议保留原声 OST=1 条目过少（约 {ost1_count} 条），"
-            f"建议至少 {min_ost1} 条（含完整时间戳区间）"
+        msg = (
+            f"建议保留原声 OST=1 条目偏少（约 {ost1_count} 条），"
+            f"后续写脚本时可参考 ≥{min_ost1} 条"
         )
+        (warnings if relaxed else issues).append(msg)
 
-    _validate_timeline_granularity(
-        content,
-        issues,
-        ost1_dur_min=ost1_dur_min,
-    )
-    if video_segment_ranges:
+    if not relaxed:
+        _validate_timeline_granularity(
+            content,
+            issues,
+            ost1_dur_min=ost1_dur_min,
+        )
+    if video_segment_ranges and not relaxed:
         _validate_video_grid_citations(content, video_segment_ranges, issues)
-    if srt_entries:
+    if srt_entries and not relaxed:
         _validate_ost1_against_srt(content, srt_entries, issues)
 
     for mistake in find_name_mistakes_in_text(content):
@@ -376,8 +393,8 @@ def validate_plot_blueprint(
 
     if _FEMALE_PRONOUN_RE.search(content) or _MALE_ROLE_AS_FEMALE_RE.search(content):
         issues.append(
-            "胡小跃/小跃在本项目抽帧与对照表中为**男性刑警**，"
-            "禁止写成女性/「她」；字幕「小月/胡小月」须归并为胡小跃(男)"
+            "胡小跃/小跃在本项目视频分析与对照表中为**男性刑警**，"
+            "禁止写成女性/「她」；字幕「小月/胡小月/胡晓月」须归并为胡小跃(男)"
         )
 
     for name, role, note in FAZU2_CHARACTER_ROLES:
@@ -392,7 +409,7 @@ def validate_plot_blueprint(
     if opening_section and "跳楼" not in opening_section and "纵身" not in opening_section:
         if "天台" in opening_section and "绝路" in opening_section:
             warnings.append(
-                "开头高潮未选用默认跳楼 sacrifice，若抽帧中无跳楼场面须在「声画对位注意」说明依据"
+                "开头高潮未选用默认跳楼 sacrifice，若视频分析中无跳楼场面须在「声画对位注意」说明依据"
             )
 
     ok = not issues
@@ -402,6 +419,7 @@ def validate_plot_blueprint(
         "warnings": warnings,
         "ost1_count": ost1_count,
         "min_ost1_expected": min_ost1,
+        "scene_count": scene_count,
         "char_count": len(content),
         "hard_cap_ms": hard_cap_ms,
         "known_names": known_names | drama_names,

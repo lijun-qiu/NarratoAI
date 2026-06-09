@@ -97,6 +97,7 @@ class SubtitleAnalyzer:
         subtitle_content: str,
         work_brief: str = "",
         subtitle_frame_analysis: str = "",
+        video_episode_analysis: str = "",
     ) -> Dict[str, str]:
         config = self._get_category_config()
         parameters = {
@@ -107,7 +108,11 @@ class SubtitleAnalyzer:
         if self.prompt_category == "short_drama_narration":
             parameters["subtitle_frame_analysis"] = (
                 subtitle_frame_analysis
-                or "（未提供字幕×抽帧对照分析，请主要依据剧情概述与字幕）"
+                or "（未提供蓝图执行说明，请主要依据剧情概述、整片视频分析与字幕）"
+            )
+            parameters["video_episode_analysis"] = (
+                video_episode_analysis
+                or "（未提供整片视频分析，picture 与画面描述请主要依据蓝图与字幕）"
             )
             parameters["output_duration_hint"] = self.script_extra_params.get(
                 "output_duration_hint",
@@ -530,6 +535,7 @@ class SubtitleAnalyzer:
         temperature: float = 0.7,
         work_brief: str = "",
         subtitle_frame_analysis: str = "",
+        video_episode_analysis: str = "",
     ) -> Dict[str, Any]:
         """
         根据剧情分析生成解说文案
@@ -554,6 +560,7 @@ class SubtitleAnalyzer:
                     subtitle_content,
                     work_brief,
                     subtitle_frame_analysis=subtitle_frame_analysis,
+                    video_episode_analysis=video_episode_analysis,
                 ),
             )
 
@@ -907,6 +914,7 @@ def generate_narration_script(
     script_extra_params: Optional[Dict[str, str]] = None,
     work_brief: str = "",
     subtitle_frame_analysis: str = "",
+    video_episode_analysis: str = "",
 ) -> Dict[str, Any]:
     """
     根据剧情分析生成解说文案的便捷函数
@@ -946,6 +954,7 @@ def generate_narration_script(
         temperature,
         work_brief=work_brief,
         subtitle_frame_analysis=subtitle_frame_analysis,
+        video_episode_analysis=video_episode_analysis,
     )
     
     # 保存结果

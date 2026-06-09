@@ -21,16 +21,16 @@ from app.services.subtitle_text import read_subtitle_text
 from app.services.documentary.documentary_settings import get_documentary_settings
 from app.services.documentary.documentary_material_resolver import (
     normalize_material_source_video_path,
-    resolve_frame_analysis_path_for_documentary,
     resolve_video_episode_analysis_path_for_documentary,
 )
 from app.services.documentary.video_episode_analysis import (
     build_video_episode_analysis_markdown,
+    build_video_episode_script_reference_section,
     load_video_episode_analysis_artifact,
+    video_episode_summary_usable,
 )
 from app.services.documentary.documentary_subtitle_enrichment import (
     analyze_subtitle_with_frames,
-    extract_subtitle_srt_from_frame_analysis,
     truncate_subtitle_content,
 )
 from app.services.documentary.opening_climax_resolver import apply_opening_climax_fix
@@ -46,7 +46,6 @@ from app.services.short_drama_script_optimizer import (
     validate_short_drama_script_duration,
     validate_short_drama_script_timestamps,
 )
-from app.services.generate_narration_script import parse_frame_analysis_to_markdown
 from app.utils.video_processor import VideoProcessor
 # 导入新的LLM服务模块 - 确保提供商被注册
 import app.services.llm  # 这会触发提供商注册
@@ -173,23 +172,6 @@ def _material_source_video_path() -> str:
     )
 
 
-def _prepare_frame_summary(analysis_json_path: str, doc_settings: dict) -> str:
-    """将抽帧分析 JSON 整理为剧情/脚本生成用的紧凑摘要。"""
-    markdown_output = parse_frame_analysis_to_markdown(analysis_json_path, detail_level="full")
-    compact_threshold = int(doc_settings.get("narration_compact_markdown_chars", 120000))
-    if len(markdown_output) > compact_threshold:
-        compact_markdown = parse_frame_analysis_to_markdown(
-            analysis_json_path,
-            detail_level="compact",
-        )
-        logger.info(
-            f"抽帧 Markdown 过长（{len(markdown_output)} 字），"
-            f"已切换紧凑模式（{len(compact_markdown)} 字）"
-        )
-        return compact_markdown
-    return markdown_output
-
-
 def _build_output_duration_hint(*, sd_settings: dict | None = None) -> str:
     cfg = sd_settings or get_short_drama_settings()
     narr_pct = int(cfg.get("narration_percent", 30))
@@ -264,19 +246,41 @@ def _log_short_drama_validation_report(
     logger.info("\n".join(lines))
 
 
-def _resolve_frame_analysis_for_short_drama(video_path: str) -> str:
-    """解析短剧解说可用的抽帧分析 JSON 路径。"""
-    material_source = _material_source_video_path()
-    explicit_analysis = (
-        st.session_state.get("frame_analysis_json_path") or ""
-    ).strip() or None
-    reuse_frame_analysis = bool(st.session_state.get("doc_reuse_frame_analysis", True))
-    return resolve_frame_analysis_path_for_documentary(
-        video_path,
-        material_source_video_path=material_source,
-        explicit_path=explicit_analysis,
-        reuse=reuse_frame_analysis,
-    ) or ""
+def _build_blueprint_execution_note(*, has_video_analysis: bool) -> str:
+    """第二步 JSON 生成：蓝图落实要点（写入 prompt blueprint_execution 块）。"""
+    lines = [
+        "## 蓝图执行要点（JSON 脚本须严格落实）",
+        "- **成片叙事顺序方案**：按表中 `_id` 顺序排列 JSON items，不得擅自调换爆点与正叙节奏",
+        "- **开头高潮方案**：第 1 段 OST=1 须取自该方案标注的字幕窗 timestamp",
+        "- **建议保留原声 OST=1**：清单中的每条须落实为 OST=1 item，timestamp 与蓝图字幕窗一致",
+        "- **原片时间线**：每条事件的**视频格**对齐画面描述，**字幕窗**对齐 OST=1 timestamp",
+        "- OST=0 解说：在情节点之间承上启下，简练埋伏，引出下一段原声",
+    ]
+    if has_video_analysis:
+        lines.append(
+            "- **picture 旁白**：参照整片视频分析同格 `旁白`/`环境`，"
+            "≤配置字数、双引号包裹、禁止复述对白"
+        )
+    return "\n".join(lines)
+
+
+def _load_video_episode_script_reference(
+    video_path: str,
+    *,
+    explicit_path: str = "",
+) -> str:
+    """加载供 JSON 脚本生成参考的整片视频分析摘要。"""
+    json_path = (explicit_path or "").strip()
+    if not json_path:
+        json_path = _resolve_video_episode_analysis_for_short_drama(video_path)
+    if not json_path:
+        return ""
+    try:
+        artifact = load_video_episode_analysis_artifact(json_path)
+        return build_video_episode_script_reference_section(artifact)
+    except Exception as exc:
+        logger.warning(f"加载整片视频分析供脚本生成失败: {exc}")
+        return ""
 
 
 def _resolve_video_episode_analysis_for_short_drama(video_path: str) -> str:
@@ -316,17 +320,24 @@ def generate_plot_blueprint_short(
                 st.error("请先选择视频文件")
                 return
 
-            enable_visual_analysis = bool(st.session_state.get("sd_enable_frame_analysis", True))
+            enable_video_analysis = bool(
+                st.session_state.get("sd_enable_video_episode_analysis", True)
+            )
             doc_settings = get_documentary_settings()
             plot_analysis = ""
             source_label = "字幕×整片视频分析×剧情联合分析"
-            analysis_json_path = ""
             video_episode_json_path = ""
 
-            if enable_visual_analysis:
+            if enable_video_analysis:
                 video_episode_json_path = _resolve_video_episode_analysis_for_short_drama(
                     params.video_origin_path
                 )
+                if not video_episode_json_path:
+                    st.error(
+                        "未找到整片视频分析 JSON。请先在「素材预处理 → 整片视频分析」完成分析；"
+                        "或取消勾选「结合整片视频分析」后仅用字幕生成。"
+                    )
+                    return
                 subtitle_content = ""
                 if subtitle_path and os.path.exists(subtitle_path):
                     subtitle_content = read_subtitle_text(subtitle_path).text
@@ -337,77 +348,35 @@ def generate_plot_blueprint_short(
                     )
                 except Exception:
                     source_duration_sec = 0.0
-
-                if video_episode_json_path:
-                    update_progress(20, "正在整理整片视频分析结果...")
-                    video_artifact = load_video_episode_analysis_artifact(video_episode_json_path)
-                    video_markdown = build_video_episode_analysis_markdown(video_artifact)
-                    analysis_json_path = _resolve_frame_analysis_for_short_drama(
-                        params.video_origin_path
-                    )
-                    frame_summary = ""
-                    if analysis_json_path:
-                        frame_summary = _prepare_frame_summary(analysis_json_path, doc_settings)
-                    update_progress(
-                        40,
-                        "正在分析字幕并对照整片视频分析构思剧情方案..."
-                        if (subtitle_content or "").strip()
-                        else "正在以整片视频分析为主构思剧情方案...",
-                    )
-                    plot_analysis = analyze_subtitle_with_frames(
-                        subtitle_content=subtitle_content,
-                        frame_markdown=frame_summary,
-                        video_theme=video_theme or "本短剧",
-                        progress_callback=lambda msg: update_progress(55, msg),
-                        documentary_settings=doc_settings,
-                        analysis_style="short_drama",
-                        frame_json_path=analysis_json_path or None,
-                        append_custom_prompt=str(st.session_state.get("append_custom_prompt") or ""),
-                        for_plot_blueprint=True,
-                        source_duration_sec=source_duration_sec or None,
-                        video_episode_json_path=video_episode_json_path,
-                        video_episode_markdown=video_markdown,
-                    )
-                else:
-                    analysis_json_path = _resolve_frame_analysis_for_short_drama(
-                        params.video_origin_path
-                    )
-                    if not analysis_json_path:
-                        st.error(
-                            "未找到整片视频分析 JSON。请先在「素材预处理 → 整片视频分析」完成分析；"
-                            "或取消勾选「结合视频/抽帧分析」后仅用字幕生成。"
-                        )
-                        return
-                    update_progress(20, "正在整理抽帧分析结果...")
-                    frame_summary = _prepare_frame_summary(analysis_json_path, doc_settings)
-                    if not (frame_summary or "").strip():
-                        st.error("抽帧分析结果为空，请重新执行「抽帧并分析」")
-                        return
-                    source_label = "字幕×抽帧×剧情联合分析"
-                    update_progress(
-                        40,
-                        "正在分析字幕并对照抽帧构思剧情方案..."
-                        if (subtitle_content or "").strip()
-                        else "正在以抽帧为主构思剧情方案...",
-                    )
-                    plot_analysis = analyze_subtitle_with_frames(
-                        subtitle_content=subtitle_content,
-                        frame_markdown=frame_summary,
-                        video_theme=video_theme or "本短剧",
-                        progress_callback=lambda msg: update_progress(55, msg),
-                        documentary_settings=doc_settings,
-                        analysis_style="short_drama",
-                        frame_json_path=analysis_json_path,
-                        append_custom_prompt=str(st.session_state.get("append_custom_prompt") or ""),
-                        for_plot_blueprint=True,
-                        source_duration_sec=source_duration_sec or None,
-                    )
+                update_progress(20, "正在整理整片视频分析结果...")
+                video_artifact = load_video_episode_analysis_artifact(video_episode_json_path)
+                video_markdown = build_video_episode_analysis_markdown(video_artifact)
+                update_progress(
+                    40,
+                    "正在分析字幕并对照整片视频分析构思剧情方案..."
+                    if (subtitle_content or "").strip()
+                    else "正在以整片视频分析为主构思剧情方案...",
+                )
+                plot_analysis = analyze_subtitle_with_frames(
+                    subtitle_content=subtitle_content,
+                    frame_markdown="",
+                    video_theme=video_theme or "本短剧",
+                    progress_callback=lambda msg: update_progress(55, msg),
+                    documentary_settings=doc_settings,
+                    analysis_style="short_drama",
+                    frame_json_path=None,
+                    append_custom_prompt=str(st.session_state.get("append_custom_prompt") or ""),
+                    for_plot_blueprint=True,
+                    source_duration_sec=source_duration_sec or None,
+                    video_episode_json_path=video_episode_json_path,
+                    video_episode_markdown=video_markdown,
+                )
             else:
                 subtitle_content = ""
                 if subtitle_path and os.path.exists(subtitle_path):
                     subtitle_content = read_subtitle_text(subtitle_path).text
                 if not (subtitle_content or "").strip():
-                    st.error("未开启抽帧分析时，构思蓝图需要字幕文件")
+                    st.error("未开启整片视频分析时，构思蓝图需要字幕文件")
                     return
                 source_label = "字幕剧情分析"
                 text_provider = config.app.get("text_llm_provider", "openai").lower()
@@ -451,7 +420,6 @@ def generate_plot_blueprint_short(
                 mode="summary",
                 meta={
                     "source_label": source_label,
-                    "analysis_path": analysis_json_path,
                     "video_episode_analysis_path": video_episode_json_path,
                     "subtitle_path": subtitle_path,
                 },
@@ -482,7 +450,7 @@ def generate_script_short_sunmmary(
 ):
     """
     生成 短剧解说 视频脚本
-    要求: 提供高质量短剧字幕；可选结合抽帧分析（参照逐帧精剪工作流）
+    要求: 提供高质量短剧字幕；推荐先确认构思蓝图（整片视频分析 + 字幕）
     适合场景: 短剧
     """
     if temperature is None:
@@ -529,28 +497,40 @@ def generate_script_short_sunmmary(
             text_provider = config.app.get("text_llm_provider", "openai").lower()
             text_model, text_api_key, text_base_url = resolve_role_credentials("text")
 
-            enable_frame_analysis = bool(
-                st.session_state.get("sd_enable_frame_analysis", True)
-            )
             doc_settings = get_documentary_settings()
-            frame_summary = ""
             subtitle_frame_analysis = ""
-            analysis_json_path = ""
+            video_episode_script_reference = ""
+            blueprint_meta = dict(st.session_state.get("plot_blueprint_meta") or {})
+            video_episode_json_path = str(
+                blueprint_meta.get("video_episode_analysis_path")
+                or st.session_state.get("video_episode_analysis_json_path")
+                or ""
+            ).strip()
 
             if prebuilt_blueprint:
                 update_progress(40, "复用已确认的剧情构思方案，准备生成脚本...")
                 plot_analysis = prebuilt_blueprint
                 script_subtitle_content = subtitle_content
-                if enable_frame_analysis:
-                    analysis_json_path = _resolve_frame_analysis_for_short_drama(
-                        params.video_origin_path
-                    ) or ""
-                    subtitle_frame_analysis = prebuilt_blueprint
-                    if subtitle_content:
-                        script_subtitle_content = truncate_subtitle_content(
-                            subtitle_content,
-                            int(doc_settings.get("subtitle_max_chars", 15000)),
-                        )
+                video_episode_script_reference = _load_video_episode_script_reference(
+                    params.video_origin_path,
+                    explicit_path=video_episode_json_path,
+                )
+                has_video_analysis = video_episode_summary_usable(
+                    video_episode_script_reference
+                )
+                subtitle_frame_analysis = _build_blueprint_execution_note(
+                    has_video_analysis=has_video_analysis,
+                )
+                if has_video_analysis:
+                    _log_plot_analysis_block(
+                        "【短剧】整片视频分析 · JSON 脚本参考",
+                        video_episode_script_reference,
+                    )
+                if subtitle_content:
+                    script_subtitle_content = truncate_subtitle_content(
+                        subtitle_content,
+                        int(doc_settings.get("subtitle_max_chars", 15000)),
+                    )
                 analysis_result = {
                     "status": "success",
                     "analysis": plot_analysis,
@@ -562,50 +542,11 @@ def generate_script_short_sunmmary(
                     "【短剧】复用已确认的完美剧情构思方案",
                     plot_analysis,
                 )
-            elif enable_frame_analysis:
-                analysis_json_path = _resolve_frame_analysis_for_short_drama(
-                    params.video_origin_path
-                )
-                if not analysis_json_path:
-                    hint = (
-                        "未找到可用的抽帧分析 JSON。请先在「素材预处理」或「抽帧分析」中完成抽帧，"
-                        "或上传/选用已有分析文件；也可取消勾选「结合抽帧分析」后仅用字幕生成。"
-                    )
-                    material_source = _material_source_video_path()
-                    if material_source:
-                        hint += (
-                            f" 已配置素材来源视频「{os.path.basename(material_source)}」，"
-                            "请确认该视频已完成抽帧分析。"
-                        )
-                    st.error(hint)
-                    return
-
-                update_progress(32, "正在整理抽帧分析结果...")
-                frame_summary = _prepare_frame_summary(analysis_json_path, doc_settings)
-                if not (frame_summary or "").strip():
-                    st.error("抽帧分析结果为空，请重新执行「抽帧并分析」")
-                    return
-                logger.info(f"短剧解说复用抽帧分析: {analysis_json_path}")
-
-                update_progress(38, "正在联合分析字幕与抽帧，构思剧情方案...")
-                subtitle_frame_analysis = analyze_subtitle_with_frames(
-                    subtitle_content=subtitle_content,
-                    frame_markdown=frame_summary,
-                    video_theme=video_theme or "本短剧",
-                    progress_callback=lambda msg: update_progress(42, msg),
-                    documentary_settings=doc_settings,
-                    analysis_style="short_drama",
-                    frame_json_path=analysis_json_path,
-                    append_custom_prompt=str(
-                        st.session_state.get("append_custom_prompt") or ""
-                    ),
-                )
-                if subtitle_frame_analysis:
-                    logger.info(
-                        f"字幕×抽帧联合剧情构思完成，约 {len(subtitle_frame_analysis)} 字"
-                    )
-                else:
-                    logger.warning("字幕×抽帧联合分析未产出有效内容，将回退为仅字幕分析")
+            else:
+                analysis_result = {
+                    "status": "error",
+                    "message": "未执行剧情分析",
+                }
 
             source_duration_sec = 0.0
             try:
@@ -624,15 +565,6 @@ def generate_script_short_sunmmary(
             }
             if not prebuilt_blueprint:
                 script_subtitle_content = subtitle_content
-                if enable_frame_analysis and subtitle_frame_analysis:
-                    script_subtitle_content = truncate_subtitle_content(
-                        subtitle_content,
-                        int(doc_settings.get("subtitle_max_chars", 15000)),
-                    )
-                    logger.info(
-                        f"结合抽帧：脚本 prompt 字幕由 {len(subtitle_content)} 字截断为 "
-                        f"{len(script_subtitle_content)} 字（时间戳仍以字幕为准）"
-                    )
 
             analyzer = SubtitleAnalyzerAdapter(
                 text_api_key,
@@ -643,68 +575,10 @@ def generate_script_short_sunmmary(
             )
             plot_analysis = plot_analysis if prebuilt_blueprint else ""
             script_frame_analysis = subtitle_frame_analysis
-            analysis_result: dict = analysis_result if prebuilt_blueprint else {
-                "status": "error",
-                "message": "未执行剧情分析",
-            }
 
-            if not prebuilt_blueprint and enable_frame_analysis and (subtitle_frame_analysis or "").strip():
-                plot_analysis = subtitle_frame_analysis.strip()
-                script_frame_analysis = (
-                    "（完美剧情构思方案已并入上方「剧情概述」，写脚本时以剧情概述为准。）"
-                )
-                analysis_result = {
-                    "status": "success",
-                    "analysis": plot_analysis,
-                    "model": text_model,
-                    "temperature": temperature,
-                    "source": "subtitle_frame_joint",
-                }
-                update_progress(52, "字幕×抽帧联合剧情构思完成")
-                logger.info("字幕×抽帧联合剧情构思成功！")
-                _log_plot_analysis_block(
-                    "【短剧】字幕×抽帧联合剧情构思方案",
-                    plot_analysis,
-                )
-            elif not prebuilt_blueprint:
-                try:
-                    logger.info(
-                        "使用 LLM 进行字幕剧情分析"
-                        + ("（含抽帧摘要）" if frame_summary else "")
-                    )
-                    analysis_result = analyzer.analyze_subtitle(
-                        subtitle_content,
-                        frame_summary=frame_summary,
-                    )
-                except Exception as e:
-                    logger.warning(f"使用新LLM服务失败，回退到旧实现: {str(e)}")
-                    analysis_result = analyze_subtitle(
-                        subtitle_file_path=subtitle_path,
-                        api_key=text_api_key,
-                        model=text_model,
-                        base_url=text_base_url,
-                        save_result=True,
-                        temperature=temperature,
-                        provider=text_provider,
-                        frame_summary=frame_summary,
-                    )
-
-                if analysis_result["status"] == "success":
-                    plot_analysis = analysis_result["analysis"]
-                    logger.info("字幕剧情分析成功！")
-                    _log_plot_analysis_block(
-                        "【短剧】字幕剧情分析方案",
-                        plot_analysis,
-                    )
-
-            if not prebuilt_blueprint and enable_frame_analysis and (subtitle_frame_analysis or "").strip():
-                script_frame_analysis = (
-                    "（完美剧情构思方案已并入上方「剧情概述」，写脚本时以剧情概述为准。）"
-                )
-            elif prebuilt_blueprint and enable_frame_analysis:
-                script_frame_analysis = (
-                    "（完美剧情构思方案已并入上方「剧情概述」，写脚本时以剧情概述为准。）"
-                )
+            if not prebuilt_blueprint:
+                st.error("请先生成并确认「完美剧情构思方案」，再生成 JSON 脚本。")
+                return
 
             if analysis_result["status"] != "success":
                 logger.error(f"分析失败: {analysis_result.get('message', 'unknown')}")
@@ -735,6 +609,7 @@ def generate_script_short_sunmmary(
                         subtitle_content=script_subtitle_content,
                         temperature=temperature,
                         subtitle_frame_analysis=script_frame_analysis,
+                        video_episode_analysis=video_episode_script_reference,
                     )
                 except Exception as e:
                     logger.warning(f"使用新LLM服务失败，回退到旧实现: {str(e)}")
@@ -749,6 +624,7 @@ def generate_script_short_sunmmary(
                         temperature=temperature,
                         provider=text_provider,
                         subtitle_frame_analysis=script_frame_analysis,
+                        video_episode_analysis=video_episode_script_reference,
                         script_extra_params=prompt_extra,
                     )
 
@@ -841,16 +717,16 @@ def generate_script_short_sunmmary(
                 subtitle_content=subtitle_content,
                 subtitle_frame_analysis=subtitle_frame_analysis,
                 append_custom_prompt=str(st.session_state.get("append_custom_prompt") or ""),
-                frame_analysis_path=analysis_json_path if enable_frame_analysis else "",
+                frame_analysis_path="",
                 settings=doc_settings,
-                enabled=enable_frame_analysis,
+                enabled=False,
             )
 
             sd_settings = get_short_drama_settings()
             narration_dict["items"] = optimize_short_drama_script_items(
                 narration_dict["items"],
                 subtitle_content=subtitle_content,
-                frame_analysis_path=analysis_json_path if enable_frame_analysis else "",
+                frame_analysis_path="",
                 settings=sd_settings,
             )
 
@@ -872,7 +748,7 @@ def generate_script_short_sunmmary(
                 narration_dict["items"] = repair_short_drama_script_timestamps(
                     narration_dict["items"],
                     subtitle_content=subtitle_content,
-                    frame_analysis_path=analysis_json_path if enable_frame_analysis else "",
+                    frame_analysis_path="",
                     settings=sd_settings,
                 )
                 _log_short_drama_validation_report(
@@ -936,13 +812,7 @@ def generate_script_short_sunmmary(
         time.sleep(0.1)
         progress_bar.progress(100)
         status_text.text("脚本生成完成！")
-        if enable_frame_analysis and analysis_json_path:
-            st.success(
-                f"视频脚本生成成功！已结合抽帧分析："
-                f"`{os.path.basename(analysis_json_path)}`"
-            )
-        else:
-            st.success("视频脚本生成成功！")
+        st.success("视频脚本生成成功！")
 
     except Exception as err:
         st.error(f"生成过程中发生错误: {str(err)}")

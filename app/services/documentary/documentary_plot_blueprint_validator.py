@@ -25,6 +25,9 @@ from app.services.short_drama_plot_analysis_validator import (
 )
 
 _SINGLE_TS_RE = re.compile(r"(?<![\d,:])(\d{2}:\d{2}:\d{2}[,.]\d{3})(?![\d,:])")
+_VIDEO_GRID_RE = re.compile(
+    r"(?<![\d,:])(\d{2}:\d{2}:\d{2})-(?!\d{2}:\d{2}:\d{2},\d{3})(\d{2}:\d{2}:\d{2})(?![\d,:])"
+)
 _FEMALE_PRONOUN_RE = re.compile(r"(胡小跃|小跃)[^。\n]{0,24}(她|女警|女性)")
 _MALE_ROLE_AS_FEMALE_RE = re.compile(
     r"胡小跃[^。\n]{0,12}(?:\(女\)|（女）|，女，|，女\)|性别[：:]\s*女)"
@@ -59,6 +62,144 @@ def _format_ms_label(ms: int) -> str:
     return format_timestamp_ms(max(0, int(ms)))
 
 
+def _normalize_video_grid_range(value: str) -> str:
+    return str(value or "").strip().replace("—", "-").replace(",", "")
+
+
+def _clip_overlaps_srt(
+    start_ms: int,
+    end_ms: int,
+    srt_entries: list[dict[str, Any]],
+    *,
+    min_overlap_ms: int = 400,
+) -> bool:
+    for entry in srt_entries:
+        try:
+            entry_start = int(entry.get("start_ms") or 0)
+            entry_end = int(entry.get("end_ms") or 0)
+        except (TypeError, ValueError):
+            continue
+        overlap = min(end_ms, entry_end) - max(start_ms, entry_start)
+        if overlap >= min_overlap_ms:
+            return True
+    return False
+
+
+def _count_timeline_table_rows(timeline: str) -> int:
+    count = 0
+    for line in timeline.splitlines():
+        stripped = line.strip()
+        if not stripped.startswith("|") or stripped.count("|") < 2:
+            continue
+        if re.match(r"^\|[-:\s|]+\|$", stripped):
+            continue
+        if "视频格" in stripped or "---" in stripped:
+            continue
+        count += 1
+    return count
+
+
+def _validate_timeline_granularity(
+    content: str,
+    issues: list[str],
+    *,
+    ost1_dur_min: float,
+    max_timeline_rows: int = 16,
+) -> None:
+    timeline = _extract_section(content, "## 原片时间线")
+    if not timeline:
+        return
+    row_count = _count_timeline_table_rows(timeline)
+    bullet_rows = len(
+        re.findall(r"(?m)^\s*[-*]\s+.*视频格", timeline)
+    )
+    total_rows = max(row_count, bullet_rows)
+    if total_rows > max_timeline_rows:
+        issues.append(
+            f"「原片时间线」条目过多（约 {total_rows} 条 > {max_timeline_rows}），"
+            "应按**完整情节段**合并，禁止按每个 10 秒格或每条字幕各写一行"
+        )
+    short_windows: list[str] = []
+    for line in timeline.splitlines():
+        if "OST=0" in line and "OST=1" not in line:
+            continue
+        for start, end in _CLIP_TS_RANGE_RE.findall(line):
+            duration = _clip_ts_duration_sec(start, end)
+            if 0 < duration < ost1_dur_min:
+                short_windows.append(f"{start}-{end}({duration:.1f}s)")
+    if short_windows:
+        issues.append(
+            f"「原片时间线」含过短字幕窗 {len(short_windows)} 处（< {ost1_dur_min:.0f}s，"
+            f"如 {short_windows[:3]}），须合并同场连续对白为完整段落"
+        )
+
+
+def _validate_video_grid_citations(
+    content: str,
+    video_segment_ranges: list[str],
+    issues: list[str],
+    *,
+    min_timeline_hits: int = 8,
+) -> None:
+    from app.services.documentary.video_episode_analysis import is_video_grid_span_allowed
+
+    if not video_segment_ranges:
+        return
+
+    timeline = _extract_section(content, "## 原片时间线")
+    if not timeline:
+        issues.append("缺少「原片时间线」章节，无法校验视频格对齐")
+        return
+
+    hits = 0
+    unknown: list[str] = []
+    for start, end in _VIDEO_GRID_RE.findall(timeline):
+        label = _normalize_video_grid_range(f"{start}-{end}")
+        if is_video_grid_span_allowed(label, video_segment_ranges):
+            hits += 1
+        elif label not in unknown:
+            unknown.append(label)
+
+    if hits < min_timeline_hits:
+        issues.append(
+            f"「原片时间线」中合法视频格引用仅 {hits} 处，要求至少 {min_timeline_hits} 处"
+            "（须对齐视频分析索引表，可跨连续多格）"
+        )
+    if unknown:
+        issues.append(
+            "「原片时间线」含未对齐视频分析索引表的视频格："
+            + "、".join(f"`{item}`" for item in unknown[:5])
+        )
+
+
+def _validate_ost1_against_srt(
+    content: str,
+    srt_entries: list[dict[str, Any]],
+    issues: list[str],
+) -> None:
+    if not srt_entries:
+        return
+    for header in (
+        "## 建议保留原声 OST=1",
+        "## OST=1 金句清单",
+        "## 开头高潮方案",
+    ):
+        section = _extract_section(content, header)
+        if not section:
+            continue
+        for start, end in _CLIP_TS_RANGE_RE.findall(section):
+            try:
+                start_ms = _ts_to_ms(start)
+                end_ms = _ts_to_ms(end)
+            except Exception:
+                continue
+            if not _clip_overlaps_srt(start_ms, end_ms, srt_entries):
+                issues.append(
+                    f"OST=1 时间戳 {start}-{end} 未与 SRT 对白时间窗重叠，"
+                    "须从字幕索引选取连续对白区间"
+                )
+
+
 def collect_all_clip_ranges(text: str) -> list[tuple[str, str]]:
     ranges = list(_CLIP_TS_RANGE_RE.findall(text or ""))
     seen: set[tuple[str, str]] = set()
@@ -85,6 +226,8 @@ def validate_plot_blueprint(
     drama_known_names: set[str] | None = None,
     min_chars: int = 2000,
     require_all_sections: bool = True,
+    video_segment_ranges: list[str] | None = None,
+    srt_entries: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """校验剧情构思 Markdown；返回 ok / issues / warnings。"""
     content = (text or "").strip()
@@ -217,6 +360,16 @@ def validate_plot_blueprint(
             f"建议保留原声 OST=1 条目过少（约 {ost1_count} 条），"
             f"建议至少 {min_ost1} 条（含完整时间戳区间）"
         )
+
+    _validate_timeline_granularity(
+        content,
+        issues,
+        ost1_dur_min=ost1_dur_min,
+    )
+    if video_segment_ranges:
+        _validate_video_grid_citations(content, video_segment_ranges, issues)
+    if srt_entries:
+        _validate_ost1_against_srt(content, srt_entries, issues)
 
     for mistake in find_name_mistakes_in_text(content):
         issues.append(mistake)

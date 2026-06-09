@@ -184,6 +184,7 @@ def get_short_drama_script_prompt_params(
         "ost1_duration_min": str(int(cfg.get("ost1_duration_min", 8))),
         "ost1_duration_max": str(int(cfg.get("ost1_duration_max", 18))),
         "ost0_duration_min": str(int(cfg.get("ost0_duration_min", 5))),
+        "picture_narration_max_chars": str(int(cfg.get("picture_narration_max_chars", 16))),
     }
 
 

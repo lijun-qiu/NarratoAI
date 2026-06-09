@@ -46,6 +46,7 @@ from app.services.short_drama_settings import get_short_drama_settings
 from app.services.documentary.video_episode_analysis import (
     build_video_episode_analysis_markdown,
     build_video_episode_time_bounds_section,
+    collect_video_episode_time_bounds,
     load_video_episode_analysis_artifact,
     summarize_video_episode_markdown,
     video_episode_summary_usable,
@@ -529,15 +530,83 @@ def resolve_subtitles_for_plot_blueprint(
 
 def collect_subtitle_time_bounds(subtitle_content: str) -> dict[str, int]:
     """从 SRT 文本汇总对白可用时间范围（毫秒）。"""
-    from app.services.srt_utils import parse_srt
-
-    entries = parse_srt(subtitle_content or "")
+    entries = parse_subtitle_entries_for_blueprint(subtitle_content)
     if not entries:
         return {"min_ms": 0, "max_ms": 0}
     return {
-        "min_ms": min(entry.start_ms for entry in entries),
-        "max_ms": max(entry.end_ms for entry in entries),
+        "min_ms": min(entry["start_ms"] for entry in entries),
+        "max_ms": max(entry["end_ms"] for entry in entries),
     }
+
+
+def parse_subtitle_entries_for_blueprint(subtitle_content: str) -> list[dict[str, Any]]:
+    """解析 SRT 为蓝图校验用的对白条目列表。"""
+    from app.services.srt_utils import format_timestamp_ms, parse_srt
+
+    entries = parse_srt(subtitle_content or "")
+    parsed: list[dict[str, Any]] = []
+    for entry in entries:
+        text = str(entry.text or "").strip()
+        if not text:
+            continue
+        parsed.append(
+            {
+                "start_ms": int(entry.start_ms),
+                "end_ms": int(entry.end_ms),
+                "text": text,
+                "time_range": (
+                    f"{format_timestamp_ms(entry.start_ms)}-"
+                    f"{format_timestamp_ms(entry.end_ms)}"
+                ),
+            }
+        )
+    return parsed
+
+
+def build_subtitle_cue_index_for_blueprint(
+    subtitle_content: str,
+    *,
+    max_entries: int = 80,
+) -> str:
+    """构思蓝图用：SRT 对白时间窗索引（OST=1 须从此表选取）。"""
+    entries = parse_subtitle_entries_for_blueprint(subtitle_content)
+    if not entries:
+        return (
+            "### 字幕对白时间窗索引\n"
+            "> 未提供 SRT；OST=1 时间戳须来自整片视频分析 `important_dialogues` 中的真实时间。"
+        )
+    if len(entries) > max_entries:
+        step = max(1, len(entries) // max_entries)
+        sampled = [entries[index] for index in range(0, len(entries), step)][:max_entries]
+        note = (
+            f"\n> SRT 共 **{len(entries)}** 条，上表采样 **{len(sampled)}** 条；"
+            "OST=1 的 timestamp 须与 SRT 真实区间一致。"
+        )
+    else:
+        sampled = entries
+        note = f"\n> SRT 共 **{len(entries)}** 条，OST=1 须逐字引用对白并匹配时间窗。"
+    lines = [
+        "### 字幕对白时间窗索引（蓝图「字幕窗」/ OST=1 须从此表选取）",
+        "| 字幕窗 time_range | 对白摘要 |",
+        "|---|---|",
+    ]
+    for entry in sampled:
+        preview = str(entry.get("text") or "").replace("|", "/").replace("\n", " ")[:40]
+        lines.append(f"| `{entry.get('time_range', '')}` | {preview} |")
+    lines.append(note)
+    return "\n".join(lines)
+
+
+def build_plot_blueprint_dual_time_alignment_section(
+    video_artifact: dict[str, Any],
+    subtitle_content: str,
+) -> str:
+    """视频分析固定格 + SRT 字幕窗 + 双轴对齐规则。"""
+    video_section = build_video_episode_time_bounds_section(video_artifact)
+    subtitle_section = build_subtitle_cue_index_for_blueprint(subtitle_content)
+    if not video_section and not subtitle_section:
+        return ""
+    return f"{video_section}\n\n{subtitle_section}"
 
 
 def _raw_scene_segments_from_artifact(artifact: dict) -> list[dict]:
@@ -1662,10 +1731,18 @@ def analyze_subtitle_with_frames(
     if for_plot_blueprint:
         if has_srt_subtitle:
             srt_time_bounds = collect_subtitle_time_bounds(srt_text)
+    video_time_bounds: dict[str, Any] = {}
+    srt_entries_for_validation: list[dict[str, Any]] = []
     if for_plot_blueprint and use_video_episode_analysis and video_episode_artifact:
-        time_bounds_section = build_video_episode_time_bounds_section(video_episode_artifact)
+        video_time_bounds = collect_video_episode_time_bounds(video_episode_artifact)
+        time_bounds_section = build_plot_blueprint_dual_time_alignment_section(
+            video_episode_artifact,
+            srt_text if has_srt_subtitle else "",
+        )
         if source_duration_sec and source_duration_sec > 0:
             time_bounds_section += f"\n- 源视频实测时长：**{source_duration_sec:.1f}s**"
+        if has_srt_subtitle:
+            srt_entries_for_validation = parse_subtitle_entries_for_blueprint(srt_text)
     elif for_plot_blueprint and json_path:
         frame_time_bounds = collect_frame_analysis_time_bounds(json_path)
         time_bounds_section = build_frame_analysis_time_bounds_section(
@@ -1972,23 +2049,27 @@ def analyze_subtitle_with_frames(
 - 第 1 段纯原声，禁止旁白
 
 ## 原片时间线（按{blueprint_timeline_label}，供选材）
-- 至少 **12–16 个情节点**；每点：**时间段 + 事件 + 画面/环境要点**
-- 标注适合 OST=0 串场 vs OST=1 原声
+- **仅 10–14 条「完整情节段」**（一场戏/一个冲突回合 = 一条），**禁止**按每个 10 秒格或每条 SRT 各写一行
+- 每条须先写 **【本段讲什么】**（1–2 句完整叙事），再写双时间轴：
+  视频格 `HH:MM:SS-HH:MM:SS`（可跨多格，如 00:09:40-00:10:10）· 【本段讲什么】+ 画面/环境 · 字幕窗 `…`（无对白写「无对白」）
+- **视频格**起止须对齐索引表连续格子；**字幕窗**须与 SRT 一致；标注 OST=0 串场 vs OST=1 原声
+- OST=1 标注行的字幕窗须 **{ost1_dur_min}–{ost1_dur_max} 秒**（合并同场连续对白，不要 2–3 秒单句）
 
 ## 成片叙事顺序方案（→ JSON 的 `_id` 播放顺序 · 重要）
 - **`_id` = 播放顺序**；`timestamp` = 原片裁剪区间，二者独立
-- 写出至少 **18–28 个 `_id` 段**规划（含 OST=0/1），估算能否支撑 **{min_minutes}–{max_minutes} 分钟**成片
-- 每段标注 **OST=0 或 OST=1**（仅写 0/1，勿写错别字）
+- 写出 **18–28 个 `_id` 段**规划（含 OST=0/1），每段 = **一段完整叙事**（不是单句台词）
+- 估算能否支撑 **{min_minutes}–{max_minutes} 分钟**成片；每段标注 **OST=0 或 OST=1**
 - 第 1 段倒叙爆点 → 第 2 段「宝子们，我们开始看{theme}。」→ 末段「宝子们，我们下期再见！」
+- OST=1 段 timestamp 须 **{ost1_dur_min}–{ost1_dur_max} 秒**；同场多句对白合并为一块
 
 ## 建议保留原声 OST=1（成片原声时长约 70%）
-- **至少 {min_ost1_plot} 条**（含时间戳）；每条：说话人 + 台词原文 + **HH:MM:SS,mmm-HH:MM:SS,mmm** + 画面张力 + 用途
-- **每条 timestamp 须为连续对白块，时长 {ost1_dur_min}–{ost1_dur_max} 秒**（禁止 2–6 秒碎段）
-- 单句对白不足 {ost1_dur_min} 秒时，须合并前后相邻 subtitle_entries 为一条连续区间
-- 同场连续对白可成块规划
+- **至少 {min_ost1_plot} 条**；每条 = **一段完整原声块**（不是半句话）
+- 格式：说话人 + 台词原文（SRT 逐字，可合并相邻句）+ **字幕窗** + **视频格** + 画面张力 + 用途
+- **字幕窗 {ost1_dur_min}–{ost1_dur_max} 秒**；单句不足 {ost1_dur_min} 秒**必须**并入同场前后对白
+- **禁止** 2–6 秒碎段（如仅「胡小跃是我的徒弟」2 秒须并入前后叶天佑对白）
 
 ## 解说 OST=0 脉络规划（成片解说时长约 30%）
-- 每条 ≥20 字；注明对应原片时间段与承上启下
+- 每条 ≥20 字，**讲清一段情节因果**；注明原片时间段与承上启下
 - **铺垫下一段 OST=1**：写清取画起点 = 该 OST=1 开始时间 − 约 {int(cfg.get("ost0_lead_before_ost1_sec", 10) or 10)} 秒
 - **点评上一段 OST=1**：写清与上一段原声同场 `timestamp`
 
@@ -2115,8 +2196,17 @@ def analyze_subtitle_with_frames(
         if source_duration_sec and source_duration_sec > 0
         else None
     )
-    frame_max_ms = int(frame_time_bounds.get("max_ms") or 0) or None
-    frame_min_ms = int(frame_time_bounds.get("min_ms") or 0)
+    if use_video_episode_analysis and video_time_bounds.get("max_ms"):
+        frame_max_ms = int(video_time_bounds.get("max_ms") or 0) or None
+        frame_min_ms = int(video_time_bounds.get("min_ms") or 0)
+    else:
+        frame_max_ms = int(frame_time_bounds.get("max_ms") or 0) or None
+        frame_min_ms = int(frame_time_bounds.get("min_ms") or 0)
+    video_segment_ranges = (
+        list(video_time_bounds.get("segment_ranges") or [])
+        if use_video_episode_analysis
+        else None
+    )
 
     try:
         for attempt in range(max_attempts):
@@ -2147,6 +2237,8 @@ def analyze_subtitle_with_frames(
                     min_chars=min_chars,
                     require_all_sections=is_short_drama
                     or not is_fazu2_compact_settings(cfg),
+                    video_segment_ranges=video_segment_ranges,
+                    srt_entries=srt_entries_for_validation or None,
                 )
                 emit_plot_blueprint_validation_report(last_validation)
                 if last_validation.get("ok"):
@@ -2178,15 +2270,21 @@ def analyze_subtitle_with_frames(
                     if cap_label
                     else ""
                 )
+                time_source_hint = (
+                    "「原片时间线」仅 **10–14 条完整情节段**（禁止按 10 秒格/单句字幕碎切）；"
+                    "每条写 **视频格**（可跨多格）+ **字幕窗**（OST=1 须 8–18 秒合并对白）；"
+                    if use_video_episode_analysis
+                    else "时间戳须来自「抽帧时间边界与场景锚点」表；画面描述须与锚点表 observation 一致；"
+                )
                 current_prompt = (
                     prompt
                     + f"\n\n## 重试要求（第 {attempt + 2} 次 · 须修正以下问题）\n"
                     f"{issue_lines}\n"
                     f"{cap_hint}"
                     f"必须输出完整方案，**不少于 {min_chars} 字**；"
-                    "时间戳须来自「抽帧时间边界与场景锚点」表；"
-                    "画面描述须与锚点表 observation 一致；"
-                    "胡小跃/小跃为男性刑警；禁止 OST=1 2–6 秒碎段。"
+                    f"{time_source_hint}"
+                    "胡小跃/小跃为男性刑警；禁止 OST=1 2–6 秒碎段；"
+                    "每条情节段须讲述一段完整内容，不要拆成几十个短片段。"
                 )
                 continue
 
@@ -2210,12 +2308,18 @@ def analyze_subtitle_with_frames(
                 issue_lines = "\n".join(
                     f"- {item}" for item in (last_validation.get("issues") or [])
                 )
+                dual_time_hint = (
+                    "「原片时间线」须双时间轴：视频格（10秒索引表）+ 字幕窗（SRT）；"
+                    if use_video_episode_analysis
+                    else ""
+                )
                 current_prompt = (
                     prompt
                     + f"\n\n## 重试要求（第 {attempt + 2} 次 · 须修正以下问题）\n"
                     f"{issue_lines}\n"
                     f"必须输出完整方案，**不少于 {min_chars} 字**，"
                     "按全部标题逐项填写；人名/关系须与剧集对照表一致、对白以字幕为准；"
+                    f"{dual_time_hint}"
                     "时间戳用 HH:MM:SS,mmm-HH:MM:SS,mmm；禁止「场景N」。"
                 )
                 continue

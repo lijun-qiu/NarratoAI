@@ -19,8 +19,8 @@ class ScriptGenerationPrompt(ParameterizedPrompt):
         metadata = PromptMetadata(
             name="script_generation",
             category="short_drama_narration",
-            version="v2.4",
-            description="短剧解说：成片8-13分钟、3:7时长比、播放顺序可倒叙/正叙、每段完整脉络",
+            version="v2.5",
+            description="短剧解说：蓝图×视频分析×字幕、精准简练旁白、承上启下吸睛",
             model_type=ModelType.TEXT,
             output_format=OutputFormat.JSON,
             tags=["短剧", "解说脚本", "文案生成", "原声片段", "黄金开场", "爽点放大", "个性吐槽", "悬念预埋"],
@@ -29,6 +29,8 @@ class ScriptGenerationPrompt(ParameterizedPrompt):
                 "plot_analysis",
                 "subtitle_content",
                 "subtitle_frame_analysis",
+                "video_episode_analysis",
+                "picture_narration_max_chars",
                 "output_duration_hint",
                 "narration_percent",
                 "original_audio_percent",
@@ -54,32 +56,36 @@ class ScriptGenerationPrompt(ParameterizedPrompt):
 
 ## 素材信息
 
-### 剧情概述
+### 完美剧情构思蓝图（已确认 · 最高优先级）
 <plot>
 ${plot_analysis}
 </plot>
+
+### 整片视频分析（10 秒格 · 画面/旁白/环境）
+<video_episode_analysis>
+${video_episode_analysis}
+</video_episode_analysis>
 
 ### 原始字幕（含精确时间戳）
 <subtitles>
 ${subtitle_content}
 </subtitles>
 
-### 字幕×抽帧对照分析（有则必须遵循）
-<subtitle_frame_analysis>
+### 蓝图执行说明
+<blueprint_execution>
 ${subtitle_frame_analysis}
-</subtitle_frame_analysis>
+</blueprint_execution>
 
-**素材优先级（硬性）：以字幕为主，抽帧为辅；剧情构思须同时利用二者。**
-- **字幕（主）**：剧情、`narration`、人名、**所有 `timestamp`**
-- **抽帧（辅）**：`picture` 画面描述，以及 `subtitle_entries` 剪辑边界对位
-- 对照分析中的**成片叙事顺序方案**、开头高潮方案、OST=1 清单须落实；时间戳与台词仍以字幕为准
-- 若剧情概述已含完整构思方案，下方对照分析可忽略
+**素材优先级（硬性）：蓝图 > 字幕时间戳 > 整片视频分析画面**
+- **蓝图（主）**：**成片叙事顺序方案**、**开头高潮方案**、**建议保留原声 OST=1**、原片时间线中的**视频格**与**字幕窗**须逐条落实
+- **字幕（时间主）**：**所有 `timestamp`**、对白原文、人名；OST=1 的 timestamp **必须**与蓝图「字幕窗」及 SRT 一致
+- **整片视频分析（画辅）**：各 10 秒格的 `旁白`/`环境`/`关键事件` → 写入 OST=1 的 **`picture`** 与 OST=0 的画面感描写
+- **禁止**自造蓝图与视频分析索引表中不存在的时间窗
 
-### 片段边界（硬性 · 对齐抽帧 subtitle_entries）
-- 抽帧 JSON 中 **`subtitle_entries`** = 字幕对位剪辑片段列表，每项含 `start` / `end` / `text`
-- 每条 item 的 `timestamp` **结束时间以该段最后一条 subtitle_entries 的 `end` 为准**
-- OST=1 须覆盖整句对白，**禁止**在原声台词未说完、字幕未结束前截断
-- 有抽帧分析时：先在 JSON 中定位对应 scene 的 `subtitle_entries`，再写入 item 的 `timestamp`
+### 片段边界（硬性 · 对齐蓝图字幕窗）
+- 蓝图「原片时间线」中 **字幕窗** `HH:MM:SS,mmm-HH:MM:SS,mmm` = OST=1 合法对白区间
+- 每条 OST=1 的 `timestamp` **结束时间 ≥ 该句对白在 SRT 中的 end**，**禁止**台词未说完就截断
+- OST=0 取画时间须落在蓝图对应 **视频格** 内；铺垫下一段 OST=1 时，解说须承上启下
 
 ### timestamp 硬性约束（违反则整份 JSON 无效）
 - 格式固定：`HH:MM:SS,mmm-HH:MM:SS,mmm`（**结束时间必须严格大于开始时间**）
@@ -97,7 +103,7 @@ ${subtitle_frame_analysis}
 ### 成片时长与切段（重要 · 硬性）
 ${output_duration_hint}
 
-**结合抽帧分析时**：以**字幕剧情**为正叙切段骨架；**情节点之间**用 OST=0 串场，**同一场戏内**可连续多段 OST=1；勿把全部情节点都标成 OST=1。
+**结合蓝图与视频分析时**：以蓝图**成片叙事顺序**为 `_id` 骨架；**情节点之间**用 OST=0 简练串场，**同一场戏内**可连续多段 OST=1；勿把全部情节点都标成 OST=1。
 
 ## 解说/原声时长比例（硬性 · 不满足则输出无效）
 
@@ -215,7 +221,7 @@ ${output_duration_hint}
 - **时间戳绝对不能重叠**，确保剪辑后无重复画面
 - **时间段必须连续且不交叉**，严格按时间顺序排列
 - **每个时间戳都必须在原始字幕中找到对应范围**
-- **片段结束边界优先对齐抽帧 `subtitle_entries` 最后一条的 `end`**
+- **片段结束边界优先对齐蓝图「字幕窗」及 SRT 对白 end**
 - 可以拆分原时间片段，但必须保持时间连续性
 - 时间戳的格式必须与原始字幕中的格式完全一致
 
@@ -243,10 +249,18 @@ ${output_duration_hint}
 }
 ```
 
-**OST=1 原声段 `picture` 旁白（硬性）：**
-- **每条 OST=1 必须填写 `picture`**：精简画面/动作/情绪描述，承上启下，**禁止复述对白**
-- **`picture` 全文须用英文双引号包裹**，如 `"楼顶对峙，紧张爆燃名场面"`
-- 旁白将烧录为画面字幕：**字号 28、黑色**；勿写过长句子
+**OST=1 原声段 `picture` 旁白字幕（硬性 · 精准简练 · 承上启下 · 吸睛）：**
+- **每条 OST=1 必须填写 `picture`**：参照蓝图对应**视频格** + 整片视频分析 `旁白`/`环境`，写成**烧录字幕**
+- **字数 ≤ ${picture_narration_max_chars} 字**（含标点）；**禁止复述对白**、禁止长句堆砌
+- **承上启下**：承接上段情绪/悬念（如「局势骤变」），铺垫本段爆点或下段转折（如「下一秒——」）
+- **吸引用户**：动词/悬念词开头（「对峙升级」「身份揭晓」「绝境反杀」），制造「想继续看」的钩子
+- **`picture` 全文须用英文双引号包裹**，如 `"楼顶对峙升级，下一秒生死一瞬"`
+- 旁白将烧录为画面字幕：**字号 28**；超字数须删繁就简，保留最强信息点
+
+**OST=0 解说 `narration` 文案（硬性 · 简练串场）：**
+- 每段 **${narration_chars_min}–${narration_chars_max} 字**，**一句一事**，拒绝废话复述
+- **承上启下**：上段原声播完后用 1–2 句点明因果/转折，再引出下段 OST=1（「而这时——」「您猜怎么着？」）
+- **吸引用户**：口语化、有态度、有节奏；埋伏笔、抛悬念，让观众舍不得划走
 
 ### 原声片段插入策略
 
@@ -398,7 +412,8 @@ ${output_duration_hint}
 - [ ] 最后一段含「宝子们，我们下期再见！」
 - [ ] 成片总时长约 ${target_output_minutes_min}–${target_output_minutes_max} 分钟
 - [ ] 解说与原声成片时长约 ${narration_percent}:${original_audio_percent}
-- [ ] 每条 OST=1 的 `picture` 已用双引号包裹且非空
+- [ ] 每条 OST=1 的 `picture` 已用双引号包裹、≤${picture_narration_max_chars} 字、承上启下且非空
+- [ ] OST=1 timestamp 与蓝图「字幕窗」/SRT 一致；画面描述对齐蓝图视频格与整片视频分析
 - [ ] **每条 `timestamp` 结束时间 > 开始时间，无任何零时长段**
 - [ ] OST=1 每段时长约 ${ost1_duration_min}–${ost1_duration_max} 秒；OST=0 每段 ≥${narration_chars_min} 字
 

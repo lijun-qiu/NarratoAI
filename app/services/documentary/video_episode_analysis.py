@@ -772,6 +772,26 @@ def build_video_episode_analysis_markdown(
     return text[: max_chars - 24].rstrip() + "\n…（整片视频分析摘要已截断）"
 
 
+def build_video_episode_script_reference_section(
+    payload: dict[str, Any],
+    *,
+    max_chars: int = 12000,
+    max_segments: int = 96,
+) -> str:
+    """脚本 JSON 生成用：整片视频分析 + 固定时间格索引（对齐蓝图视频格）。"""
+    markdown = build_video_episode_analysis_markdown(
+        payload,
+        max_chars=max(4000, max_chars - 3000),
+        max_segments=max_segments,
+    )
+    schedule = build_video_episode_schedule_index(payload, max_rows=min(48, max_segments))
+    parts = [markdown]
+    if schedule:
+        parts.extend(["", schedule])
+    text = "\n".join(parts).strip()
+    return summarize_video_episode_markdown(text, max_chars)
+
+
 def summarize_video_episode_markdown(markdown: str, max_chars: int) -> str:
     text = (markdown or "").strip()
     if not text:
@@ -786,25 +806,182 @@ def video_episode_summary_usable(summary: str) -> bool:
     return bool(text) and text not in {"（无整片视频分析）", "（无）"}
 
 
+def normalize_video_grid_range(value: str) -> str:
+    return str(value or "").strip().replace("—", "-").replace(",", "")
+
+
+def collect_video_episode_time_bounds(payload: dict[str, Any]) -> dict[str, Any]:
+    """从整片视频分析汇总时间边界与固定 10 秒格列表。"""
+    segments = payload.get("episodic_segments") or []
+    segment_ranges: list[str] = []
+    segment_bounds_ms: list[tuple[int, int]] = []
+    for segment in segments:
+        if not isinstance(segment, dict):
+            continue
+        time_range = normalize_video_grid_range(str(segment.get("time_range") or ""))
+        if not time_range or "-" not in time_range:
+            continue
+        start_sec, end_sec = _parse_time_range_bounds(time_range)
+        segment_ranges.append(time_range)
+        segment_bounds_ms.append((start_sec * 1000, end_sec * 1000))
+
+    duration = float(payload.get("video_duration_seconds") or 0)
+    if segment_bounds_ms:
+        min_ms = segment_bounds_ms[0][0]
+        max_ms = segment_bounds_ms[-1][1]
+    elif duration > 0:
+        min_ms = 0
+        max_ms = int(duration * 1000)
+    else:
+        min_ms = 0
+        max_ms = 0
+
+    return {
+        "min_ms": min_ms,
+        "max_ms": max_ms,
+        "segment_ranges": segment_ranges,
+        "segment_bounds_ms": segment_bounds_ms,
+        "segment_count": len(segment_ranges),
+    }
+
+
+def build_video_episode_schedule_index(
+    payload: dict[str, Any],
+    *,
+    max_rows: int = 96,
+) -> str:
+    """构思蓝图用：固定 10 秒格索引表（须逐格引用）。"""
+    segments = payload.get("episodic_segments") or []
+    if not segments:
+        return ""
+    sampled = _sample_items_uniformly(segments, max_rows)
+    lines = [
+        "### 视频分析固定时间格索引（蓝图「视频格」须从此表逐字引用）",
+        "| 视频格 time_range | 标题 | 关键事件 |",
+        "|---|---|---|",
+    ]
+    for segment in sampled:
+        if not isinstance(segment, dict):
+            continue
+        time_range = normalize_video_grid_range(str(segment.get("time_range") or ""))
+        title = str(segment.get("title") or "").strip()[:12]
+        events = str(segment.get("key_events") or "").strip()[:36]
+        lines.append(f"| `{time_range}` | {title} | {events} |")
+    if len(segments) > len(sampled):
+        lines.append(
+            f"\n> 全片共 **{len(segments)}** 格，上表均匀采样 **{len(sampled)}** 格；"
+            "蓝图按**完整情节段**取材，主视频格须来自索引表，一场戏可跨多格，禁止自造窗口。"
+        )
+    return "\n".join(lines)
+
+
+def is_video_grid_span_allowed(span: str, segment_ranges: list[str]) -> bool:
+    """判断视频格区间是否为索引表中连续格子的合法并集（一场戏可跨多格）。"""
+    normalized = normalize_video_grid_range(span)
+    if not normalized or "-" not in normalized:
+        return False
+    allowed = {
+        normalize_video_grid_range(item)
+        for item in segment_ranges
+        if str(item or "").strip()
+    }
+    if normalized in allowed:
+        return True
+    intervals: list[tuple[int, int]] = []
+    for item in segment_ranges:
+        start_sec, end_sec = _parse_time_range_bounds(normalize_video_grid_range(item))
+        if end_sec > start_sec:
+            intervals.append((start_sec, end_sec))
+    if not intervals:
+        return False
+    start_sec, end_sec = _parse_time_range_bounds(normalized)
+    if end_sec <= start_sec:
+        return False
+    pos = start_sec
+    while pos < end_sec:
+        chunk_end = min(pos + SEGMENT_INTERVAL_SECONDS, end_sec)
+        covered = any(s <= pos and e >= chunk_end for s, e in intervals)
+        if not covered:
+            return False
+        pos = chunk_end
+    return True
+
+
+def build_plot_blueprint_narrative_granularity_rules(
+    *,
+    ost1_duration_min: int = 8,
+    ost1_duration_max: int = 18,
+) -> str:
+    """构思蓝图：完整情节段粒度规则（禁止按 10 秒格/单句对白碎切）。"""
+    return (
+        "## 情节段粒度（硬性 · 禁止碎切）\n"
+        "- **每条 = 一段完整内容**：一场戏、一个冲突回合或一条清晰叙事线（通常 **30 秒–3 分钟** 原片跨度）\n"
+        "- **禁止**按每个 10 秒视频格各写一行；**禁止**按每条 SRT 字幕各写一行\n"
+        "- **原片时间线**仅 **10–14 条**完整情节段，不是 30+ 条碎点\n"
+        f"- **OST=1 字幕窗**：合并相邻对白为 **{ost1_duration_min}–{ost1_duration_max} 秒**连续区间；"
+        f"单句不足 {ost1_duration_min} 秒须并入同场前后对白\n"
+        "- **视频格**可跨多格：如 `00:09:40-00:10:10` 覆盖审讯室整场，起止须落在索引表连续格子上\n"
+        "- **OST=0 串场**：用 1 段解说讲完该情节段因果，不要拆成多个 5 秒碎点\n"
+        "- **成片叙事顺序**每条 `_id` 也应是一段完整叙事单元（原声块或解说块），不是单句台词"
+    )
+
+
+def build_plot_blueprint_video_time_rules(
+    *,
+    ost1_duration_min: int = 8,
+    ost1_duration_max: int = 18,
+) -> str:
+    return (
+        "## 双时间轴对齐规则（硬性 · 精准控制）\n"
+        "- **视频格**（画面/剧情）：起止须对齐索引表连续 10 秒格；**一场戏可跨多格**（如 `00:09:40-00:10:10`）\n"
+        "- **字幕窗**（对白/OST=1）：只能使用 SRT 索引中的 `HH:MM:SS,mmm-HH:MM:SS,mmm`（毫秒级）\n"
+        "- **原片时间线**每条 = **一段完整情节**；格式："
+        "`视频格 \\`00:01:20-00:01:50\\` · 【本段讲什么】事件摘要 · 字幕窗 \\`…\\`（无对白写「无对白」）`\n"
+        f"- **OST=1** 字幕窗 **{ost1_duration_min}–{ost1_duration_max} 秒**；禁止 2–6 秒单句碎段\n"
+        "- **OST=0** 取画时间须落在对应视频格跨度内；铺垫下一段 OST=1 时起点 = 字幕窗开始 − 约 10 秒\n"
+        "- 禁止编造索引表与 SRT 中不存在的时间；冲突时：**台词/OST 以字幕为准，画面以视频格为准**"
+    )
+
+
 def build_video_episode_time_bounds_section(payload: dict[str, Any]) -> str:
-    """构思蓝图用：整片视频分析时间边界与首尾片段锚点。"""
+    """构思蓝图用：整片视频分析时间边界、固定格索引与对齐规则。"""
+    bounds = collect_video_episode_time_bounds(payload)
     duration = float(payload.get("video_duration_seconds") or 0)
     segments = payload.get("episodic_segments") or []
     if duration <= 0 and not segments:
         return ""
     duration_label = _format_timestamp(duration) if duration > 0 else "未知"
     lines = [
-        "## 整片视频分析时间边界与场景锚点",
+        "## 整片视频分析时间边界",
         f"- 源视频总时长：**{duration_label}**（{duration:.1f}s）",
-        f"- 情节片段粒度：每 **{SEGMENT_INTERVAL_SECONDS} 秒** 一格，共 **{len(segments)}** 条",
+        f"- 固定 **{SEGMENT_INTERVAL_SECONDS} 秒** 一格，共 **{bounds['segment_count']}** 条",
     ]
     if segments:
-        lines.append(f"- 首段：`{segments[0].get('time_range', '')}` · {segments[0].get('key_events', '')}")
         lines.append(
-            f"- 末段：`{segments[-1].get('time_range', '')}` · {segments[-1].get('key_events', '')}"
+            f"- 首格：`{segments[0].get('time_range', '')}` · {segments[0].get('key_events', '')}"
         )
-    lines.append("- 蓝图中的时间段/画面要点须落在此分析覆盖范围内，禁止编造超出上限的时间戳")
-    return "\n".join(lines)
+        lines.append(
+            f"- 末格：`{segments[-1].get('time_range', '')}` · {segments[-1].get('key_events', '')}"
+        )
+    schedule = build_video_episode_schedule_index(payload)
+    from app.services.short_drama_settings import get_short_drama_settings
+
+    sd_cfg = get_short_drama_settings()
+    ost1_min = int(sd_cfg.get("ost1_duration_min", 8) or 8)
+    ost1_max = int(sd_cfg.get("ost1_duration_max", 18) or 18)
+    granularity = build_plot_blueprint_narrative_granularity_rules(
+        ost1_duration_min=ost1_min,
+        ost1_duration_max=ost1_max,
+    )
+    rules = build_plot_blueprint_video_time_rules(
+        ost1_duration_min=ost1_min,
+        ost1_duration_max=ost1_max,
+    )
+    parts = ["\n".join(lines)]
+    if schedule:
+        parts.extend(["", schedule])
+    parts.extend(["", granularity, "", rules])
+    return "\n".join(parts)
 
 
 def _probe_duration_seconds(video_path: str) -> float:

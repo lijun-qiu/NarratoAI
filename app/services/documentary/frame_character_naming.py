@@ -15,43 +15,11 @@ from app.services.documentary.documentary_settings import (
     FRAME_UNKNOWN_CHARACTER_FEMALE,
     FRAME_UNKNOWN_CHARACTER_MALE,
 )
-from app.services.short_drama_drama_knowledge import (
-    ObviousCharacterRelation,
-    PLOT_BLUEPRINT_NAME_ALIAS_GROUPS,
-    correct_name_mistakes_in_text,
-    resolve_obvious_character_relations,
-)
 
 _GENDER_SUFFIX_RE = re.compile(r"[\(（][男女不明][\)）]$")
 _NAMED_WITH_GENDER_RE = re.compile(
     r"([\u4e00-\u9fffA-Za-z·]{2,8})([\(（][男女不明][\)）])"
 )
-_RELATION_LABEL_KEYWORDS: dict[str, tuple[str, ...]] = {
-    "师徒": ("师徒", "师傅", "弟子", "爱徒", "门生"),
-    "师兄弟": ("师兄弟", "师兄", "师弟", "同门"),
-    "父子": ("父子", "父亲", "儿子", "生父", "老爸", "爸"),
-    "母子": ("母子", "母亲", "儿子", "亲妈", "老妈"),
-    "养母子": ("养母子", "养母", "养子"),
-    "母女": ("母女", "母亲", "女儿"),
-    "兄妹": ("兄妹", "哥哥", "妹妹", "兄长", "姐姐", "弟弟"),
-    "养兄弟": ("养兄弟", "异姓兄弟"),
-    "夫妻": ("夫妻", "丈夫", "妻子", "老公", "老婆"),
-    "上下级": ("上下级", "上级", "下级", "领导", "下属"),
-    "至交": ("至交", "老友", "旧友"),
-}
-_RELATION_PRIORITY: dict[str, int] = {
-    "师徒": 0,
-    "师兄弟": 1,
-    "父子": 2,
-    "母子": 3,
-    "养母子": 4,
-    "母女": 5,
-    "兄妹": 6,
-    "养兄弟": 7,
-    "夫妻": 8,
-    "上下级": 9,
-    "至交": 10,
-}
 # 附定妆照时禁止用作姓名、须改为头像匹配规范名的模糊代称
 _GENERIC_FACE_ROLE_LABELS: tuple[str, ...] = (
     "便衣男警察",
@@ -71,12 +39,6 @@ _GENERIC_FACE_ROLE_LABELS: tuple[str, ...] = (
     "男子",
     "女子",
 )
-# 旧版解说剧本常用名，不在上传头像名单时应一律剔除（模型易幻觉）
-_LEGACY_HALLUCINATED_CHARACTER_NAMES: frozenset[str] = frozenset(
-    {"伟业", "老叶", "常征", "赵鹏超", "小跃", "小月"}
-)
-
-
 def build_frame_naming_priority_rules(
     *,
     has_drama_knowledge: bool = False,
@@ -89,9 +51,9 @@ def build_frame_naming_priority_rules(
         f"1. **唯一依据**：本帧/本批关键帧中**脸/侧脸清晰可见**，且与已上传**定妆照/头像**对照匹配（{FRAME_FACE_MATCH_SIMILARITY_HINT}）"
         " → **必须**在 **characters** 字段写规范姓名，"
         "**禁止**在 observation/action 写人名，**禁止**用便衣男/年轻男子/警员等代称代替；",
-        "2. **硬字幕/SRT/subtitle_entries 中的姓名、称呼、关系词、对白内容**（如「二师兄」「老叶」「秦枫」台词）"
+        "2. **硬字幕/SRT/subtitle_entries 中的姓名、称呼、关系词、对白内容**"
         "**不得**用于推断画面人物身份，仅作对白摘录；**禁止**听声/剧情猜说话人；",
-        "3. **人物关系表** 仅用于已写入姓名的**谐音校正**（秦峰→秦枫），"
+        "3. **人物关系表** 仅用于已写入姓名的**写法校正**，"
         "以及**两人姓名均已由面孔匹配写入后**补写明显关系（师徒/父子）；"
         "**禁止**凭职级词、对白内容、关系表名单猜人；",
         f"4. 脸不可辨、仅有背影/侧背、或无法与任一头像匹配 → "
@@ -143,7 +105,7 @@ def build_frame_face_match_batch_hint(
             "**禁止**在脸已清晰可辨时仍用「便衣男(男)」「年轻男子(男)」「警服警官(男)」「警员(男)」等代称敷衍；",
             "仅当脸不可辨、背对镜头、远景模糊、或确实无法与任一头像匹配时，"
             f"才写带服装特征的暂称或「{FRAME_UNKNOWN_CHARACTER_MALE}」「{FRAME_UNKNOWN_CHARACTER_FEMALE}」；",
-            "**禁止**凭硬字幕/SRT 称呼（二师兄、老叶等）猜人名；",
+            "**禁止**凭硬字幕/SRT 称呼猜人名；",
             "**同一人回溯**：后帧面孔匹配为某人后，前序帧仅当**同一身形+同一服装**可确认为同一人时才改规范名；"
             "无法确认是否同一人则保留暂称，**禁止**整批便衣统一替换。",
             "两人姓名均已由面孔匹配（或同一人回溯）写入后，可补明显师徒/父子/上下级等关系词。",
@@ -156,24 +118,14 @@ def _strip_gender_suffix(name: str) -> str:
 
 
 def _canonical_for_name(name: str) -> str:
-    cleaned = _strip_gender_suffix(name)
-    for canonical, aliases in PLOT_BLUEPRINT_NAME_ALIAS_GROUPS:
-        if cleaned == canonical or cleaned in aliases:
-            return canonical
-    return cleaned
+    return _strip_gender_suffix(name)
 
 
 def _name_tokens_for_matching(name: str) -> set[str]:
     cleaned = _strip_gender_suffix(name)
     if not cleaned:
         return set()
-    tokens = {cleaned}
-    for canonical, aliases in PLOT_BLUEPRINT_NAME_ALIAS_GROUPS:
-        if cleaned == canonical or cleaned in aliases:
-            tokens.add(canonical)
-            tokens.update(aliases)
-            break
-    return {token for token in tokens if len(token) >= 2}
+    return {cleaned}
 
 
 def _min_reliable_face_mentions(frame_count: int) -> int:
@@ -363,8 +315,6 @@ def is_character_name_evidence_backed(name: str, evidence_text: str) -> bool:
 
 
 def _default_gender_for_name(name: str) -> str:
-    if name in {"文江燕", "文琴", "赵子怡", "彭含章"}:
-        return "女"
     return "男"
 
 
@@ -389,17 +339,6 @@ def strip_unreliable_names_in_text(
             updated,
         )
 
-    if ref_names:
-        for legacy in sorted(_LEGACY_HALLUCINATED_CHARACTER_NAMES, key=len, reverse=True):
-            if legacy in ref_names or is_character_name_face_backed(legacy, reliable_faces):
-                continue
-            gender = _default_gender_for_name(legacy)
-            updated = updated.replace(f"{legacy}({gender})", FRAME_UNKNOWN_CHARACTER_MALE)
-            updated = re.sub(
-                rf"(?<![\u4e00-\u9fff]){re.escape(legacy)}",
-                "未名人员",
-                updated,
-            )
     return updated
 
 
@@ -450,9 +389,8 @@ def sanitize_segment_character_names(
     kept: list[str] = []
     removed: list[str] = []
     for name in char_list:
-        corrected = correct_name_mistakes_in_text(name)
-        if is_character_name_face_backed(corrected, reliable_faces):
-            kept.append(corrected)
+        if is_character_name_face_backed(name, reliable_faces):
+            kept.append(name)
         else:
             removed.append(name)
 
@@ -854,150 +792,9 @@ def extract_canonical_names_from_text(
     return found
 
 
-def _relation_already_mentioned(text: str, label: str) -> bool:
-    keywords = _RELATION_LABEL_KEYWORDS.get(label, (label,))
-    return any(keyword in (text or "") for keyword in keywords)
-
-
-def find_obvious_relation_for_pair(
-    name_a: str,
-    name_b: str,
-    *,
-    relations: tuple[ObviousCharacterRelation, ...],
-    evidence_text: str = "",
-) -> ObviousCharacterRelation | None:
-    pair = frozenset({name_a, name_b})
-    candidates = [item for item in relations if item.pair_key() == pair]
-    if not candidates:
-        return None
-
-    triggered = [
-        item
-        for item in candidates
-        if item.triggers and any(trigger in evidence_text for trigger in item.triggers)
-    ]
-    if triggered:
-        return min(triggered, key=lambda item: _RELATION_PRIORITY.get(item.label, 99))
-
-    unconditional = [item for item in candidates if not item.triggers]
-    if not unconditional:
-        return None
-    return min(unconditional, key=lambda item: _RELATION_PRIORITY.get(item.label, 99))
-
-
-def enrich_segment_with_obvious_relationships(
-    segment: dict[str, Any],
-    *,
-    relations: tuple[ObviousCharacterRelation, ...],
-    reliable_faces: set[str] | None = None,
-) -> bool:
-    """两人姓名均已由面孔匹配写入时，补充明显关系。"""
-    if not relations or not isinstance(segment, dict):
-        return False
-
-    known_names = {item.a for item in relations} | {item.b for item in relations}
-    action = str(segment.get("action") or "")
-    observation = str(segment.get("observation") or "")
-    combined = f"{action}\n{observation}"
-    present = extract_canonical_names_from_text(combined, known_names=known_names)
-    if reliable_faces:
-        present = {name for name in present if is_character_name_face_backed(name, reliable_faces)}
-    if len(present) < 2:
-        return False
-
-    discovered: list[dict[str, str]] = []
-    present_list = sorted(present)
-    for index, name_a in enumerate(present_list):
-        for name_b in present_list[index + 1 :]:
-            relation = find_obvious_relation_for_pair(
-                name_a,
-                name_b,
-                relations=relations,
-            )
-            if not relation:
-                continue
-            if _relation_already_mentioned(combined, relation.label):
-                continue
-            discovered.append({"a": relation.a, "b": relation.b, "type": relation.label})
-
-    if not discovered:
-        return False
-
-    existing = segment.get("character_relationships")
-    merged: list[dict[str, str]] = []
-    seen: set[tuple[str, str, str]] = set()
-    for item in (existing if isinstance(existing, list) else []) + discovered:
-        if not isinstance(item, dict):
-            continue
-        key = (str(item.get("a") or ""), str(item.get("b") or ""), str(item.get("type") or ""))
-        if key in seen:
-            continue
-        seen.add(key)
-        merged.append({"a": key[0], "b": key[1], "type": key[2]})
-    segment["character_relationships"] = merged
-
-    notes = "；".join(f"{item['a']}与{item['b']}（{item['type']}）" for item in discovered)
-    if notes and f"（{notes}）" not in observation:
-        segment["observation"] = observation.rstrip() + f"（{notes}）"
-    return True
-
-
 def apply_obvious_character_relationships_to_artifact(artifact: dict[str, Any]) -> None:
-    """整份 artifact：对已同时完成面孔匹配的两人补充明显关系。"""
-    if not isinstance(artifact, dict):
-        return
-
-    drama_id = str(artifact.get("drama_id") or "").strip()
-    relations = resolve_obvious_character_relations(drama_id)
-    if not relations:
-        return
-
-    ref_names = {
-        str(item.get("name") or "").strip()
-        for item in (artifact.get("character_references") or [])
-        if isinstance(item, dict) and str(item.get("name") or "").strip()
-    }
-
-    obs_by_batch: dict[int, list[dict[str, Any]]] = {}
-    for observation in artifact.get("frame_observations") or []:
-        if not isinstance(observation, dict):
-            continue
-        batch_index = int(observation.get("batch_index", 0))
-        obs_by_batch.setdefault(batch_index, []).append(observation)
-
-    enriched = 0
-    for segment in artifact.get("scene_segments") or []:
-        if not isinstance(segment, dict):
-            continue
-        batch_index = int(segment.get("batch_index", 0))
-        frames = obs_by_batch.get(batch_index, [])
-        reliable = collect_reliable_face_identified_names(frames, ref_names)
-        if enrich_segment_with_obvious_relationships(
-            segment,
-            relations=relations,
-            reliable_faces=reliable,
-        ):
-            enriched += 1
-
-    for batch in artifact.get("batches") or []:
-        if not isinstance(batch, dict):
-            continue
-        batch_index = int(batch.get("batch_index", 0))
-        frames = [
-            item for item in (batch.get("frame_observations") or []) if isinstance(item, dict)
-        ]
-        reliable = collect_reliable_face_identified_names(frames, ref_names)
-        for segment in batch.get("scene_segments") or []:
-            if not isinstance(segment, dict):
-                continue
-            enrich_segment_with_obvious_relationships(
-                segment,
-                relations=relations,
-                reliable_faces=reliable,
-            )
-
-    if enriched:
-        logger.info(f"抽帧 artifact：已为 {enriched} 条 segment 补充明显人物关系")
+    """通用版不注入剧专属人物关系。"""
+    return
 
 
 def apply_segment_character_consistency_to_artifact(artifact: dict[str, Any]) -> None:

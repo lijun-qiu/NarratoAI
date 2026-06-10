@@ -290,7 +290,7 @@ picture_wrap_double_quotes = true
     narration_chars_min = 20
     narration_chars_max = 40
     default_custom_prompt = "尽量覆盖全片时间线，每 30 秒至少一段解说，不要大段跳过。"
-    default_video_theme = "罚罪2"
+    default_video_theme = ""
     append_custom_prompt = ""
     # 有 SRT 时与抽帧分析交叉验证（对白以字幕为准，表情动作以画面为准）
     enable_subtitle_enrichment = true
@@ -369,7 +369,7 @@ picture_wrap_double_quotes = true
     narration_script_temperature = 0.4
     # 完整规则由 WebUI「自定义提示词」反显（get_compact_custom_prompt_display），此处可留空
     default_custom_prompt = ""
-    default_video_theme = "罚罪2"
+    default_video_theme = ""
     # 本集/本片专属要求，由 WebUI「追加提示词」编辑，叠加在自定义提示词之后
     append_custom_prompt = ""
     require_subtitle_for_script = true
@@ -383,13 +383,13 @@ picture_wrap_double_quotes = true
     subtitle_analysis_short_drama_min_chars = 2000
     subtitle_analysis_short_drama_max_tokens = 8192
     subtitle_analysis_frame_lexicon_chars = 4000
-    # 短剧联合构思：注入剧集人物关系对照（主题含「罚罪」时自动加载 fazu2_relationships.md）
-    enable_subtitle_analysis_drama_knowledge = true
+    # 短剧联合构思：注入剧集人物关系对照（须在下方配置 knowledge 文件路径）
+    enable_subtitle_analysis_drama_knowledge = false
     subtitle_analysis_drama_knowledge_max_chars = 10000
     # 抽帧视觉分析：同样注入人物关系对照（默认关；联合构思仍可单独开启）
     enable_frame_analysis_drama_knowledge = false
     frame_analysis_drama_knowledge_max_chars = 5000
-    # subtitle_analysis_drama_knowledge_file = "app/data/drama_knowledge/fazu2_relationships.md"
+    # subtitle_analysis_drama_knowledge_file = "headImg/作品名/relationships.md"
 
 ##########################################
 # 完美字幕（影视解说：解说 + 原声双轨）
@@ -430,8 +430,21 @@ picture_wrap_double_quotes = true
     original_subtitle_color = "#FFE066"
 
 [video_episode_analysis]
-# 整片视频分析：上传前转码（更清晰默认：640p/CRF28，短片优先 720p/CRF26，单段上限 24MB）
+# 整片视频分析：先整片压缩为 720p 母版，再按切镜逐镜截取上传
 max_upload_mb = 24.0
+upload_transcode_profile = "high"
+# 切段：environment_change=仅场景/布景明显变化；edit_cut=每个硬切都切
+scene_cut_mode = "environment_change"
+scene_candidate_threshold = 0.25
+scene_environment_diff_threshold = 0.18
+scene_frame_sample_before_seconds = 3.0
+scene_frame_sample_after_seconds = 1.0
+scene_min_merge_seconds = 3.0
+scene_min_segment_seconds = 5.0
+scene_max_seconds = 180.0
+# edit_cut 模式才使用
+scene_detect_threshold = 0.35
+# 以下两项保留兼容旧配置，分镜模式下不再按固定时长切段
 chunk_seconds = 300.0
 short_video_high_profile_sec = 300.0
 

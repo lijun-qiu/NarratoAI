@@ -1,7 +1,7 @@
 #!/usr/bin/env python
 # -*- coding: UTF-8 -*-
 
-"""剧集人物注册：剧名目录、人物关系表、头像参照（headImg）。"""
+"""剧集人物注册：作品目录、可选人物关系表、头像参照（headImg）。"""
 
 from __future__ import annotations
 
@@ -12,14 +12,10 @@ from typing import Any
 
 from loguru import logger
 
-from app.data.drama_knowledge.fazu2_upload_roster import (
-    roster_for_drama,
-    roster_groups_for_drama,
-)
-
 _PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
 _HEAD_IMG_DIRNAME = "headImg"
 _SUPPORTED_IMAGE_EXTENSIONS = (".jpg", ".jpeg", ".png", ".webp")
+_KNOWLEDGE_FILENAMES = ("relationships.md", "characters.md")
 
 _CHARACTER_SECTION_RE = re.compile(
     r"^###\s+(?:\d+\.\s*)?([\u4e00-\u9fffA-Za-z·]{2,8})（",
@@ -35,24 +31,17 @@ _CHARACTER_TABLE_RE = re.compile(
 )
 _NON_CHARACTER_HEADERS = frozenset(
     {
-        "秦枫下属",
         "其他",
-        "金鼎集团",
-        "汉洲商会",
-        "儒颂集团",
         "人物",
         "易错点",
     }
 )
 
-DRAMA_CATALOG: dict[str, dict[str, str]] = {
-    "罚罪2": {
-        "label": "罚罪2",
-        "knowledge_file": "app/data/drama_knowledge/fazu2_relationships.md",
-    },
-}
+DRAMA_CATALOG: dict[str, dict[str, str]] = {}
 
-DEFAULT_DRAMA_ID = "罚罪2"
+DEFAULT_DRAMA_ID = ""
+_PATH_FALLBACK_SEGMENT = "default"
+PREDEFINED_DRAMA_ORDER: tuple[str, ...] = ("罚罪2", "罚罪")
 RELATIONSHIP_DIAGRAM_STEM = "_relationship"
 
 
@@ -65,15 +54,50 @@ def head_img_root() -> str:
 
 
 def head_img_dir(drama_id: str) -> str:
-    safe_id = _safe_path_segment(drama_id or DEFAULT_DRAMA_ID)
+    safe_id = _safe_path_segment(drama_id)
     return os.path.join(head_img_root(), safe_id)
 
 
 def list_dramas() -> list[dict[str, str]]:
-    return [
-        {"id": drama_id, "label": meta.get("label") or drama_id}
-        for drama_id, meta in DRAMA_CATALOG.items()
-    ]
+    """扫描 headImg 子目录作为作品列表。"""
+    root = head_img_root()
+    if not os.path.isdir(root):
+        return []
+
+    dramas: list[dict[str, str]] = []
+    for entry in sorted(os.listdir(root)):
+        path = os.path.join(root, entry)
+        if os.path.isdir(path):
+            dramas.append({"id": entry, "label": entry})
+    return dramas
+
+
+def list_drama_select_options() -> list[dict[str, str]]:
+    """作品下拉选项：首项为空占位，其后内置顺序（罚罪2 优先）+ headImg 目录。"""
+    seen: set[str] = set()
+    options: list[dict[str, str]] = [{"id": "", "label": "（请选择作品）"}]
+
+    for drama_id in PREDEFINED_DRAMA_ORDER:
+        if drama_id not in seen:
+            seen.add(drama_id)
+            options.append({"id": drama_id, "label": drama_id})
+
+    try:
+        from app.data.drama_knowledge.fazu2_upload_roster import DRAMA_UPLOAD_ROSTERS
+
+        for drama_id in sorted(DRAMA_UPLOAD_ROSTERS.keys()):
+            if drama_id not in seen:
+                seen.add(drama_id)
+                options.append({"id": drama_id, "label": drama_id})
+    except ImportError:
+        pass
+
+    for item in list_dramas():
+        drama_id = str(item.get("id") or "").strip()
+        if drama_id and drama_id not in seen:
+            seen.add(drama_id)
+            options.append({"id": drama_id, "label": str(item.get("label") or drama_id)})
+    return options
 
 
 def get_drama(drama_id: str) -> dict[str, str] | None:
@@ -81,9 +105,11 @@ def get_drama(drama_id: str) -> dict[str, str] | None:
     if not drama_id:
         return None
     meta = DRAMA_CATALOG.get(drama_id)
-    if not meta:
-        return None
-    return {"id": drama_id, **meta}
+    if meta:
+        return {"id": drama_id, **meta}
+    if os.path.isdir(head_img_dir(drama_id)):
+        return {"id": drama_id, "label": drama_id}
+    return {"id": drama_id, "label": drama_id}
 
 
 def resolve_knowledge_path_for_drama(drama_id: str) -> str:
@@ -91,16 +117,22 @@ def resolve_knowledge_path_for_drama(drama_id: str) -> str:
     if not meta:
         return ""
     rel_path = str(meta.get("knowledge_file") or "").strip()
-    if not rel_path:
-        return ""
-    if os.path.isabs(rel_path):
-        return rel_path
-    return os.path.join(_PROJECT_ROOT, rel_path.replace("/", os.sep))
+    if rel_path:
+        if os.path.isabs(rel_path):
+            return rel_path
+        return os.path.join(_PROJECT_ROOT, rel_path.replace("/", os.sep))
+
+    directory = head_img_dir(drama_id)
+    for filename in _KNOWLEDGE_FILENAMES:
+        candidate = os.path.join(directory, filename)
+        if os.path.isfile(candidate):
+            return candidate
+    return ""
 
 
 def _safe_path_segment(value: str) -> str:
     cleaned = re.sub(r'[<>:"/\\|?*]', "_", (value or "").strip())
-    return cleaned or DEFAULT_DRAMA_ID
+    return cleaned or _PATH_FALLBACK_SEGMENT
 
 
 def _safe_character_filename(name: str) -> str:
@@ -125,11 +157,47 @@ def _load_knowledge_text(drama_id: str) -> str:
         return ""
 
 
+def _discover_character_names_from_directory(drama_id: str) -> list[str]:
+    directory = head_img_dir(drama_id)
+    if not os.path.isdir(directory):
+        return []
+
+    names: list[str] = []
+    seen: set[str] = set()
+    for fname in sorted(os.listdir(directory)):
+        stem, ext = os.path.splitext(fname)
+        if ext.lower() not in _SUPPORTED_IMAGE_EXTENSIONS:
+            continue
+        if stem == RELATIONSHIP_DIAGRAM_STEM or not stem:
+            continue
+        if stem in seen:
+            continue
+        seen.add(stem)
+        names.append(stem)
+    return names
+
+
+def _roster_entries_for_drama(drama_id: str) -> list[dict[str, str]] | None:
+    try:
+        from app.data.drama_knowledge.fazu2_upload_roster import roster_for_drama
+
+        roster = roster_for_drama(drama_id)
+        if roster:
+            return [dict(item) for item in roster]
+    except ImportError:
+        pass
+    return None
+
+
 def list_characters_for_drama(drama_id: str) -> list[str]:
-    """返回剧集头像上传名单；有定制 roster 时优先于 Markdown 解析。"""
-    roster = roster_for_drama(drama_id)
-    if roster:
-        return [str(item.get("name") or "").strip() for item in roster if item.get("name")]
+    """返回作品人物名单：优先已上传头像文件名，其次内置名单/关系表 Markdown。"""
+    discovered = _discover_character_names_from_directory(drama_id)
+    if discovered:
+        return discovered
+
+    roster_entries = _roster_entries_for_drama(drama_id)
+    if roster_entries:
+        return [str(item.get("name") or "").strip() for item in roster_entries if item.get("name")]
 
     content = _load_knowledge_text(drama_id)
     if not content:
@@ -148,10 +216,15 @@ def list_characters_for_drama(drama_id: str) -> list[str]:
 
 
 def list_character_roster_groups(drama_id: str) -> list[dict[str, Any]]:
-    """按频率分级返回上传名单（无 roster 时整表归为 single 组）。"""
-    groups = roster_groups_for_drama(drama_id)
-    if groups:
-        return groups
+    """按频率分级返回上传名单（内置作品用分级表，其余整表归为 single 组）。"""
+    try:
+        from app.data.drama_knowledge.fazu2_upload_roster import roster_groups_for_drama
+
+        roster_groups = roster_groups_for_drama(drama_id)
+        if roster_groups:
+            return roster_groups
+    except ImportError:
+        pass
 
     names = list_characters_for_drama(drama_id)
     if not names:
@@ -177,12 +250,11 @@ def find_head_image_path(drama_id: str, character_name: str) -> str:
 
 def list_character_head_slots(drama_id: str) -> list[dict[str, Any]]:
     """按上传名单返回槽位（含 tier、role_hint、已上传路径）。"""
-    roster = roster_for_drama(drama_id)
-    entries: list[dict[str, str]] = (
-        [dict(item) for item in roster]
-        if roster
-        else [{"name": name, "tier": "", "role_hint": ""} for name in list_characters_for_drama(drama_id)]
-    )
+    roster_entries = _roster_entries_for_drama(drama_id)
+    if roster_entries:
+        entries = roster_entries
+    else:
+        entries = [{"name": name, "tier": "", "role_hint": ""} for name in list_characters_for_drama(drama_id)]
 
     slots: list[dict[str, Any]] = []
     for entry in entries:
@@ -399,7 +471,7 @@ def build_batch_vision_reference_prompt_section(
     if prefix_count <= 0:
         return ""
 
-    work = (drama_label or "本剧").strip()
+    work = (drama_label or "本片").strip()
     lines: list[str] = [
         f"## 视觉参照图（本请求最前 {prefix_count} 张 · **不是视频帧**）",
     ]
@@ -447,7 +519,7 @@ def build_batch_vision_reference_prompt_section(
             )
             image_index += 1
         else:
-            lines.append("以下定妆照按顺序对应剧中人物，**须逐脸对照**关键帧中的面孔：")
+            lines.append("以下定妆照按顺序对应片中人物，**须逐脸对照**关键帧中的面孔：")
             for item in refs:
                 name = str(item.get("name") or "").strip()
                 lines.append(f"- **{name}** — 参照图 #{image_index}")
@@ -494,10 +566,10 @@ def merge_frame_analysis_settings_for_drama(
     *,
     enable_knowledge_text: bool = False,
 ) -> dict[str, Any]:
-    """选中剧集时写入主题；文字关系表仅勾选后注入。"""
+    """选中作品时写入主题；文字关系表仅勾选且存在文件时注入。"""
     merged = dict(settings or {})
-    drama = get_drama(drama_id)
-    if not drama:
+    drama_id = (drama_id or "").strip()
+    if not drama_id:
         return merged
 
     merged["enable_frame_analysis_drama_knowledge"] = bool(enable_knowledge_text)
@@ -506,5 +578,5 @@ def merge_frame_analysis_settings_for_drama(
         if knowledge_path:
             merged["drama_knowledge_file"] = knowledge_path
     merged["selected_drama_id"] = drama_id
-    merged.setdefault("default_video_theme", drama.get("label") or drama_id)
+    merged.setdefault("default_video_theme", drama_id)
     return merged

@@ -64,6 +64,7 @@ from app.services.drama_character_registry import (
     project_root,
     resolve_media_path,
 )
+from app.services.documentary.plot_reference import build_plot_reference_prompt_section
 from app.services.short_drama_drama_knowledge import (
     apply_name_corrections_to_frame_analysis_artifact,
     build_frame_analysis_drama_knowledge_section,
@@ -100,6 +101,7 @@ class DocumentaryFrameExtractionService:
         video_path: str,
         video_theme: str = "",
         custom_prompt: str = "",
+        plot_reference: str = "",
         frame_interval_input: int | float | None = None,
         vision_batch_size: int | None = None,
         vision_llm_provider: str | None = None,
@@ -200,6 +202,7 @@ class DocumentaryFrameExtractionService:
             rotation=rotation,
             batches=batches,
             custom_prompt=custom_prompt,
+            plot_reference=plot_reference,
             video_theme=video_theme,
             max_concurrency=concurrency,
             progress_callback=progress,
@@ -228,6 +231,7 @@ class DocumentaryFrameExtractionService:
             relationship_diagram_path=relationship_diagram_path,
             frame_drama_knowledge_text_enabled=frame_drama_knowledge_text_enabled,
             frame_relationship_diagram_enabled=frame_relationship_diagram_enabled,
+            plot_reference=plot_reference,
             test_mode=test_mode,
             test_max_duration_seconds=resolved_max_duration,
             test_start_time_seconds=resolved_start_time,
@@ -263,6 +267,7 @@ class DocumentaryFrameExtractionService:
         video_path: str = "",
         video_theme: str = "",
         custom_prompt: str = "",
+        plot_reference: str = "",
         vision_llm_provider: str | None = None,
         progress_callback: Callable[[float, str], None] | None = None,
         vision_api_key: str | None = None,
@@ -283,6 +288,7 @@ class DocumentaryFrameExtractionService:
             raise FileNotFoundError(f"抽帧分析文件不存在: {analysis_json_path}")
 
         artifact = pairing_load_analysis_artifact(analysis_json_path)
+        resolved_plot_reference = (plot_reference or str(artifact.get("plot_reference") or "")).strip()
         resolved_drama_id = (drama_id or str(artifact.get("drama_id") or "")).strip()
         enable_knowledge_text = frame_drama_knowledge_text_enabled
         rel_enabled = frame_relationship_diagram_enabled
@@ -388,6 +394,7 @@ class DocumentaryFrameExtractionService:
             rotation=rotation,
             items=retry_items,
             custom_prompt=custom_prompt,
+            plot_reference=resolved_plot_reference,
             video_theme=video_theme,
             max_concurrency=concurrency,
             progress_callback=progress,
@@ -433,6 +440,7 @@ class DocumentaryFrameExtractionService:
             relationship_diagram_path=resolved_relationship,
             frame_drama_knowledge_text_enabled=enable_knowledge_text,
             frame_relationship_diagram_enabled=rel_enabled,
+            plot_reference=resolved_plot_reference,
             test_mode=test_mode,
             test_max_duration_seconds=test_max_duration,
             test_start_time_seconds=test_start_time,
@@ -686,7 +694,8 @@ class DocumentaryFrameExtractionService:
         rotation: VisionModelRotation,
         items: list[tuple[int, list[str], str]],
         custom_prompt: str,
-        video_theme: str,
+        plot_reference: str = "",
+        video_theme: str = "",
         max_concurrency: int,
         progress_callback: Callable[[float, str], None],
         documentary_settings: dict | None = None,
@@ -715,6 +724,7 @@ class DocumentaryFrameExtractionService:
                 frame_count=len(frame_paths),
                 video_theme=video_theme,
                 custom_prompt=custom_prompt,
+                plot_reference=plot_reference,
                 documentary_settings=doc_settings,
                 time_range=time_range,
                 subtitle_content=subtitle_content,
@@ -1055,6 +1065,7 @@ class DocumentaryFrameExtractionService:
         rotation: VisionModelRotation,
         batches: list[list[str]],
         custom_prompt: str,
+        plot_reference: str = "",
         video_theme: str,
         max_concurrency: int,
         progress_callback: Callable[[float, str], None],
@@ -1091,6 +1102,7 @@ class DocumentaryFrameExtractionService:
                 frame_count=len(frame_paths),
                 video_theme=video_theme,
                 custom_prompt=custom_prompt,
+                plot_reference=plot_reference,
                 documentary_settings=doc_settings,
                 time_range=time_range,
                 subtitle_content=subtitle_content,
@@ -1171,6 +1183,7 @@ class DocumentaryFrameExtractionService:
         frame_count: int,
         video_theme: str,
         custom_prompt: str,
+        plot_reference: str = "",
         documentary_settings: dict | None = None,
         time_range: str = "",
         subtitle_content: str = "",
@@ -1262,13 +1275,16 @@ class DocumentaryFrameExtractionService:
             if dialogue:
                 extra_lines.append(
                     f"本批次时间范围 {time_range} 附近字幕对白（分析画面时请对照，不要虚构台词；"
-                    f"出现的小名/昵称/关系称呼如老叶、小跃、师傅等须原样使用）：{dialogue}"
+                    f"出现的小名/昵称/关系称呼须原样使用）：{dialogue}"
                 )
         extra_lines.append(
             "scene_segments 若含 subtitle_entries（每项 start/end/text），其中 text 为**原片字幕逐条原文**；"
             "characters 中的人名须由本批可见面孔与定妆照匹配；observation/action 禁止写人名；"
-            "二者可同时成立（如字幕「老叶」+ 拼图识别叶天佑与楚青桐）；勿改写 subtitle_entries 原文。"
+            "硬字幕对白与面孔匹配的人名可同时成立；勿改写 subtitle_entries 原文。"
         )
+        plot_section = build_plot_reference_prompt_section(plot_reference)
+        if plot_section.strip():
+            extra_lines.append(plot_section.strip())
         if (video_theme or "").strip():
             extra_lines.append(f"视频主题：{video_theme.strip()}")
         if (custom_prompt or "").strip():
@@ -1344,6 +1360,7 @@ class DocumentaryFrameExtractionService:
         relationship_diagram_path: str = "",
         frame_drama_knowledge_text_enabled: bool = False,
         frame_relationship_diagram_enabled: bool = False,
+        plot_reference: str = "",
         test_mode: bool = False,
         test_max_duration_seconds: float | None = None,
         test_start_time_seconds: float = 0.0,
@@ -1416,6 +1433,8 @@ class DocumentaryFrameExtractionService:
         }
         if drama_id:
             artifact["drama_id"] = drama_id
+        if (plot_reference or "").strip():
+            artifact["plot_reference"] = (plot_reference or "").strip()
         artifact["frame_drama_knowledge_text_enabled"] = bool(frame_drama_knowledge_text_enabled)
         artifact["frame_relationship_diagram_enabled"] = bool(frame_relationship_diagram_enabled)
         cfg = documentary_settings or get_documentary_settings()

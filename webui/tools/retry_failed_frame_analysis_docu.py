@@ -15,7 +15,6 @@ from app.services.documentary.documentary_settings import (
 from app.services.documentary.frame_analysis_pairing import load_analysis_artifact
 from app.services.documentary.frame_extraction_service import DocumentaryFrameExtractionService
 from app.services.drama_character_registry import (
-    DEFAULT_DRAMA_ID,
     merge_frame_analysis_settings_for_drama,
     resolve_active_relationship_diagram_path,
     resolve_character_references,
@@ -111,8 +110,11 @@ def retry_failed_frame_analysis_docu(
         drama_id = str(
             st.session_state.get("doc_frame_drama_id")
             or artifact.get("drama_id")
-            or DEFAULT_DRAMA_ID
+            or ""
         ).strip()
+        if not drama_id:
+            st.error("请先在素材预处理区域选择作品名称")
+            return
         enable_knowledge_text = bool(st.session_state.get("doc_frame_enable_drama_knowledge_text"))
         enable_relationship_diagram = bool(st.session_state.get("doc_frame_enable_relationship_diagram"))
         doc_settings = dict(doc_settings)
@@ -151,6 +153,7 @@ def retry_failed_frame_analysis_docu(
                     video_path=video_path,
                     video_theme=video_theme,
                     custom_prompt=st.session_state.get("custom_prompt", ""),
+                    plot_reference=st.session_state.get("doc_plot_reference", ""),
                     vision_llm_provider=vision_llm_provider,
                     progress_callback=update_progress,
                     vision_api_key=vision_api_key,

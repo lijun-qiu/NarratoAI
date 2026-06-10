@@ -1,13 +1,12 @@
 #!/usr/bin/env python
 # -*- coding: UTF-8 -*-
 
-"""短剧解说：剧集人物关系知识库（分析前须熟悉）。"""
+"""剧集人物关系知识库：仅当配置显式指定文件路径时注入，不自动匹配剧名。"""
 
 from __future__ import annotations
 
 import os
 import re
-from dataclasses import dataclass
 from functools import lru_cache
 from typing import Any
 
@@ -19,12 +18,6 @@ from app.services.documentary.documentary_settings import (
 )
 
 _PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
-
-_DEFAULT_KNOWLEDGE_BY_THEME: tuple[tuple[str, str], ...] = (
-    ("罚罪2", "app/data/drama_knowledge/fazu2_relationships.md"),
-    ("罚罪", "app/data/drama_knowledge/fazu2_relationships.md"),
-    ("fazu", "app/data/drama_knowledge/fazu2_relationships.md"),
-)
 
 _NAME_SECTION_RE = re.compile(
     r"^###\s+(?:\d+\.\s*)?([\u4e00-\u9fffA-Za-z·]{2,6})（",
@@ -39,76 +32,9 @@ _NAME_TABLE_RE = re.compile(
     re.MULTILINE,
 )
 
-# 常见张冠李戴 / 错别字（左为错误写法）
-COMMON_NAME_MISTAKES: tuple[tuple[str, str, str], ...] = (
-    ("胡小月", "胡小跃", "胡小跃是男刑警，叶天佑弟子，非「胡小月」"),
-    ("胡晓月", "胡小跃", "同上"),
-    ("小月", "小跃", "胡小跃简称应为小跃"),
-    ("秦峰", "秦枫", "男一号秦枫，禁止写秦峰"),
-    ("罗伯", "罗博", "马金手下罗博，禁止写罗伯"),
-)
 
-# 构思蓝图：规范名 + 常见谐音/ASR/简称（均视为同一人，勿拆成两个角色）
-PLOT_BLUEPRINT_NAME_ALIAS_GROUPS: tuple[tuple[str, tuple[str, ...]], ...] = (
-    ("胡小跃", ("胡小月", "胡晓月", "小月", "小跃", "胡队")),
-    ("秦枫", ("秦峰", "峰啊")),
-    ("罗博", ("罗伯",)),
-    ("叶天佑", ("老叶", "叶局")),
-    ("麦洪超", ("麦队",)),
-    ("彭含章", ("彭姐",)),
-    ("文琴", ("文妈",)),
-)
-
-
-@dataclass(frozen=True)
-class ObviousCharacterRelation:
-    """两人姓名均已写入时可补充的固定关系（不可用于猜第三人）。"""
-
-    a: str
-    b: str
-    label: str
-    triggers: tuple[str, ...] = ()
-
-    def pair_key(self) -> frozenset[str]:
-        return frozenset({self.a, self.b})
-
-
-# 《罚罪2》明显关系：仅当 action/observation 中已同时出现两人姓名时才可补充
-FAZU2_OBVIOUS_CHARACTER_RELATIONS: tuple[ObviousCharacterRelation, ...] = (
-    ObviousCharacterRelation("叶天佑", "秦枫", "师徒"),
-    ObviousCharacterRelation("叶天佑", "胡小跃", "师徒"),
-    ObviousCharacterRelation("叶天佑", "麦洪超", "师徒"),
-    ObviousCharacterRelation("胡小跃", "秦枫", "师兄弟"),
-    ObviousCharacterRelation("胡小跃", "麦洪超", "师兄弟"),
-    ObviousCharacterRelation("秦枫", "麦洪超", "师兄弟"),
-    ObviousCharacterRelation("文琴", "刘天也", "母子"),
-    ObviousCharacterRelation("文琴", "秦枫", "养母子"),
-    ObviousCharacterRelation("文琴", "文江燕", "母女"),
-    ObviousCharacterRelation("秦立志", "秦枫", "父子"),
-    ObviousCharacterRelation("刘天也", "文江燕", "兄妹"),
-    ObviousCharacterRelation("秦枫", "文江燕", "兄妹"),
-    ObviousCharacterRelation("秦枫", "刘天也", "养兄弟"),
-    ObviousCharacterRelation("赵鹏", "赵子怡", "兄妹"),
-    ObviousCharacterRelation("赵子怡", "刘天也", "夫妻"),
-    ObviousCharacterRelation("楚青桐", "叶天佑", "上下级", ("厅", "省厅", "副厅长", "上级", "领导")),
-    ObviousCharacterRelation("楚青桐", "叶天佑", "至交"),
-    ObviousCharacterRelation("叶天佑", "严明", "上下级"),
-    ObviousCharacterRelation("叶天佑", "彭含章", "上下级"),
-    ObviousCharacterRelation("叶天佑", "钟雁宁", "上下级"),
-    ObviousCharacterRelation("胡小跃", "汪涛", "上下级"),
-    ObviousCharacterRelation("胡小跃", "杨振刚", "上下级"),
-    ObviousCharacterRelation("秦枫", "汪涛", "上下级"),
-    ObviousCharacterRelation("秦枫", "杨振刚", "上下级"),
-)
-
-_FAZU2_DRAMA_IDS = frozenset({"罚罪2", "罚罪", "fazu"})
-
-
-def resolve_obvious_character_relations(drama_id: str) -> tuple[ObviousCharacterRelation, ...]:
-    if (drama_id or "").strip().lower() in {item.lower() for item in _FAZU2_DRAMA_IDS} or (
-        drama_id or ""
-    ).strip() in _FAZU2_DRAMA_IDS:
-        return FAZU2_OBVIOUS_CHARACTER_RELATIONS
+def resolve_obvious_character_relations(drama_id: str) -> tuple:
+    """通用版不维护剧专属人物关系表。"""
     return ()
 
 
@@ -118,7 +44,7 @@ def build_plot_blueprint_character_relationship_table_section(
     *,
     use_video_episode_analysis: bool = False,
 ) -> tuple[str, set[str]]:
-    """构思蓝图：注入文字版人物关系表（完整 Markdown，与视频分析/字幕联合分析）。"""
+    """构思蓝图：注入文字版人物关系表（须配置 knowledge 文件路径）。"""
     if not _is_subtitle_analysis_enabled(settings):
         return "", set()
 
@@ -134,12 +60,11 @@ def build_plot_blueprint_character_relationship_table_section(
     material_ref = "整片视频分析" if use_video_episode_analysis else "字幕/抽帧"
     header = f"""## 人物关系表（文字 · **分析前必读** · 与{material_ref}联合分析）
 
-以下为 **{work}** 官方人物关系表，请**先通读本表**再写「主要人物表」与时间线：
+以下为 **{work}** 人物关系表，请**先通读本表**再写「主要人物表」与时间线：
 - 写蓝图时须**同时对照**本表、{material_ref} 与字幕，交叉验证人名/关系/阵营
 - {material_ref}出现的人名须能在本表中找到对应身份与关系
-- **谐音/ASR 错字须归并为同一人**（小月/胡小月/胡晓月→胡小跃，秦峰→秦枫，罗伯→罗博，老叶→叶天佑）
-- **禁止张冠李戴**：勿把 A 的台词、遭遇、关系写成 B（如秦枫≠刘天也，文江燕是刘天也妹妹）
-- **关系须与本表一致**：三兄妹为秦枫、刘天也、文江燕；叶天佑是局长、秦枫/胡小跃/麦洪超的师傅"""
+- **禁止张冠李戴**：勿把 A 的台词、遭遇、关系写成 B
+- **关系须与本表一致**；硬字幕简称须与对照表核对后再写入人物表"""
     return _build_drama_knowledge_block(
         theme=theme,
         settings=settings,
@@ -150,24 +75,8 @@ def build_plot_blueprint_character_relationship_table_section(
 
 
 def build_frame_obvious_relationship_hint(drama_id: str = "") -> str:
-    """抽帧 prompt：已写入姓名的两人之间可补明显关系。"""
-    relations = resolve_obvious_character_relations(drama_id)
-    if not relations:
-        return ""
-    samples = "；".join(
-        f"{item.a}↔{item.b}（{item.label}）"
-        for item in relations[:8]
-    )
-    return "\n".join(
-        [
-            "## 人物关系补充（仅两人姓名已写入时）",
-            "当 observation/action 中**已同时出现**两名角色的规范姓名（**均来自本批定妆照/头像面孔匹配**）时，"
-            "可对照关系表在描述中补写明显关系词（师徒/父子/母子/兄妹/上下级/夫妻等）；"
-            "**禁止**凭硬字幕/SRT 称呼（二师兄、老叶等）、对白职级词或关系表名单推断人名。",
-            f"常见固定关系示例：{samples}…",
-            "subtitle_entries 原文仍须保持字幕原样，关系词只写在 observation/action 侧。",
-        ]
-    )
+    """抽帧 prompt：已写入姓名的两人之间可补明显关系（通用版无预设关系）。"""
+    return ""
 
 
 def _resolve_knowledge_path(theme: str, settings: dict[str, Any] | None) -> str:
@@ -181,11 +90,6 @@ def _resolve_knowledge_path(theme: str, settings: dict[str, Any] | None) -> str:
         if os.path.isabs(explicit):
             return explicit
         return os.path.join(_PROJECT_ROOT, explicit.replace("/", os.sep))
-
-    theme_text = (theme or "").strip().lower()
-    for keyword, rel_path in _DEFAULT_KNOWLEDGE_BY_THEME:
-        if keyword.lower() in theme_text:
-            return os.path.join(_PROJECT_ROOT, rel_path.replace("/", os.sep))
     return ""
 
 
@@ -195,7 +99,7 @@ def _is_subtitle_analysis_enabled(settings: dict[str, Any] | None) -> bool:
         return False
     if cfg.get("enable_drama_knowledge") is False:
         return False
-    return True
+    return bool(_resolve_knowledge_path("", cfg))
 
 
 def _is_frame_analysis_enabled(settings: dict[str, Any] | None) -> bool:
@@ -206,7 +110,7 @@ def _is_frame_analysis_enabled(settings: dict[str, Any] | None) -> bool:
     if frame_flag is False:
         return False
     if frame_flag is True:
-        return True
+        return bool(_resolve_knowledge_path("", cfg))
     return False
 
 
@@ -272,7 +176,7 @@ def build_short_drama_drama_knowledge_section(
 ) -> tuple[str, set[str]]:
     """
     返回 (注入 prompt 的 Markdown 块, 知识库人物名集合)。
-    无匹配知识库时返回 ("", set())。
+    无配置知识库路径时返回 ("", set())。
     """
     if not _is_subtitle_analysis_enabled(settings):
         return "", set()
@@ -291,10 +195,8 @@ def build_short_drama_drama_knowledge_section(
 
 以下为 **{work}** 官方人物关系与身份，请**先通读本节**再写「主要人物表」与时间线：
 - {material_ref}出现的人名须在本对照或下方「{visual_ref}」中可对应
-- **谐音/ASR 错字须归并为同一人**（小月/胡小月/胡晓月→胡小跃，秦峰→秦枫，罗伯→罗博，老叶→叶天佑）；人物表每人只列规范名一条
-- **禁止张冠李戴**：勿把 A 的台词、遭遇、关系写成 B（如秦枫≠刘天也，文江燕是刘天也妹妹）
-- **关系须准确**：三兄妹为秦枫、刘天也、文江燕（文琴养子女）；叶天佑是局长、秦枫/胡小跃/麦洪超的师傅
-- 硬字幕简称（如老叶）须与对照表核对后再写入人物表"""
+- **禁止张冠李戴**：勿把 A 的台词、遭遇、关系写成 B
+- 硬字幕简称须与对照表核对后再写入人物表"""
     return _build_drama_knowledge_block(
         theme=theme,
         settings=settings,
@@ -308,7 +210,7 @@ def build_frame_analysis_drama_knowledge_section(
     theme: str,
     settings: dict[str, Any] | None = None,
 ) -> tuple[str, set[str]]:
-    """抽帧视觉分析：注入精简版人物关系对照（与联合构思共用同一 md 源文件）。"""
+    """抽帧视觉分析：注入精简版人物关系对照（须配置 knowledge 文件路径）。"""
     if not _is_frame_analysis_enabled(settings):
         return "", set()
 
@@ -322,9 +224,7 @@ def build_frame_analysis_drama_knowledge_section(
 - **唯一写名途径**：本批画面中脸与头像/定妆照一致（≥1 帧匹配）→ 写规范姓名；或后帧匹配后，前序**同一身形+同一服装**可确认同一人时回溯写名
 - **硬字幕/SRT** 仅摘录对白；**禁止**凭称呼猜人，也**禁止**整批便衣统一替换
 - 面孔无法匹配任一头像 → 「{FRAME_UNKNOWN_CHARACTER_MALE}」「{FRAME_UNKNOWN_CHARACTER_FEMALE}」或便衣/警员等可见描述
-- **两人姓名均已由面孔匹配写入**时，可补明显关系（师徒/父子/上下级等）
-- **谐音校正**（仅对已写入姓名）：胡小月/小月→胡小跃；秦峰→秦枫；罗伯→罗博
-- **勿混**：叶天佑/老叶（局长）≠ 伟业；秦枫≠刘天也；文江燕是刘天也亲妹妹"""
+- **两人姓名均已由面孔匹配写入**时，可补明显关系（师徒/父子/上下级等）"""
     return _build_drama_knowledge_block(
         theme=theme,
         settings=settings,
@@ -335,13 +235,8 @@ def build_frame_analysis_drama_knowledge_section(
 
 
 def find_name_mistakes_in_text(text: str) -> list[str]:
-    """检测构思输出中的常见人名/关系笔误。"""
-    content = text or ""
-    issues: list[str] = []
-    for wrong, correct, hint in COMMON_NAME_MISTAKES:
-        if wrong in content and wrong != correct:
-            issues.append(f"出现错误写法「{wrong}」，应为「{correct}」——{hint}")
-    return issues
+    """通用版不维护剧专属人名纠错表。"""
+    return []
 
 
 def build_plot_blueprint_name_unification_section(
@@ -351,28 +246,11 @@ def build_plot_blueprint_name_unification_section(
     use_video_episode_analysis: bool = False,
 ) -> str:
     """构思蓝图：整片视频分析/抽帧与字幕谐音、ASR 错字、简称归并为同一人物。"""
-    path = _resolve_knowledge_path(theme, settings)
-    if not path and not any(
-        keyword in (theme or "").lower() for keyword, _ in _DEFAULT_KNOWLEDGE_BY_THEME
-    ):
-        source_hint = (
-            "整片视频分析 important_dialogues / involved_characters"
-            if use_video_episode_analysis
-            else "抽帧 subtitle_entries、硬字幕、observation"
-        )
-        lines = [
-            "## 人名谐音/简称归并（硬性）",
-            f"- {source_hint} 中的**谐音/ASR 错字/简称**，"
-            "若明显指同一人，须**归并为同一角色**，人物表只列一条",
-            "- 人物表、时间线、OST 清单用**规范全名**；引用原声台词时可保留 SRT 原文",
-            "- **禁止**因写法不同拆成两个角色（如「小月」与「胡小跃」不得各占一行）",
-        ]
-        return "\n".join(lines)
-
-    alias_lines = [
-        f"- **{canonical}** ← {(' / '.join(aliases))}"
-        for canonical, aliases in PLOT_BLUEPRINT_NAME_ALIAS_GROUPS
-    ]
+    source_hint = (
+        "整片视频分析 important_dialogues / involved_characters"
+        if use_video_episode_analysis
+        else "抽帧 subtitle_entries、硬字幕、observation"
+    )
     index_label = (
         "整片视频分析人物索引"
         if use_video_episode_analysis
@@ -382,60 +260,30 @@ def build_plot_blueprint_name_unification_section(
     return "\n".join(
         [
             "## 人名谐音/ASR 归并（硬性 · 同一人）",
-            f"分析{visual_source}与字幕索引时，下列写法**一律视为同一人**；"
-            "**主要人物表只写规范名一条**，括号内可注「又名/字幕常写：…」：",
-            *alias_lines,
-            "- **叶天佑（老叶）≠ 伟业**：不同人物，禁止合并",
-            "- **秦枫 ≠ 刘天也 ≠ 文江燕**：禁止因关系相近而合并",
-            "- 时间线、OST 清单、叙事顺序中的**说话人/当事人**须用**规范名**（以「"
-            + index_label
-            + "」为准）；「建议保留原声」条目内**台词原文**可保留 SRT 原字（如「小月」）",
-            f"- {visual_source} 与 SRT 人名冲突时：以**{index_label} + 关系对照表**归并到同一人，勿新增虚构角色",
+            f"分析{visual_source}与字幕索引时，**谐音/ASR 错字/简称**若明显指同一人，"
+            "须**归并为同一角色**，人物表只列一条规范全名；",
+            f"- {source_hint} 与 SRT 人名冲突时：以**{index_label} + 关系对照表**归并到同一人，勿新增虚构角色",
+            "- 时间线、OST 清单、叙事顺序中的**说话人/当事人**须用**规范名**；"
+            "「建议保留原声」条目内**台词原文**可保留 SRT 原字",
+            "- **禁止**因写法不同拆成两个角色",
         ]
     )
 
 
 def correct_name_mistakes_in_text(text: str) -> str:
-    """将文本中的常见人名笔误替换为规范写法。"""
-    corrected = text or ""
-    if not corrected:
-        return corrected
-    for wrong, correct, _ in COMMON_NAME_MISTAKES:
-        if wrong and wrong != correct:
-            corrected = corrected.replace(wrong, correct)
-    return corrected
+    """通用版不做剧专属人名替换。"""
+    return text or ""
 
 
 def apply_name_corrections_to_segment(segment: dict[str, Any]) -> None:
-    """就地修正 scene_segment 各字段中的常见人名笔误（字幕字段保持 SRT 原文）。"""
-    if not isinstance(segment, dict):
-        return
-    for key in ("scene", "observation", "action", "emotion", "key_visual"):
-        value = segment.get(key)
-        if isinstance(value, str) and value.strip():
-            segment[key] = correct_name_mistakes_in_text(value)
+    """通用版不修改 segment 人名。"""
+    return
 
 
 def apply_name_corrections_to_observation(observation: dict[str, Any]) -> None:
-    if not isinstance(observation, dict):
-        return
-    value = observation.get("observation")
-    if isinstance(value, str) and value.strip():
-        observation["observation"] = correct_name_mistakes_in_text(value)
+    return
 
 
 def apply_name_corrections_to_frame_analysis_artifact(artifact: dict[str, Any]) -> None:
-    """抽帧 artifact 完成后：统一修正 scene_segments / frame_observations 中的人名笔误。"""
-    if not isinstance(artifact, dict):
-        return
-    for segment in artifact.get("scene_segments") or []:
-        apply_name_corrections_to_segment(segment)
-    for batch in artifact.get("batches") or []:
-        if not isinstance(batch, dict):
-            continue
-        for segment in batch.get("scene_segments") or []:
-            apply_name_corrections_to_segment(segment)
-        for observation in batch.get("frame_observations") or []:
-            apply_name_corrections_to_observation(observation)
-    for observation in artifact.get("frame_observations") or []:
-        apply_name_corrections_to_observation(observation)
+    """通用版抽帧 artifact 不做剧专属人名后处理。"""
+    return

@@ -1494,8 +1494,13 @@ def build_plot_blueprint_material_principles(
         if use_video_episode_analysis
         else "每个场景描述须能在抽帧与字幕中找到依据；禁止编造未支持的情节"
     )
+    subtitle_ref = (
+        "SRT 字幕"
+        if has_srt_subtitle
+        else ("对白线索（整片视频分析）" if use_video_episode_analysis else "对白线索（抽帧）")
+    )
     return f"""## 蓝图目标（硬性）
-- **主任务**：结合**人物关系表 + SRT 字幕 + {("整片视频分析" if use_video_episode_analysis else "抽帧摘要")}**，对**整段视频**做**场景分段**，并**详细描述每个场景发生的事**
+- **主任务**：结合**人物关系表（若有） + {subtitle_ref} + {("整片视频分析" if use_video_episode_analysis else "抽帧摘要")}**，对**整段视频**做**场景分段**，并**详细描述每个场景发生的事**
 - **不是**写 OST 清单或成片剪辑顺序；后者在后续「生成脚本 JSON」步骤再做
 
 ## 素材优先级

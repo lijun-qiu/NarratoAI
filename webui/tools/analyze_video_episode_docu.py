@@ -12,7 +12,6 @@ from app.services.documentary.video_episode_analysis import (
     default_video_episode_analysis_path,
 )
 from app.services.drama_character_registry import (
-    DEFAULT_DRAMA_ID,
     get_drama,
     resolve_active_relationship_diagram_path,
     resolve_character_references,
@@ -59,9 +58,12 @@ def analyze_video_episode_docu(params, *, resume: bool = True, output_path: str 
             st.error("请先选择有效的视频文件")
             return
 
-        drama_id = str(st.session_state.get("doc_frame_drama_id") or DEFAULT_DRAMA_ID).strip()
+        drama_id = str(st.session_state.get("doc_frame_drama_id") or "").strip()
+        if not drama_id:
+            st.error("请先在素材预处理区域选择作品名称")
+            return
         drama_meta = get_drama(drama_id)
-        drama_title = str((drama_meta or {}).get("label") or drama_id or DEFAULT_DRAMA_ID).strip()
+        drama_title = str((drama_meta or {}).get("label") or drama_id).strip()
         selected_names = set(st.session_state.get("doc_frame_selected_character_names") or [])
         character_references = (
             st.session_state.get("doc_frame_character_references")
@@ -94,6 +96,7 @@ def analyze_video_episode_docu(params, *, resume: bool = True, output_path: str 
                 progress_callback=update_progress,
                 output_path=(output_path or "").strip() or None,
                 resume=resume,
+                plot_reference=st.session_state.get("doc_plot_reference", ""),
             )
         )
 

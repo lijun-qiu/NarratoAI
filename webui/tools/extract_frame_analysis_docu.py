@@ -19,7 +19,6 @@ from app.services.documentary.frame_analysis_pairing import (
 )
 from app.services.documentary.frame_extraction_service import DocumentaryFrameExtractionService
 from app.services.drama_character_registry import (
-    DEFAULT_DRAMA_ID,
     merge_frame_analysis_settings_for_drama,
     resolve_active_relationship_diagram_path,
     resolve_character_references,
@@ -131,7 +130,10 @@ def extract_frame_analysis_docu(
                     st.session_state.get("doc_enable_subtitle_enrichment")
                 )
 
-            drama_id = str(st.session_state.get("doc_frame_drama_id") or DEFAULT_DRAMA_ID).strip()
+            drama_id = str(st.session_state.get("doc_frame_drama_id") or "").strip()
+            if not drama_id:
+                st.error("请先在素材预处理区域选择作品名称")
+                return
             enable_knowledge_text = bool(st.session_state.get("doc_frame_enable_drama_knowledge_text"))
             enable_relationship_diagram = bool(st.session_state.get("doc_frame_enable_relationship_diagram"))
             doc_settings = dict(doc_settings)
@@ -222,6 +224,7 @@ def extract_frame_analysis_docu(
                     video_path=params.video_origin_path,
                     video_theme=video_theme,
                     custom_prompt=st.session_state.get("custom_prompt", ""),
+                    plot_reference=st.session_state.get("doc_plot_reference", ""),
                     frame_interval_input=frame_interval_input,
                     vision_batch_size=vision_batch_size,
                     vision_llm_provider=vision_llm_provider,

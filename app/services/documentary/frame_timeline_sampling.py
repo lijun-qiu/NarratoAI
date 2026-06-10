@@ -1162,7 +1162,7 @@ def build_frame_subtitle_lexicon_markdown(
         "## 抽帧字幕人物索引（只读 · 对白与称呼以此为准）",
         "- **出现人物（据抽帧 action 标注）**："
         + ("、".join(names) if names else "（未识别到具名人物）"),
-        "- **对白/称呼须与下方摘录一致**：含全名、小名、昵称、关系称呼（老叶、小跃、师傅等）",
+        "- **对白/称呼须与下方摘录一致**：含全名、小名、昵称、关系称呼",
     ]
     lines.append("- **对白摘录（按时间均匀采样）**：")
     for snippet in sampled:

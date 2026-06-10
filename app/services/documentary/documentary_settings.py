@@ -95,7 +95,7 @@ DOCUMENTARY_DEFAULTS: Dict[str, Any] = {
     "narration_script_max_tokens": 16000,
     "narration_script_temperature": 0.4,
     # WebUI「视频主题」默认值
-    "default_video_theme": "罚罪2",
+    "default_video_theme": "",
     # 叠加在自定义提示词之后的本集/本片专属要求
     "append_custom_prompt": "",
 }
@@ -175,7 +175,7 @@ DOCUMENTARY_COMPACT_OVERRIDES: Dict[str, Any] = {
     "transition_hook_template": "故事，得从头讲起。",
     "closing_hook_template": "宝子们，我们下期再见！",
     "default_custom_prompt": "",
-    "default_video_theme": "罚罪2",
+    "default_video_theme": "",
     "append_custom_prompt": "",
     # 逐帧精剪：生成脚本前必须有字幕，并完成字幕×抽帧对照分析
     "require_subtitle_for_script": True,
@@ -477,22 +477,16 @@ def build_frame_character_naming_hint(settings: Optional[Dict[str, Any]] = None)
     cfg = settings or get_documentary_settings()
     hints: list[str] = [
         f"人名/称呼写入：**仅**本批可见面孔与定妆照/头像对照匹配时可写规范姓名（{FRAME_FACE_MATCH_SIMILARITY_HINT}）；",
-        "硬字幕/SRT/subtitle_entries 中的姓名、称呼（老叶、二师兄、叶局等）**不得**用于推断画面人物；",
+        "硬字幕/SRT/subtitle_entries 中的姓名、称呼**不得**用于推断画面人物；",
         "关系表/关系图**不能**作为猜人依据；",
         "**两人姓名均已由面孔匹配写入**时，可补明显师徒/父子/上下级等关系词；",
         "subtitle_entries 须**原样**摘录对白原文（含 ASR 错字）；无面孔匹配时写带特征的暂称或未名人员；",
         "后帧头像匹配成功后，前序帧仅当**同一身形+同一服装**可确认同一人时才回溯写规范名，否则保留暂称；",
         f"无法完成头像匹配时，characters 不写该项或用暂称；描述文本用「{FRAME_UNKNOWN_CHARACTER_MALE}」等仅当必要，"
         f"**禁止**用「领导」「警员」「男子A」等泛称作姓名；",
-        "只允许在 characters 写**已上传头像名单内**、且本批面孔匹配成功的规范姓名；"
-        "禁止写名单外旧称（如伟业、老叶等历史解说剧本人名）。",
+        "只允许在 characters 写**已上传头像名单内**、且本批面孔匹配成功的规范姓名；",
         "observation/action/key_visual **禁止写姓名(男/女)**，人名只进 characters 数组。",
     ]
-    if is_fazu2_compact_settings(cfg):
-        hints.append(
-            "示例：observation「楼顶天台，并肩对峙，阴天冷色调」，characters: [\"叶天佑\"]；"
-            f"另一人无法匹配时不写入 characters，描述可用服装特征暂称。"
-        )
     return " ".join(hints)
 
 
@@ -510,10 +504,6 @@ def build_frame_gender_hint(settings: Optional[Dict[str, Any]] = None) -> str:
         "observation/action/key_visual 只写地点、动作、光线，**禁止写姓名(男/女)或代称**；",
         "同一批次内同一人物的性别须前后一致；仅见背影/侧脸无法确认时标「不明」，勿猜测。",
     ]
-    if is_fazu2_compact_settings(cfg):
-        reference = build_fazu2_frame_character_gender_reference()
-        if reference:
-            hints.append(reference)
     return " ".join(hints)
 
 

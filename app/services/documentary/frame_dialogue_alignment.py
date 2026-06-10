@@ -69,8 +69,6 @@ def _resolve_reference_names(artifact: dict[str, Any]) -> set[str]:
 
 
 def _default_gender_for_name(name: str) -> str:
-    if name in {"文江燕", "文琴", "赵子怡", "彭含章"}:
-        return "女"
     return "男"
 
 
@@ -204,7 +202,7 @@ def fix_listener_speaker_confusion_in_observation(observation: str, *, has_subti
                 obs = obs.replace(cue, "静听")
 
     if has_subtitle and is_listener and _SUBTITLE_LISTENER_NOTE not in obs:
-        if "秦枫" in obs and not any(cue in obs for cue in ("说话", "开口", "语带", "挥手")):
+        if not any(cue in obs for cue in ("说话", "开口", "语带", "挥手")):
             obs = f"{obs}{_SUBTITLE_LISTENER_NOTE}"
 
     return obs

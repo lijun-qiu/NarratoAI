@@ -82,6 +82,7 @@ TIER_LABELS: dict[str, str] = {
 TIER_ORDER: tuple[str, ...] = ("core", "medium", "low")
 
 DRAMA_UPLOAD_ROSTERS: dict[str, tuple[dict[str, str], ...]] = {
+    "罚罪": FAZU2_CHARACTER_UPLOAD_ROSTER,
     "罚罪2": FAZU2_CHARACTER_UPLOAD_ROSTER,
 }
 

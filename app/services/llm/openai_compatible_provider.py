@@ -276,9 +276,19 @@ class OpenAICompatibleVisionProvider(_OpenAICompatibleBase, VisionModelProvider)
             for item in (kwargs.get("reference_image_paths") or [])
             if str(item).strip()
         ]
+        scene_index = kwargs.get("scene_index")
+        scene_total = kwargs.get("scene_total")
+        scene_prefix = ""
+        if scene_index and scene_total:
+            scene_prefix = f"第 {int(scene_index)}/{int(scene_total)} 镜 · "
+        elif scene_index:
+            scene_prefix = f"第 {int(scene_index)} 镜 · "
+        time_range = str(kwargs.get("scene_time_range") or "").strip()
+        range_suffix = f" · {time_range}" if time_range else ""
         logger.info(
-            f"视频分析上传: {path.name} ({size_mb:.2f} MB)"
+            f"视频分析上传: {scene_prefix}{path.name} ({size_mb:.2f} MB)"
             + (f"，参照图 {len(reference_paths)} 张" if reference_paths else "")
+            + range_suffix
         )
 
         data_url = self._video_to_data_url(path)

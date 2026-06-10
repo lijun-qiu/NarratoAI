@@ -108,7 +108,7 @@ def build_frame_timeline_narrative_rules() -> str:
 - **frame_observations** 是逐秒账本：每一帧写清 **[景别] 地点，人物+动作**；读 sequential 列表应能还原事件顺序
 - **scene_segments** 是剪辑段落：按地点/动作阶段拆分，每条 timestamp 须落在本批真实时间轴内
 - **overall_activity_summary** 须按时间顺序写事件链（用 → 连接），例：
-  「本批次：5:00 停车场车辆行驶 → 5:01–5:03 车顶秦枫趴伏 → 5:04 车辆甩尾 → 5:07 秦枫持枪奔跑」
+  「本批次：5:00 停车场车辆行驶 → 5:01–5:03 车顶角色A趴伏 → 5:04 车辆甩尾 → 5:07 角色A持枪奔跑」
 - 禁止用一条笼统 segment 覆盖整批多种动作（如车顶追逐 + 地面奔跑 + 车辆甩尾）"""
 
 
@@ -132,8 +132,8 @@ def build_frame_observation_spec(*, frame_count: int) -> str:
 - **timestamp**：该帧时间 `HH:MM:SS,mmm`（**须与输入帧文件名时间码一致**，勿从 00:00:00 重计）
 - **characters**（数组）：本帧画面内可见人物的规范姓名（须逐脸对照定妆照匹配）；无匹配则不写该项
 - **observation**：15–40 字，格式建议「[景别] 地点，动作/姿态，光线关键词」——**禁止写人名**
-  - 例：「[特写] 审讯室，拍桌质问，顶光硬阴影」，characters: ["胡小跃"]
-  - 例：「[特写] 车顶，趴伏抓边，夜/室外/冷调」，characters: ["秦枫"]
+  - 例：「[特写] 审讯室，拍桌质问，顶光硬阴影」，characters: ["角色A"]
+  - 例：「[特写] 车顶，趴伏抓边，夜/室外/冷调」，characters: ["角色B"]
 - 若本帧有硬字幕：另填 JSON 字段 `burned_in_subtitle` / `has_burned_in_subtitle`（**不要**写进 observation 字符串里）
 - **硬字幕 ≠ 本帧说话人**：仅复制文字；谁说话须看本帧嘴型/手势，反应镜/聆听镜勿标「开口说话」
 - 逐帧只写**这一帧**可见内容；相邻帧若画面相同，仍须分别描述细微变化（表情、手势、字幕出现）"""
@@ -164,7 +164,7 @@ def build_frame_extraction_json_skeleton(
     {{
       "timestamp": "00:05:00,000-00:05:03,000",
       "scene": "废弃停车场车顶",
-      "characters": ["秦枫"],
+      "characters": ["角色A"],
       "observation": "夜间，趴伏于行驶中的车顶，神情紧张",
       "action": "抓握车顶边缘，车辆高速行驶",
       "emotion": "紧张",
@@ -178,7 +178,7 @@ def build_frame_extraction_json_skeleton(
     {{
       "timestamp": "00:05:04,000-00:05:09,000",
       "scene": "废弃停车场",
-      "characters": ["秦枫"],
+      "characters": ["角色A"],
       "observation": "车辆甩尾后，持枪在停车场内奔跑追捕",
       "action": "持枪奔跑，后方有人跟随",
       "emotion": "紧迫",
@@ -191,9 +191,9 @@ def build_frame_extraction_json_skeleton(
   ],
   "frame_observations": [
     {{"timestamp": "00:05:00,000", "observation": "[远景] 废弃停车场，汽车行驶，夜间暗调{burned}"}},
-    {{"timestamp": "00:05:02,000", "characters": ["秦枫"], "observation": "[特写] 车顶，侧脸凝重{burned}"}}
+    {{"timestamp": "00:05:02,000", "characters": ["角色A"], "observation": "[特写] 车顶，侧脸凝重{burned}"}}
   ],
-  "overall_activity_summary": "本批次：5:00 停车场车辆行驶 → 5:01–5:03 车顶秦枫趴伏 → 5:04 车辆甩尾 → 5:07 秦枫持枪奔跑"
+  "overall_activity_summary": "本批次：5:00 停车场车辆行驶 → 5:01–5:03 车顶角色A趴伏 → 5:04 车辆甩尾 → 5:07 角色A持枪奔跑"
 }}
 ```
 

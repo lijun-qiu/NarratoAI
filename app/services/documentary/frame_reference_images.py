@@ -132,7 +132,7 @@ def build_reference_carryover_prompt(
     if names:
         lines.append(
             f"- 定妆照人物（{ '、'.join(names) }）须逐脸对照、{FRAME_FACE_MATCH_SIMILARITY_HINT} 后才可写规范名；"
-            f"硬字幕/SRT/对白内容（二师兄、老叶等）**不得**猜人"
+            f"硬字幕/SRT/对白内容**不得**猜人"
         )
     lines.append(f"- 无依据时用「{FRAME_UNKNOWN_CHARACTER_MALE}」「{FRAME_UNKNOWN_CHARACTER_FEMALE}」")
     return "\n".join(lines)

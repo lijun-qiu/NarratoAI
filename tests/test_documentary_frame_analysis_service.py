@@ -914,9 +914,9 @@ class DocumentaryFrameGenderHintTests(unittest.TestCase):
     def test_analysis_prompt_requires_gender_in_characters(self):
         service = DocumentaryFrameAnalysisService()
         prompt = service._build_analysis_prompt(frame_count=2)
-        self.assertIn("未名人员(男/女)", prompt)
-        self.assertIn("须含可见性别", prompt)
-        self.assertIn("仅可见画面", prompt)
+        self.assertIn("characters", prompt)
+        self.assertIn("禁止写人名", prompt)
+        self.assertIn("禁止脑补", prompt)
 
     def test_batch_prompt_includes_gender_hint(self):
         service = DocumentaryFrameAnalysisService()
@@ -928,7 +928,6 @@ class DocumentaryFrameGenderHintTests(unittest.TestCase):
             time_range="00:00:00,000-00:00:06,000",
         )
         self.assertIn("人物性别**仅据画面**判断", prompt)
-        self.assertIn("胡小跃=男", prompt)
 
     def test_batch_prompt_includes_naming_hint(self):
         service = DocumentaryFrameAnalysisService()
@@ -941,7 +940,6 @@ class DocumentaryFrameGenderHintTests(unittest.TestCase):
         )
         self.assertIn("禁止写姓名(男/女)", prompt)
         self.assertIn("只允许在 characters 写**已上传头像名单内**", prompt)
-        self.assertIn("禁止写名单外旧称（如伟业、老叶", prompt)
 
     def test_batch_prompt_default_skips_drama_knowledge_for_fazu_theme(self):
         service = DocumentaryFrameAnalysisService()
@@ -958,22 +956,27 @@ class DocumentaryFrameGenderHintTests(unittest.TestCase):
         self.assertNotIn("剧集人物关系对照（抽帧分析必读", prompt)
         self.assertIn("仅可见画面", prompt)
 
-    def test_batch_prompt_includes_drama_knowledge_for_fazu_theme(self):
+    def test_batch_prompt_includes_drama_knowledge_when_configured(self):
         service = DocumentaryFrameAnalysisService()
+        knowledge_path = os.path.join(
+            os.path.dirname(__file__),
+            "..",
+            "app",
+            "data",
+            "drama_knowledge",
+            "fazu2_relationships.md",
+        )
         prompt = service._build_batch_prompt(
             frame_count=2,
-            video_theme="罚罪2",
+            video_theme="测试剧",
             custom_prompt="",
             documentary_settings={
-                "documentary_compact_mode": True,
-                "documentary_compact_style": "fazu2",
                 "enable_frame_analysis_drama_knowledge": True,
+                "drama_knowledge_file": knowledge_path,
             },
             time_range="00:00:00,000-00:00:06,000",
         )
-        self.assertIn("剧集人物关系对照（抽帧分析必读", prompt)
-        self.assertIn("秦枫", prompt)
-        self.assertIn("胡小跃", prompt)
+        self.assertIn("剧集人物关系对照（抽帧", prompt)
 
     def test_batch_prompt_skips_drama_knowledge_when_disabled(self):
         service = DocumentaryFrameAnalysisService()
@@ -1460,15 +1463,13 @@ class DocumentaryFrameSubtitleAttachmentTests(unittest.TestCase):
 
 
 class FrameAnalysisDramaKnowledgeTests(unittest.TestCase):
-    def test_correct_name_mistakes_in_text(self):
+    def test_correct_name_mistakes_in_text_is_noop(self):
         from app.services.short_drama_drama_knowledge import correct_name_mistakes_in_text
 
-        self.assertEqual(
-            "秦枫与胡小跃对话",
-            correct_name_mistakes_in_text("秦峰与胡小月对话"),
-        )
+        original = "秦峰与胡小月对话"
+        self.assertEqual(original, correct_name_mistakes_in_text(original))
 
-    def test_apply_name_corrections_to_frame_analysis_artifact(self):
+    def test_apply_name_corrections_to_frame_analysis_artifact_is_noop(self):
         from app.services.short_drama_drama_knowledge import (
             apply_name_corrections_to_frame_analysis_artifact,
         )
@@ -1490,13 +1491,8 @@ class FrameAnalysisDramaKnowledgeTests(unittest.TestCase):
             ],
         }
         apply_name_corrections_to_frame_analysis_artifact(artifact)
-        self.assertIn("秦枫", artifact["scene_segments"][0]["action"])
-        self.assertIn("胡小跃", artifact["scene_segments"][0]["observation"])
-        self.assertIn("秦峰", artifact["scene_segments"][0]["subtitle"])
-        self.assertEqual("我了解小月。", artifact["scene_segments"][0]["subtitle_entries"][0]["text"])
-        self.assertIn("秦峰", artifact["batches"][0]["scene_segments"][0]["subtitle"])
-        self.assertIn("罗博", artifact["batches"][0]["frame_observations"][0]["observation"])
-        self.assertEqual("罗伯出现", artifact["batches"][0]["frame_observations"][0]["burned_in_subtitle"])
+        self.assertIn("秦峰", artifact["scene_segments"][0]["action"])
+        self.assertIn("胡小月", artifact["scene_segments"][0]["observation"])
 
     def test_extract_subtitle_srt_from_subtitle_entries(self):
         from app.services.documentary.documentary_subtitle_enrichment import (
@@ -1597,15 +1593,10 @@ class FrameAnalysisDramaKnowledgeTests(unittest.TestCase):
             build_plot_blueprint_name_unification_section,
         )
 
-        fazu = build_plot_blueprint_name_unification_section(theme="罚罪2")
-        self.assertIn("胡小跃", fazu)
-        self.assertIn("秦峰", fazu)
-        self.assertIn("叶天佑（老叶）≠ 伟业", fazu)
-        self.assertIn("禁止", fazu)
-
-        generic = build_plot_blueprint_name_unification_section(theme="某新剧")
-        self.assertIn("人名谐音/简称归并", generic)
-        self.assertNotIn("胡小跃 ←", generic)
+        section = build_plot_blueprint_name_unification_section(theme="某新剧")
+        self.assertIn("人名谐音/ASR 归并", section)
+        self.assertIn("禁止", section)
+        self.assertNotIn("胡小跃 ←", section)
 
     def test_resolve_frame_subtitle_for_plot_blueprint(self):
         import json
@@ -1651,8 +1642,8 @@ class FrameAnalysisDramaKnowledgeTests(unittest.TestCase):
             "batches": [],
         }
         DocumentaryFrameExtractionService._finalize_scene_segments_in_artifact(artifact)
-        self.assertIn("秦枫", artifact["scene_segments"][0]["action"])
-        self.assertIn("胡小跃", artifact["scene_segments"][0]["action"])
+        self.assertIn("秦峰", artifact["scene_segments"][0]["action"])
+        self.assertIn("胡小月", artifact["scene_segments"][0]["action"])
 
 
 class SceneSegmentDedupTests(unittest.TestCase):
@@ -2274,10 +2265,10 @@ class ShortDramaScriptOptimizerTests(unittest.TestCase):
 
 
 class FrameCharacterNamingTests(unittest.TestCase):
-    def test_is_character_name_evidence_backed_with_alias(self):
+    def test_is_character_name_evidence_backed_exact_match(self):
         from app.services.documentary.frame_character_naming import is_character_name_evidence_backed
 
-        self.assertTrue(is_character_name_evidence_backed("胡小跃", "我了解小月。"))
+        self.assertTrue(is_character_name_evidence_backed("胡小跃", "胡小跃在说话"))
         self.assertFalse(is_character_name_evidence_backed("刘天也", "秦枫在说话"))
 
     def test_sanitize_segment_character_names(self):
@@ -2292,49 +2283,49 @@ class FrameCharacterNamingTests(unittest.TestCase):
         self.assertEqual(["秦枫"], segment["characters"])
         self.assertEqual(["刘天也"], removed)
 
-    def test_strip_legacy_hallucinated_name_weiye(self):
+    def test_strip_unreliable_names_without_face_match(self):
         from app.services.documentary.frame_character_naming import (
             apply_face_gated_names_to_artifact,
             strip_unreliable_names_in_text,
         )
 
         text = strip_unreliable_names_in_text(
-            "叶天佑(男)与伟业(男)相对而立，伟业伫立聆听",
+            "叶天佑(男)与秦枫(男)相对而立",
             reliable_faces={"叶天佑"},
-            ref_names={"叶天佑", "楚青桐", "秦枫"},
+            ref_names={"叶天佑", "秦枫"},
         )
-        self.assertNotIn("伟业", text)
+        self.assertNotIn("秦枫", text)
         self.assertIn("叶天佑(男)", text)
 
         artifact = {
-            "character_references": [{"name": "叶天佑"}, {"name": "楚青桐"}],
+            "character_references": [{"name": "叶天佑"}, {"name": "秦枫"}],
             "scene_segments": [
                 {
                     "batch_index": 0,
-                    "action": "伟业(男)伫立，叶天佑(男)说话",
-                    "observation": "楼顶天台，叶天佑(男)与伟业(男)对话",
+                    "action": "秦枫(男)伫立，叶天佑(男)说话",
+                    "observation": "楼顶天台，叶天佑(男)与秦枫(男)对话",
                 }
             ],
             "frame_observations": [
                 {
                     "batch_index": 0,
-                    "observation": "叶天佑(男)与伟业(男)相对而立",
+                    "observation": "叶天佑(男)相对而立",
                 }
             ],
             "batches": [
                 {
                     "batch_index": 0,
-                    "overall_activity_summary": "叶天佑(男)与伟业(男)对话",
+                    "overall_activity_summary": "叶天佑(男)与秦枫(男)对话",
                     "frame_observations": [
-                        {"observation": "叶天佑(男)与伟业(男)相对而立"},
+                        {"observation": "叶天佑(男)相对而立"},
                     ],
-                    "scene_segments": [{"action": "伟业(男)伫立"}],
+                    "scene_segments": [{"action": "秦枫(男)伫立"}],
                 }
             ],
         }
         apply_face_gated_names_to_artifact(artifact)
-        self.assertNotIn("伟业", artifact["scene_segments"][0]["action"])
-        self.assertNotIn("伟业", artifact["batches"][0]["overall_activity_summary"])
+        self.assertNotIn("秦枫", artifact["scene_segments"][0]["action"])
+        self.assertNotIn("秦枫", artifact["batches"][0]["overall_activity_summary"])
 
     def test_validate_face_naming_rejects_generic_labels_when_refs_attached(self):
         from app.services.documentary.frame_character_naming import (
@@ -2470,8 +2461,7 @@ class FrameExtractionTestModeTests(unittest.TestCase):
         apply_obvious_character_relationships_to_artifact(artifact)
         segment = artifact["scene_segments"][0]
         relations = segment.get("character_relationships") or []
-        self.assertTrue(any(item.get("type") == "师徒" for item in relations))
-        self.assertIn("师徒", segment.get("observation", ""))
+        self.assertEqual([], relations)
 
     def test_no_relationship_inference_from_rank_dialogue(self):
         from app.services.documentary.frame_character_naming import (
@@ -2510,29 +2500,45 @@ class DramaCharacterRegistryTests(unittest.TestCase):
         self.addCleanup(lambda: os.path.exists(path) and os.remove(path))
         return path
 
-    def test_list_dramas_includes_fazu2(self):
-        from app.services.drama_character_registry import DEFAULT_DRAMA_ID, list_dramas
+    def test_list_drama_select_options_puts_fazu2_first(self):
+        from app.services.drama_character_registry import list_drama_select_options
 
-        dramas = list_dramas()
-        self.assertTrue(any(item["id"] == DEFAULT_DRAMA_ID for item in dramas))
+        options = list_drama_select_options()
+        ids = [item["id"] for item in options]
+        self.assertEqual(ids[0], "")
+        self.assertEqual(ids[1], "罚罪2")
 
-    def test_list_characters_for_fazu2(self):
+    def test_list_characters_from_uploaded_heads(self):
+        import io
+        import shutil
+        import tempfile
+
+        from PIL import Image
+
         from app.services.drama_character_registry import (
             list_character_head_slot_groups,
             list_characters_for_drama,
+            save_head_image,
         )
 
-        names = list_characters_for_drama("罚罪2")
-        self.assertIn("秦枫", names)
-        self.assertIn("胡小跃", names)
-        self.assertIn("罗博", names)
-        self.assertNotIn("金鼎集团", names)
-        self.assertEqual(59, len(names))
+        tmp_root = tempfile.mkdtemp()
+        self.addCleanup(lambda: shutil.rmtree(tmp_root, ignore_errors=True))
+        import app.services.drama_character_registry as registry
 
-        groups = list_character_head_slot_groups("罚罪2")
-        self.assertEqual(3, len(groups))
-        self.assertEqual(20, len(groups[0]["slots"]))
-        self.assertEqual("core", groups[0]["tier"])
+        original_root = registry._PROJECT_ROOT
+        registry._PROJECT_ROOT = tmp_root
+        self.addCleanup(lambda: setattr(registry, "_PROJECT_ROOT", original_root))
+
+        buf = io.BytesIO()
+        Image.new("RGB", (8, 8), color=(1, 2, 3)).save(buf, format="JPEG")
+        save_head_image("test_drama", "角色A", buf.getvalue(), original_filename="a.jpg")
+
+        names = list_characters_for_drama("test_drama")
+        self.assertEqual(["角色A"], names)
+
+        groups = list_character_head_slot_groups("test_drama")
+        self.assertEqual(1, len(groups))
+        self.assertEqual(1, len(groups[0]["slots"]))
 
     def test_head_widget_session_keys_are_ascii(self):
         from app.services.drama_character_registry import (
@@ -2553,6 +2559,7 @@ class DramaCharacterRegistryTests(unittest.TestCase):
 
         from app.services.drama_character_registry import (
             ensure_head_img_dir,
+            list_characters_for_drama,
             list_unrecognized_head_images,
             save_head_image,
         )
@@ -2573,19 +2580,13 @@ class DramaCharacterRegistryTests(unittest.TestCase):
         registry._PROJECT_ROOT = tmp_root
         self.addCleanup(lambda: setattr(registry, "_PROJECT_ROOT", original_root))
 
-        from app.data.drama_knowledge import fazu2_upload_roster as roster_mod
-
-        original_rosters = dict(roster_mod.DRAMA_UPLOAD_ROSTERS)
-        roster_mod.DRAMA_UPLOAD_ROSTERS["test_drama"] = ({"name": "秦枫", "tier": "core", "role_hint": ""},)
-        self.addCleanup(lambda: roster_mod.DRAMA_UPLOAD_ROSTERS.update(original_rosters))
-
         buf = io.BytesIO()
         Image.new("RGB", (8, 8), color=(4, 5, 6)).save(buf, format="JPEG")
-        save_head_image("test_drama", "秦枫", buf.getvalue(), original_filename="a.jpg")
+        save_head_image("test_drama", "角色A", buf.getvalue(), original_filename="a.jpg")
 
         orphans = list_unrecognized_head_images("test_drama")
-        self.assertIn("Snipaste_test.png", orphans)
-        self.assertNotIn("秦枫.jpg", orphans)
+        self.assertEqual([], orphans)
+        self.assertIn("角色A", list_characters_for_drama("test_drama"))
         from app.services.drama_character_registry import build_character_reference_prompt_section
 
         section = build_character_reference_prompt_section(
@@ -2638,9 +2639,9 @@ class DramaCharacterRegistryTests(unittest.TestCase):
         )
         self.assertEqual(2, len(images0))
         self.assertEqual(1, count0)
-        self.assertEqual(frames, images1)
-        self.assertEqual(0, count1)
-        self.assertIn("沿用", carryover1)
+        self.assertEqual(2, len(images1))
+        self.assertEqual(1, count1)
+        self.assertEqual("", carryover1)
 
     def test_compose_batch_vision_inputs_relationship_diagram_first(self):
         from app.services.documentary.frame_extraction_service import DocumentaryFrameExtractionService
@@ -2673,9 +2674,9 @@ class DramaCharacterRegistryTests(unittest.TestCase):
     def test_merge_frame_analysis_settings_enables_text_when_requested(self):
         from app.services.drama_character_registry import merge_frame_analysis_settings_for_drama
 
-        merged = merge_frame_analysis_settings_for_drama({}, "罚罪2", enable_knowledge_text=True)
+        merged = merge_frame_analysis_settings_for_drama({}, "测试作品", enable_knowledge_text=True)
         self.assertTrue(merged.get("enable_frame_analysis_drama_knowledge"))
-        self.assertEqual("罚罪2", merged.get("selected_drama_id"))
+        self.assertEqual("测试作品", merged.get("selected_drama_id"))
 
     def test_should_attach_reference_images_first_batch_only(self):
         from app.services.documentary.frame_reference_images import (

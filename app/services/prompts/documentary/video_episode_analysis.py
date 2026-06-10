@@ -25,10 +25,10 @@ from app.services.documentary.video_episode_segment_schedule import segment_poli
 
 def _resolve_drama_title(drama_title: str | dict[str, str] | None) -> str:
     if isinstance(drama_title, dict):
-        raw = drama_title.get("label") or drama_title.get("id") or "罚罪2"
+        raw = drama_title.get("label") or drama_title.get("id") or "本片"
     else:
-        raw = drama_title or "罚罪2"
-    return str(raw).strip() or "罚罪2"
+        raw = drama_title or "本片"
+    return str(raw).strip() or "本片"
 
 
 def _format_hms_timestamp(seconds: float) -> str:
@@ -136,7 +136,7 @@ def build_character_naming_guidance_block(*, has_references: bool = False) -> st
         return (
             "## 人物命名规则\n"
             "- 无法从画面确认身份时，`involved_characters` / `speaker` 写「剧中未明确交代」。\n"
-            "- **禁止**凭字幕称呼（如二师兄、老叶）直接当作规范姓名，除非片内字幕已写明全名。"
+            "- **禁止**凭字幕称呼直接当作规范姓名，除非片内字幕已写明全名。"
         )
 
     policy_label = segment_policy_summary()
@@ -144,11 +144,11 @@ def build_character_naming_guidance_block(*, has_references: bool = False) -> st
         "## 人物命名规则（须对照上传头像 · 严格）\n"
         f"- **每个时间窗独立识脸**（{policy_label}）：每条 `episodic_segments` 须对照该 `time_range` 窗口内**实际可见面孔**与定妆照匹配后再写 `involved_characters`\n"
         f"- 仅当脸/侧脸清晰且与定妆照匹配（{FRAME_FACE_MATCH_SIMILARITY_HINT}）"
-        " → 写规范姓名（如秦枫、胡小跃）；**未达 90% 相似度禁止写规范名**\n"
+        " → 写规范姓名；**未达 90% 相似度禁止写规范名**\n"
         f"- 该窗口内**无清晰人脸 / 无法匹配 / 相似度不足** → 写「{FRAME_UNKNOWN_CHARACTER_MALE}」「{FRAME_UNKNOWN_CHARACTER_FEMALE}」"
         " 或「剧中未明确交代」，**禁止**便衣男/年轻警员/警服男子等泛称，**禁止**凭剧情印象猜名\n"
-        "- **禁止**仅凭字幕称呼、对白内容、上下格人物、警服/便服等猜规范姓名\n"
-        "- 同着警服等易混角色（如秦枫与胡小跃）须**逐脸细对**，不可互换\n"
+        "- **禁止**仅凭字幕称呼、对白内容、上下格人物、服装等猜规范姓名\n"
+        "- 外貌相近的角色须**逐脸细对**，不可互换\n"
         "- `important_dialogues.speaker` 同样遵守上述规则；说话人须在该台词时间窗内可见且面孔匹配，**禁止**听声猜人"
     )
 
@@ -264,7 +264,7 @@ def build_episodic_segment_continuity_rules() -> str:
 
 def build_video_episode_analysis_prompt(
     *,
-    drama_title: str = "罚罪2",
+    drama_title: str = "",
     video_duration_seconds: float | None = None,
     segment_schedule_block: str = "",
     character_naming_block: str = "",

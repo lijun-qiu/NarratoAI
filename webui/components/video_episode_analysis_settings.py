@@ -75,10 +75,10 @@ def render_video_episode_analysis_panel(tr, params) -> None:
         "直接将整集 mp4 传给视觉模型，输出 overall_summary / episodic_segments（含旁白 narration、环境描述 environment_description）"
         "/ important_dialogues 等 JSON。"
         "适合快速把握剧情；精细剪辑时间轴仍建议用「抽帧分析」。"
-        "分析时会显示压缩、分段上传、模型调用与合并保存等步骤进度。"
-        "上传前默认转码为 **640p·CRF28**（短片优先 720p·CRF26，单段≤24MB）；"
-        "可在 config.toml `[video_episode_analysis]` 调整 `max_upload_mb`。"
-        "人物命名会复用「抽帧分析」中上传的头像参照（请在抽帧分析面板勾选人物并上传头像）。"
+        "分析前先将原片压缩为 **720p** 母版，再按切镜逐镜截取上传并调用视觉模型。"
+        "可在 config.toml `[video_episode_analysis]` 调整 `max_upload_mb`、`upload_transcode_profile`。"
+        "人物命名复用上方「作品名称 / 头像参照」中勾选的人物头像。"
+        "剧情参考亦在上方填写，抽帧与整片分析共用。"
     )
 
     video_path = (params.video_origin_path or "").strip()

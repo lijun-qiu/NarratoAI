@@ -19,6 +19,8 @@ dashscope>=1.24.6
 
 # 图像处理依赖
 Pillow>=10.3.0
+opencv-python>=4.8.0
+scenedetect>=0.6.4
 
 # 进度条和重试机制
 tqdm>=4.66.6

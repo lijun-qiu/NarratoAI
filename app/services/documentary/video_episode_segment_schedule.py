@@ -12,6 +12,8 @@ import re
 import subprocess
 from typing import Any
 
+from loguru import logger
+
 from app.services.documentary.video_episode_constants import (
     SCENE_CANDIDATE_THRESHOLD,
     SCENE_CUT_MODE,
@@ -44,7 +46,16 @@ def schedule_seed(*, video_path: str, start_offset_seconds: float) -> int:
     return int(hashlib.md5(raw.encode("utf-8")).hexdigest()[:8], 16)
 
 
-def _run_ffmpeg_scene_detect(
+def _threshold_to_content_detector(threshold: float) -> float:
+    """将旧版 FFmpeg scenecut 阈值 (0–1) 映射为 ContentDetector 灵敏度。"""
+    try:
+        value = float(threshold)
+    except (TypeError, ValueError):
+        value = SCENE_CANDIDATE_THRESHOLD
+    return max(1.0, min(100.0, value * 100.0))
+
+
+def _run_ffmpeg_scene_detect_fallback(
     video_path: str,
     *,
     start_seconds: float,
@@ -90,6 +101,57 @@ def _run_ffmpeg_scene_detect(
     return sorted(set(cuts))
 
 
+def _run_pyscenedetect_scene_detect(
+    video_path: str,
+    *,
+    start_seconds: float,
+    duration_seconds: float | None,
+    threshold: float,
+) -> list[float]:
+    try:
+        from scenedetect import SceneManager, open_video
+        from scenedetect.detectors import ContentDetector
+        from scenedetect.frame_timecode import FrameTimecode
+    except ImportError:
+        logger.warning("PySceneDetect 未安装，回退 FFmpeg scenecut")
+        return _run_ffmpeg_scene_detect_fallback(
+            video_path,
+            start_seconds=start_seconds,
+            duration_seconds=duration_seconds,
+            threshold=threshold,
+        )
+
+    try:
+        video = open_video(video_path)
+        fps = float(video.frame_rate or 30.0)
+        if start_seconds > 0:
+            video.seek(FrameTimecode(start_seconds, fps=fps))
+
+        end_time = None
+        if duration_seconds is not None and duration_seconds > 0:
+            end_time = FrameTimecode(start_seconds + duration_seconds, fps=fps)
+
+        scene_manager = SceneManager()
+        scene_manager.add_detector(
+            ContentDetector(threshold=_threshold_to_content_detector(threshold))
+        )
+        scene_manager.detect_scenes(video, end_time=end_time)
+        scene_list = scene_manager.get_scene_list()
+        cuts = [
+            round(scene_start.get_seconds(), 3)
+            for scene_start, _scene_end in scene_list[1:]
+        ]
+        return sorted(set(cuts))
+    except Exception as exc:
+        logger.warning(f"PySceneDetect 切点检测失败，回退 FFmpeg scenecut: {exc}")
+        return _run_ffmpeg_scene_detect_fallback(
+            video_path,
+            start_seconds=start_seconds,
+            duration_seconds=duration_seconds,
+            threshold=threshold,
+        )
+
+
 def detect_edit_cut_seconds(
     video_path: str,
     *,
@@ -102,7 +164,7 @@ def detect_edit_cut_seconds(
         return []
     if duration_seconds is not None and duration_seconds <= 0:
         return []
-    return _run_ffmpeg_scene_detect(
+    return _run_pyscenedetect_scene_detect(
         video_path,
         start_seconds=start_seconds,
         duration_seconds=duration_seconds,

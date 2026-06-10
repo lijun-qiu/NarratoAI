@@ -434,6 +434,7 @@ picture_wrap_double_quotes = true
 max_upload_mb = 24.0
 upload_transcode_profile = "high"
 # 切段：environment_change=仅场景/布景明显变化；edit_cut=每个硬切都切
+# 硬切检测：PySceneDetect ContentDetector（未安装或失败时回退 FFmpeg scenecut）
 scene_cut_mode = "environment_change"
 scene_candidate_threshold = 0.25
 scene_environment_diff_threshold = 0.18

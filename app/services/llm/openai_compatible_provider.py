@@ -323,7 +323,16 @@ class OpenAICompatibleVisionProvider(_OpenAICompatibleBase, VisionModelProvider)
                     )
                     if response.choices and response.choices[0].message and response.choices[0].message.content:
                         return response.choices[0].message.content
-                    raise APICallError("OpenAI 兼容接口返回空响应")
+                    finish_reason = ""
+                    if response.choices:
+                        finish_reason = str(getattr(response.choices[0], "finish_reason", "") or "")
+                    logger.warning(
+                        f"视频分析空响应: model={model_name} finish_reason={finish_reason or 'unknown'}"
+                    )
+                    raise APICallError(
+                        "OpenAI 兼容接口返回空响应"
+                        + (f"（finish_reason={finish_reason}）" if finish_reason else "")
+                    )
                 except OpenAIAuthError as exc:
                     raise AuthenticationError(str(exc))
                 except OpenAIRateLimitError as exc:

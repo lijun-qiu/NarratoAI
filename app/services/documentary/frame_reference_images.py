@@ -12,6 +12,7 @@ import PIL.Image
 from loguru import logger
 
 from app.services.documentary.documentary_settings import (
+    FRAME_FACE_MATCH_SIMILARITY_HINT,
     FRAME_UNKNOWN_CHARACTER_FEMALE,
     FRAME_UNKNOWN_CHARACTER_MALE,
 )
@@ -20,7 +21,7 @@ from app.utils import utils
 
 ATTACH_MODE_EVERY_BATCH = "every_batch"
 ATTACH_MODE_FIRST_BATCH = "first_batch"
-REFERENCE_COLLAGE_MAX_HEADS_PER_SHEET = 6
+REFERENCE_COLLAGE_MAX_HEADS_PER_SHEET = 4
 
 
 def resolve_reference_collage_mode(
@@ -124,14 +125,14 @@ def build_reference_carryover_prompt(
     work = (drama_label or "本剧").strip()
     lines = [
         "## 视觉参照沿用（本批不再重复发送参照图）",
-        f"首批已提供 **{work}** 人物定妆照；本批写规范姓名仍须**对照该批关键帧可见面孔**与参照达到较高面部相似度（约80%以上）。",
+        f"首批已提供 **{work}** 人物定妆照；本批写规范姓名仍须**对照该批关键帧可见面孔**与参照匹配（{FRAME_FACE_MATCH_SIMILARITY_HINT}）。",
     ]
     if relationship_diagram_attached:
         lines.append("- 关系图仅作谐音/关系**校正**，不可凭关系图猜人")
     if names:
         lines.append(
-            f"- 定妆照人物（{ '、'.join(names) }）须逐脸对照、相似度约80%以上匹配后才可写规范名；"
-            f"硬字幕/SRT 称呼（二师兄、老叶等）**不得**猜人"
+            f"- 定妆照人物（{ '、'.join(names) }）须逐脸对照、{FRAME_FACE_MATCH_SIMILARITY_HINT} 后才可写规范名；"
+            f"硬字幕/SRT/对白内容（二师兄、老叶等）**不得**猜人"
         )
     lines.append(f"- 无依据时用「{FRAME_UNKNOWN_CHARACTER_MALE}」「{FRAME_UNKNOWN_CHARACTER_FEMALE}」")
     return "\n".join(lines)

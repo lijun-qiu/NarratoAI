@@ -10,7 +10,7 @@
 """
 
 from ..base import ParameterizedPrompt, PromptMetadata, ModelType, OutputFormat
-from app.services.documentary.video_episode_constants import SEGMENT_INTERVAL_SECONDS
+from app.services.documentary.video_episode_segment_schedule import segment_policy_summary
 
 
 class ScriptGenerationPrompt(ParameterizedPrompt):
@@ -57,7 +57,7 @@ class ScriptGenerationPrompt(ParameterizedPrompt):
         )
         
     def get_template(self) -> str:
-        grid_header = f"### 整片视频分析（{SEGMENT_INTERVAL_SECONDS} 秒格 · 画面/旁白/环境）"
+        grid_header = f"### 整片视频分析（{segment_policy_summary()} · 画面/旁白/环境）"
         template = """# 短剧解说脚本创作任务
 
 ## 任务目标

@@ -385,6 +385,7 @@ def build_batch_vision_reference_prompt_section(
     collage_sheets: list[list[dict[str, str]]] | None = None,
 ) -> str:
     """构建关系图 + 人物头像参照的 prompt 说明（均排在视频关键帧之前）。"""
+    from app.services.documentary.documentary_settings import FRAME_FACE_MATCH_SIMILARITY_HINT
     from app.services.documentary.frame_reference_images import REFERENCE_COLLAGE_MAX_HEADS_PER_SHEET
 
     rel_path = resolve_media_path(relationship_diagram_path)
@@ -456,7 +457,7 @@ def build_batch_vision_reference_prompt_section(
     lines.extend(
         [
             f"从第 **{prefix_count + 1}** 张起共 **{video_frame_count}** 张为本批次视频关键帧。",
-            "关键帧中**脸/侧脸清晰**且与定妆照逐脸对照、面部相似度约80%以上匹配 → **必须**写规范姓名 `姓名(男/女)`，禁止便衣男/年轻男子/警员等代称；",
+            f"关键帧中**脸/侧脸清晰**且与定妆照逐脸对照、{FRAME_FACE_MATCH_SIMILARITY_HINT} → 写规范姓名 `姓名(男/女)`，禁止便衣男/年轻男子/警员等代称；",
             "**每一张关键帧须独立识脸**，禁止把上一帧人物照抄到下一帧；",
             "仅脸不可辨、背对、远景模糊或确实无法匹配时，才用未名人员或带服装特征的暂称；",
             "**禁止**因关系表/定妆照列表而默认全员在场；**禁止**凭字幕称呼猜人。",

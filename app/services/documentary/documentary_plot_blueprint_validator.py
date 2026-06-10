@@ -11,7 +11,7 @@ from typing import Any
 from loguru import logger
 
 from app.services.documentary.documentary_settings import FAZU2_CHARACTER_ROLES
-from app.services.documentary.video_episode_constants import SEGMENT_INTERVAL_SECONDS
+from app.services.documentary.video_episode_segment_schedule import segment_policy_summary
 from app.services.short_drama_drama_knowledge import find_name_mistakes_in_text
 from app.services.short_drama_plot_analysis_validator import (
     _CLIP_TS_RANGE_RE,
@@ -120,7 +120,7 @@ def _validate_timeline_granularity(
     if total_rows > max_timeline_rows:
         issues.append(
             f"「原片时间线」条目过多（约 {total_rows} 条 > {max_timeline_rows}），"
-            f"应按**完整情节段**合并，禁止按每个 {SEGMENT_INTERVAL_SECONDS} 秒格或每条字幕各写一行"
+            f"应按**完整情节段**合并，禁止按每个 {segment_policy_summary()} 或每条字幕各写一行"
         )
     short_windows: list[str] = []
     for line in timeline.splitlines():

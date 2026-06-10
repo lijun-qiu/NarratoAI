@@ -28,9 +28,18 @@ from app.services.documentary.frame_reference_images import (
 from app.services.drama_character_registry import resolve_media_path
 from app.services.documentary.video_episode_constants import (
     SEGMENT_INTERVAL_SECONDS,
+    SEGMENT_MAX_SECONDS,
+    SEGMENT_MIN_SECONDS,
+    SEGMENT_SPLIT_POLICY,
     get_upload_transcode_profile,
     get_video_episode_upload_settings,
     resolve_upload_profile_chain,
+)
+from app.services.documentary.video_episode_segment_schedule import (
+    average_segment_seconds,
+    build_segment_schedule,
+    detect_scene_cut_seconds,
+    segment_policy_summary,
 )
 from app.services.prompts.documentary.video_episode_analysis import (
     build_reference_carryover_naming_block,
@@ -40,10 +49,12 @@ from app.services.prompts.documentary.video_episode_analysis import (
 )
 from app.utils import utils
 
-VIDEO_EPISODE_ANALYSIS_ARTIFACT_VERSION = "documentary-video-episode-analysis-v6"
+VIDEO_EPISODE_ANALYSIS_ARTIFACT_VERSION = "documentary-video-episode-analysis-v7"
 _MIN_CHUNK_SECONDS = 60.0
 _VIDEO_ANALYSIS_TIMEOUT = 900.0
 _MAX_CHUNK_RETRIES = 3
+# 单次 API 最多输出的情节窗条数，超出则对同一上传段分批调用
+_MAX_SEGMENTS_PER_API_CALL = 32
 
 VIDEO_EPISODE_FIELD_COMMENTS: dict[str, str] = {
     "_readme": "JSON 不支持 // 注释；本 field_comments 对象置于文件最前，说明各字段含义，不参与业务逻辑。",
@@ -61,17 +72,18 @@ VIDEO_EPISODE_FIELD_COMMENTS: dict[str, str] = {
     "chunk_count": "上传分段总数（长片按约5分钟/段切分）",
     "completed_chunk_count": "已成功完成的分段数",
     "failed_chunk_indices": "失败分段索引列表（0 起），可点击补全重试",
-    "segment_interval_seconds": f"情节片段固定时间窗长度（秒），当前为 {SEGMENT_INTERVAL_SECONDS}",
-    "segment_split_policy": f"切分策略标识（fixed_{SEGMENT_INTERVAL_SECONDS}s=固定{SEGMENT_INTERVAL_SECONDS}秒一格）",
+    "segment_min_seconds": f"同场景最短采样窗（秒），当前 {SEGMENT_MIN_SECONDS}",
+    "segment_max_seconds": f"同场景最长采样窗（秒），当前 {SEGMENT_MAX_SECONDS}",
+    "segment_split_policy": f"切分策略（{SEGMENT_SPLIT_POLICY}=切镜+{SEGMENT_MIN_SECONDS}-{SEGMENT_MAX_SECONDS}秒随机采样）",
     "episodic_segment_count": "episodic_segments 条数",
-    "coverage_warnings": "时间窗/片段约束校验告警（非空表示模型输出曾偏离固定格子）",
+    "coverage_warnings": "时间窗/片段约束校验告警（非空表示模型输出曾偏离预计算时间窗）",
     "overall_summary": "本集/本段核心剧情概括（约200字内）",
     "key_conflict": "本集/本段最核心的矛盾冲突（一句话）",
-    "episodic_segments": f"固定{SEGMENT_INTERVAL_SECONDS}秒情节片段列表（全片时间轴绝对时间）",
+    "episodic_segments": "自适应场景情节片段列表（全片时间轴绝对时间，切镜即切分）",
     "episodic_segments.segment_id": "片段序号，从 1 起",
     "episodic_segments.title": "片段标题（4-6字）",
-    "episodic_segments.time_range": "片内绝对时间窗，格式 HH:MM:SS-HH:MM:SS，须与固定格子一致",
-    "episodic_segments.key_events": f"该{SEGMENT_INTERVAL_SECONDS}秒内关键事件（一句话）",
+    "episodic_segments.time_range": "片内绝对时间窗，格式 HH:MM:SS-HH:MM:SS，须与预计算窗口一致",
+    "episodic_segments.key_events": "该时间窗内关键事件（切镜格须写「场景切换至…」）",
     "episodic_segments.narration": "纪录片旁白（第三人称，15-35字，可用于后期配音）",
     "episodic_segments.environment_description": "场景环境（地点、光线、氛围、布景等，15-40字）",
     "episodic_segments.involved_characters": "该片段涉及人物（规范姓名或「剧中未明确交代」）",
@@ -248,6 +260,50 @@ def summarize_checkpoint_progress(
     }
 
 
+def estimate_video_episode_chunk_max_tokens(segment_count: int) -> int:
+    """按情节窗条数估算输出 token（自适应分段后条数远大于旧固定格）。"""
+    count = max(1, int(segment_count))
+    return min(64000, max(12000, 3500 + count * 320))
+
+
+def split_schedule_for_api_batches(
+    schedule: list[str],
+    *,
+    max_per_batch: int = _MAX_SEGMENTS_PER_API_CALL,
+) -> list[list[str]]:
+    if len(schedule) <= max(1, max_per_batch):
+        return [schedule]
+    batches: list[list[str]] = []
+    cursor = 0
+    while cursor < len(schedule):
+        batches.append(schedule[cursor : cursor + max_per_batch])
+        cursor += max_per_batch
+    return batches
+
+
+def build_schedule_batch_prompt_addon(
+    *,
+    batch_index: int,
+    batch_count: int,
+    batch_size: int,
+) -> str:
+    if batch_count <= 1:
+        return ""
+    lines = [
+        "## 本批输出范围（分批 · 同一视频仅分析下列时间窗）",
+        f"- 本批为第 **{batch_index + 1}/{batch_count}** 批，共 **{batch_size}** 条 `time_range`",
+        "- **仅**输出本批窗口对应的 `episodic_segments`，条数须与列表一致",
+    ]
+    if batch_index > 0:
+        lines.extend(
+            [
+                "- 本批 **`overall_summary` / `key_conflict` 填空字符串 `\"\"`**",
+                "- 本批 `important_dialogues` / `cliffhangers_or_foreshadowing` 输出 `[]`",
+            ]
+        )
+    return "\n".join(lines)
+
+
 def validate_chunk_partial(
     partial: dict[str, Any],
     *,
@@ -255,13 +311,14 @@ def validate_chunk_partial(
     chunk_duration_seconds: float,
     chunk_index: int,
     total_chunks: int,
+    expected_schedule: list[str] | None = None,
+    require_overall_summary: bool = True,
 ) -> list[str]:
-    """校验单段模型输出是否满足固定时间窗约束，不符合则触发重试。"""
+    """校验单段模型输出是否满足时间窗约束，不符合则触发重试。"""
     issues: list[str] = []
-    expected_schedule = build_fixed_segment_schedule(
-        chunk_duration_seconds,
-        start_offset_seconds=chunk_offset_seconds,
-    )
+    if expected_schedule is None:
+        issues.append("缺少预计算时间窗")
+        return issues
     expected_count = len(expected_schedule)
     segments = partial.get("episodic_segments") or []
     filled = sum(
@@ -289,7 +346,7 @@ def validate_chunk_partial(
             f"环境描述 environment_description {environment_filled}/{expected_count} 不足（至少 {min_required}）"
         )
 
-    if chunk_index == 0 and not str(partial.get("overall_summary") or "").strip():
+    if require_overall_summary and chunk_index == 0 and not str(partial.get("overall_summary") or "").strip():
         issues.append("首段缺少 overall_summary")
 
     enforced = enforce_episodic_segment_schedule(segments, expected_schedule)
@@ -386,7 +443,7 @@ def _prepare_chunk_reference_context(
     character_references: list[dict[str, str]] | None,
     relationship_diagram_path: str,
 ) -> tuple[list[str], str]:
-    """每段上传均附带头像/关系图（拼图每张最多 6 人），便于逐格识脸。"""
+    """每段上传均附带头像/关系图（拼图每张最多 4 人），便于逐格识脸。"""
     refs = [
         {"name": str(item.get("name") or "").strip(), "path": str(item.get("path") or "").strip()}
         for item in (character_references or [])
@@ -401,8 +458,8 @@ def _prepare_chunk_reference_context(
         "frame_reference_token_saver": False,
         "frame_reference_attach_mode": "every_batch",
         "frame_reference_max_edge": 384,
-        "frame_reference_individual_max_heads": 6,
-        "frame_reference_collage_max_heads": 6,
+        "frame_reference_individual_max_heads": 4,
+        "frame_reference_collage_max_heads": 4,
         "default_video_theme": drama_title,
     }
     head_paths = [item["path"] for item in refs if os.path.isfile(item["path"])]
@@ -438,40 +495,42 @@ def _prepare_chunk_reference_context(
 def build_fixed_segment_schedule(
     duration_seconds: float,
     *,
-    interval_seconds: int = SEGMENT_INTERVAL_SECONDS,
+    interval_seconds: int | None = None,
     start_offset_seconds: float = 0.0,
+    video_path: str = "",
 ) -> list[str]:
-    """生成固定长度时间窗（末段不足 interval 时保留余量）。"""
-    duration = max(0.0, float(duration_seconds))
-    start_base = max(0.0, float(start_offset_seconds))
-    end_limit = start_base + duration
-    ranges: list[str] = []
-    cursor = start_base
-    while cursor < end_limit - 0.01:
-        seg_end = min(cursor + interval_seconds, end_limit)
-        ranges.append(f"{_format_timestamp(cursor)}-{_format_timestamp(seg_end)}")
-        cursor = seg_end
-    return ranges
+    """兼容旧名：现统一走自适应场景分段。"""
+    del interval_seconds
+    return build_segment_schedule(
+        duration_seconds,
+        start_offset_seconds=start_offset_seconds,
+        video_path=video_path,
+    )
 
 
-def build_segment_schedule_prompt_block(fixed_time_ranges: list[str]) -> str:
-    if not fixed_time_ranges:
+def build_segment_schedule_prompt_block(time_ranges: list[str]) -> str:
+    if not time_ranges:
         return ""
     lines = [
-        "## 固定时间窗口（硬性要求）",
+        "## 自适应场景捕捉时间窗口（硬性要求 · 已预计算）",
         (
-            f"你必须输出 **恰好 {len(fixed_time_ranges)} 条** `episodic_segments`，"
+            f"你必须输出 **恰好 {len(time_ranges)} 条** `episodic_segments`，"
             "`time_range` 必须与下列窗口 **完全一致**（字符级一致，仅用 `-` 连接）："
         ),
+        (
+            f"- 同场景内每格 **{SEGMENT_MIN_SECONDS}–{SEGMENT_MAX_SECONDS} 秒**；"
+            "遇**切镜/换场**边界已单独切格，该格 `key_events` 须写「场景切换至…」"
+        ),
     ]
-    for index, time_range in enumerate(fixed_time_ranges, start=1):
+    for index, time_range in enumerate(time_ranges, start=1):
         lines.append(f"{index}. `{time_range}`")
     lines.extend(
         [
-            f"- 除最后一条外，每条窗口长度 **必须恰好 {SEGMENT_INTERVAL_SECONDS} 秒**；禁止合并、禁止改短或拉长。",
+            f"- 除末条外，单格时长须在 **{SEGMENT_MIN_SECONDS}–{SEGMENT_MAX_SECONDS} 秒**；"
+            "切镜格可短于 1 秒；**禁止**合并、改短或拉长预计算窗口。",
             "- 每条都必须填写 4-6 字 `title`、该窗口内 `key_events`、`narration`（纪录片旁白）、"
             "`environment_description`（场景环境）、`involved_characters`。",
-            f"- 某 {SEGMENT_INTERVAL_SECONDS} 秒若无明显新事件，`key_events` 写「画面/对话延续上段」，"
+            "- 同场景延续时 `key_events` 可写「画面/对话延续上段」，"
             "`narration` / `environment_description` 可写「延续上段」，**不得跳过任何窗口**。",
         ]
     )
@@ -563,15 +622,16 @@ def validate_episodic_segments(
     *,
     video_duration_seconds: float = 0.0,
     expected_time_ranges: list[str] | None = None,
+    segment_split_policy: str = SEGMENT_SPLIT_POLICY,
 ) -> list[str]:
-    """检查片段是否符合固定时间窗，返回警告列表。"""
+    """检查片段是否符合时间窗策略，返回警告列表。"""
     warnings: list[str] = []
     video_end = max(0, int(video_duration_seconds))
 
     if expected_time_ranges:
         if len(segments) != len(expected_time_ranges):
             warnings.append(
-                f"片段数量 {len(segments)} 与固定窗口 {len(expected_time_ranges)} 不一致"
+                f"片段数量 {len(segments)} 与预计算窗口 {len(expected_time_ranges)} 不一致"
             )
         for segment, expected in zip(segments, expected_time_ranges):
             actual = str(segment.get("time_range") or "").strip().replace("—", "-")
@@ -589,14 +649,30 @@ def validate_episodic_segments(
             warnings.append(f"片段 {time_range} 时间范围无效")
             continue
         is_tail = video_end > 0 and end >= video_end - 1
-        if not is_tail and duration != SEGMENT_INTERVAL_SECONDS:
-            warnings.append(
-                f"片段 {time_range} 时长 {duration}s，应为 {SEGMENT_INTERVAL_SECONDS}s"
-            )
-        elif is_tail and duration > SEGMENT_INTERVAL_SECONDS:
-            warnings.append(
-                f"末段 {time_range} 时长 {duration}s 超过 {SEGMENT_INTERVAL_SECONDS}s"
-            )
+        if expected_time_ranges and index < len(expected_time_ranges):
+            expected_range = expected_time_ranges[index]
+            if str(segment.get("time_range") or "").strip().replace("—", "-") == expected_range:
+                continue
+        if segment_split_policy == "adaptive_scene":
+            if not is_tail and duration > SEGMENT_MAX_SECONDS + 0.5:
+                warnings.append(
+                    f"片段 {time_range} 时长 {duration}s，超过同场景上限 {SEGMENT_MAX_SECONDS}s"
+                )
+            elif not is_tail and duration + 0.05 < SEGMENT_MIN_SECONDS:
+                warnings.append(
+                    f"片段 {time_range} 时长 {duration}s，短于同场景下限 {SEGMENT_MIN_SECONDS}s"
+                    "（切镜格除外）"
+                )
+        else:
+            legacy_interval = SEGMENT_INTERVAL_SECONDS
+            if not is_tail and duration != legacy_interval:
+                warnings.append(
+                    f"片段 {time_range} 时长 {duration}s，应为 {legacy_interval}s"
+                )
+            elif is_tail and duration > legacy_interval:
+                warnings.append(
+                    f"片段 {time_range} 时长 {duration}s 超过 {legacy_interval}s"
+                )
 
     for index in range(1, len(segments)):
         prev_end = _parse_time_range_bounds(segments[index - 1].get("time_range", ""))[1]
@@ -1166,6 +1242,10 @@ def load_video_episode_analysis_artifact(path: str) -> dict[str, Any]:
         "drama_title",
         "drama_id",
         "analysis_status",
+        "segment_min_seconds",
+        "segment_max_seconds",
+        "segment_split_policy",
+        "scene_cut_count",
         "segment_interval_seconds",
         "episodic_segment_count",
         "coverage_warnings",
@@ -1220,9 +1300,9 @@ def build_video_episode_analysis_markdown(
         lines.extend(
             [
                 "",
-                "## 固定时间窗情节片段",
+                "## 自适应场景情节片段",
                 (
-                    f"共 {len(segments)} 条（每 {SEGMENT_INTERVAL_SECONDS} 秒一格）"
+                    f"共 {len(segments)} 条（{segment_policy_summary(payload=payload)}）"
                     + (f"，以下均匀采样 {len(sampled)} 条" if len(sampled) < len(segments) else "")
                 ),
             ]
@@ -1419,7 +1499,7 @@ def build_video_episode_schedule_index(
         return ""
     sampled = _sample_items_uniformly(segments, max_rows)
     lines = [
-        "### 视频分析固定时间格索引（段内各格独立；上传分段边界见 coverage_warnings）",
+        "### 视频分析时间格索引（自适应场景格；上传分段边界见 coverage_warnings）",
         "| 视频格 time_range | 标题 | 人物 | 关键事件 |",
         "|---|---|---|---|",
     ]
@@ -1462,31 +1542,31 @@ def is_video_grid_span_allowed(span: str, segment_ranges: list[str]) -> bool:
     if end_sec <= start_sec:
         return False
     pos = start_sec
-    while pos < end_sec:
-        chunk_end = min(pos + SEGMENT_INTERVAL_SECONDS, end_sec)
-        covered = any(s <= pos and e >= chunk_end for s, e in intervals)
-        if not covered:
+    while pos < end_sec - 0.01:
+        candidates = [end for start, end in intervals if start <= pos + 0.01 and end > pos + 0.01]
+        if not candidates:
             return False
-        pos = chunk_end
-    return True
+        pos = max(candidates)
+    return pos >= end_sec - 0.01
 
 
 def build_plot_blueprint_narrative_granularity_rules(
     *,
     ost1_duration_min: int = 8,
     ost1_duration_max: int = 18,
+    payload: dict[str, Any] | None = None,
 ) -> str:
-    """构思蓝图：完整情节段粒度规则（禁止按固定视频格/单句对白碎切）。"""
-    grid_label = f"{SEGMENT_INTERVAL_SECONDS} 秒"
+    """构思蓝图：完整情节段粒度规则（禁止按单格/单句对白碎切）。"""
+    grid_label = segment_policy_summary(payload=payload)
     return (
         "## 情节段粒度（硬性 · 禁止碎切）\n"
         "- **每条 = 一段完整内容**：一场戏、一个冲突回合或一条清晰叙事线（通常 **30 秒–3 分钟** 原片跨度）\n"
-        f"- **禁止**按每个 {grid_label}视频格各写一行；**禁止**按每条 SRT 字幕各写一行\n"
+        f"- **禁止**按每个 {grid_label} 各写一行；**禁止**按每条 SRT 字幕各写一行\n"
         "- **原片时间线**仅 **10–14 条**完整情节段，不是 30+ 条碎点\n"
         f"- **OST=1 字幕窗**：合并相邻对白为 **{ost1_duration_min}–{ost1_duration_max} 秒**连续区间；"
         f"单句不足 {ost1_duration_min} 秒须并入同场前后对白\n"
         "- **视频格**可跨多格：如 `00:09:40-00:10:10` 覆盖审讯室整场，起止须落在索引表连续格子上\n"
-        "- **OST=0 串场**：用 1 段解说讲完该情节段因果，不要拆成多个 5 秒碎点\n"
+        "- **OST=0 串场**：用 1 段解说讲完该情节段因果，不要拆成多个碎点\n"
         "- **成片叙事顺序**每条 `_id` 也应是一段完整叙事单元（原声块或解说块），不是单句台词"
     )
 
@@ -1495,11 +1575,12 @@ def build_plot_blueprint_video_time_rules(
     *,
     ost1_duration_min: int = 8,
     ost1_duration_max: int = 18,
+    payload: dict[str, Any] | None = None,
 ) -> str:
-    grid_label = f"{SEGMENT_INTERVAL_SECONDS} 秒"
+    grid_label = segment_policy_summary(payload=payload)
     return (
         "## 双时间轴对齐规则（硬性 · 精准控制）\n"
-        f"- **视频格**（画面/剧情）：起止须对齐索引表连续 {grid_label}格；**一场戏可跨多格**（如 `00:09:40-00:10:10`）\n"
+        f"- **视频格**（画面/剧情）：起止须对齐索引表连续 {grid_label}；**一场戏可跨多格**\n"
         "- **字幕窗**（对白/OST=1）：只能使用 SRT 索引中的 `HH:MM:SS,mmm-HH:MM:SS,mmm`（毫秒级）\n"
         "- **原片时间线**每条 = **一段完整情节**；格式："
         "`视频格 \\`00:01:20-00:01:50\\` · 【本段讲什么】事件摘要 · 字幕窗 \\`…\\`（无对白写「无对白」）`\n"
@@ -1517,10 +1598,11 @@ def build_video_episode_time_bounds_section(payload: dict[str, Any]) -> str:
     if duration <= 0 and not segments:
         return ""
     duration_label = _format_timestamp(duration) if duration > 0 else "未知"
+    policy_label = segment_policy_summary(payload=payload)
     lines = [
         "## 整片视频分析时间边界",
         f"- 源视频总时长：**{duration_label}**（{duration:.1f}s）",
-        f"- 固定 **{SEGMENT_INTERVAL_SECONDS} 秒** 一格，共 **{bounds['segment_count']}** 条",
+        f"- **{policy_label}**，共 **{bounds['segment_count']}** 条",
     ]
     if segments:
         lines.append(
@@ -1538,10 +1620,12 @@ def build_video_episode_time_bounds_section(payload: dict[str, Any]) -> str:
     granularity = build_plot_blueprint_narrative_granularity_rules(
         ost1_duration_min=ost1_min,
         ost1_duration_max=ost1_max,
+        payload=payload,
     )
     rules = build_plot_blueprint_video_time_rules(
         ost1_duration_min=ost1_min,
         ost1_duration_max=ost1_max,
+        payload=payload,
     )
     parts = ["\n".join(lines)]
     if schedule:
@@ -1561,7 +1645,13 @@ def _probe_duration_seconds(video_path: str) -> float:
         "default=noprint_wrappers=1:nokey=1",
         video_path,
     ]
-    result = subprocess.run(cmd, capture_output=True, text=True, check=False)
+    result = subprocess.run(
+        cmd,
+        capture_output=True,
+        encoding="utf-8",
+        errors="replace",
+        check=False,
+    )
     try:
         return max(0.0, float((result.stdout or "").strip()))
     except ValueError:
@@ -1862,84 +1952,135 @@ class VideoEpisodeAnalysisService:
         progress: Callable[[float, str], None],
         analyze_progress: int,
         previous_chunk_partial: dict[str, Any] | None = None,
+        source_video_path: str = "",
+        scene_cuts: list[float] | None = None,
     ) -> tuple[dict[str, Any], int]:
         chunk_duration_seconds = float(chunk.get("duration_seconds") or 0)
         chunk_offset_seconds = float(chunk.get("offset_seconds") or 0)
-        chunk_schedule = build_fixed_segment_schedule(
+        chunk_schedule = build_segment_schedule(
             chunk_duration_seconds,
             start_offset_seconds=chunk_offset_seconds,
+            video_path=source_video_path,
+            scene_cuts=scene_cuts,
         )
-        schedule_block = build_segment_schedule_prompt_block(chunk_schedule)
+        schedule_batches = split_schedule_for_api_batches(chunk_schedule)
         reference_paths, naming_block = _prepare_chunk_reference_context(
             chunk_index=chunk_index,
             drama_title=drama_title,
             character_references=character_references,
             relationship_diagram_path=relationship_diagram_path,
         )
-        if total_chunks == 1:
-            prompt = build_video_episode_analysis_prompt(
-                drama_title=drama_title,
-                video_duration_seconds=video_duration_seconds,
-                segment_schedule_block=schedule_block,
-                character_naming_block=naming_block,
-            )
-        else:
-            prompt = build_video_episode_chunk_prompt(
-                drama_title=drama_title,
-                chunk_index=chunk_index,
-                total_chunks=total_chunks,
-                offset_seconds=chunk_offset_seconds,
-                chunk_duration_seconds=chunk_duration_seconds,
-                segment_schedule_block=schedule_block,
-                character_naming_block=naming_block,
-                previous_chunk_partial=previous_chunk_partial,
-            )
-        chunk_max_tokens = max(
-            8000,
-            int(2000 + 120 * (chunk_duration_seconds / SEGMENT_INTERVAL_SECONDS)),
-        )
 
-        last_error: Exception | None = None
-        for attempt in range(1, _MAX_CHUNK_RETRIES + 1):
-            try:
-                if reference_paths and chunk_index >= 0:
+        merged_partial: dict[str, Any] | None = None
+        max_attempts = 0
+
+        for batch_index, batch_schedule in enumerate(schedule_batches):
+            schedule_block = build_segment_schedule_prompt_block(batch_schedule)
+            batch_addon = build_schedule_batch_prompt_addon(
+                batch_index=batch_index,
+                batch_count=len(schedule_batches),
+                batch_size=len(batch_schedule),
+            )
+            if total_chunks == 1:
+                prompt = build_video_episode_analysis_prompt(
+                    drama_title=drama_title,
+                    video_duration_seconds=video_duration_seconds,
+                    segment_schedule_block=schedule_block,
+                    character_naming_block=naming_block,
+                )
+            else:
+                prompt = build_video_episode_chunk_prompt(
+                    drama_title=drama_title,
+                    chunk_index=chunk_index,
+                    total_chunks=total_chunks,
+                    offset_seconds=chunk_offset_seconds,
+                    chunk_duration_seconds=chunk_duration_seconds,
+                    segment_schedule_block=schedule_block,
+                    character_naming_block=naming_block,
+                    previous_chunk_partial=previous_chunk_partial,
+                )
+            if batch_addon:
+                prompt = f"{prompt}\n\n{batch_addon}"
+
+            chunk_max_tokens = estimate_video_episode_chunk_max_tokens(len(batch_schedule))
+            require_summary = batch_index == 0 and chunk_index == 0
+
+            last_error: Exception | None = None
+            for attempt in range(1, _MAX_CHUNK_RETRIES + 1):
+                try:
+                    batch_label = (
+                        f" · 输出批 {batch_index + 1}/{len(schedule_batches)}"
+                        f"（{len(batch_schedule)} 窗 · max_tokens≈{chunk_max_tokens}）"
+                        if len(schedule_batches) > 1
+                        else f" · {len(batch_schedule)} 窗 · max_tokens≈{chunk_max_tokens}"
+                    )
                     progress(
                         analyze_progress,
                         f"第 {chunk_index + 1}/{total_chunks} 段 · "
-                        f"附带 {len(reference_paths)} 张参照图 · 调用模型中"
+                        f"附带 {len(reference_paths)} 张参照图 · 调用模型中{batch_label}"
                         + (f"（重试 {attempt}/{_MAX_CHUNK_RETRIES}）" if attempt > 1 else "")
                         + "...",
                     )
-                raw = await provider.analyze_video(
-                    chunk["path"],
-                    prompt,
-                    api_key=api_key,
-                    api_base=base_url,
-                    reference_image_paths=reference_paths,
-                    timeout_override=_VIDEO_ANALYSIS_TIMEOUT,
-                    max_tokens=min(chunk_max_tokens, 64000),
-                )
-                parsed_partial = parse_video_episode_analysis_payload(raw)
-                issues = validate_chunk_partial(
-                    parsed_partial,
-                    chunk_offset_seconds=chunk_offset_seconds,
-                    chunk_duration_seconds=chunk_duration_seconds,
-                    chunk_index=chunk_index,
-                    total_chunks=total_chunks,
-                )
-                if issues:
-                    raise ValueError("片段约束不符合: " + " | ".join(issues[:3]))
-                return parsed_partial, attempt
-            except Exception as exc:
-                last_error = exc
-                if attempt < _MAX_CHUNK_RETRIES:
-                    progress(
-                        analyze_progress,
-                        f"第 {chunk_index + 1}/{total_chunks} 段不符合约束或调用失败，"
-                        f"重试 {attempt}/{_MAX_CHUNK_RETRIES}（{exc}）...",
+                    raw = await provider.analyze_video(
+                        chunk["path"],
+                        prompt,
+                        api_key=api_key,
+                        api_base=base_url,
+                        reference_image_paths=reference_paths,
+                        timeout_override=_VIDEO_ANALYSIS_TIMEOUT,
+                        max_tokens=chunk_max_tokens,
                     )
-                    await asyncio.sleep(min(2 * attempt, 6))
-        raise ValueError(str(last_error) if last_error else "分段分析失败")
+                    parsed_partial = parse_video_episode_analysis_payload(raw)
+                    issues = validate_chunk_partial(
+                        parsed_partial,
+                        chunk_offset_seconds=chunk_offset_seconds,
+                        chunk_duration_seconds=chunk_duration_seconds,
+                        chunk_index=chunk_index,
+                        total_chunks=total_chunks,
+                        expected_schedule=batch_schedule,
+                        require_overall_summary=require_summary,
+                    )
+                    if issues:
+                        raise ValueError("片段约束不符合: " + " | ".join(issues[:3]))
+                    merged_partial = (
+                        merge_video_episode_partial_analyses([merged_partial, parsed_partial])
+                        if merged_partial
+                        else parsed_partial
+                    )
+                    max_attempts = max(max_attempts, attempt)
+                    break
+                except Exception as exc:
+                    last_error = exc
+                    if attempt < _MAX_CHUNK_RETRIES:
+                        progress(
+                            analyze_progress,
+                            f"第 {chunk_index + 1}/{total_chunks} 段"
+                            + (
+                                f" 批 {batch_index + 1}/{len(schedule_batches)}"
+                                if len(schedule_batches) > 1
+                                else ""
+                            )
+                            + f" 不符合约束或调用失败，重试 {attempt}/{_MAX_CHUNK_RETRIES}（{exc}）...",
+                        )
+                        await asyncio.sleep(min(2 * attempt, 6))
+            else:
+                raise ValueError(str(last_error) if last_error else "分段分析失败")
+
+        if not merged_partial:
+            raise ValueError(str(last_error) if last_error else "分段分析失败")
+
+        final_issues = validate_chunk_partial(
+            merged_partial,
+            chunk_offset_seconds=chunk_offset_seconds,
+            chunk_duration_seconds=chunk_duration_seconds,
+            chunk_index=chunk_index,
+            total_chunks=total_chunks,
+            expected_schedule=chunk_schedule,
+            require_overall_summary=(chunk_index == 0),
+        )
+        if final_issues:
+            raise ValueError("片段约束不符合: " + " | ".join(final_issues[:3]))
+        return merged_partial, max_attempts
 
     async def analyze_episode(
         self,
@@ -1979,6 +2120,22 @@ class VideoEpisodeAnalysisService:
         video_duration_seconds = _probe_duration_seconds(video_path)
         duration_label = _format_timestamp(video_duration_seconds)
         progress(4, f"视频时长 {duration_label}，准备压缩上传...")
+
+        progress(6, "正在检测切镜点并生成自适应时间窗...")
+        scene_cuts = detect_scene_cut_seconds(
+            video_path,
+            duration_seconds=video_duration_seconds,
+        )
+        preview_schedule = build_segment_schedule(
+            video_duration_seconds,
+            video_path=video_path,
+            scene_cuts=scene_cuts,
+        )
+        progress(
+            8,
+            f"切镜 {len(scene_cuts)} 处 · 预计 {len(preview_schedule)} 条场景片段"
+            f"（{SEGMENT_MIN_SECONDS}-{SEGMENT_MAX_SECONDS} 秒采样）",
+        )
 
         upload_cfg = get_video_episode_upload_settings()
         if max_upload_mb is None:
@@ -2165,6 +2322,8 @@ class VideoEpisodeAnalysisService:
                     progress=progress,
                     analyze_progress=analyze_progress,
                     previous_chunk_partial=last_successful_partial,
+                    source_video_path=video_path,
+                    scene_cuts=scene_cuts,
                 )
                 chunk_results[chunk_key] = {
                     "status": "completed",
@@ -2214,8 +2373,11 @@ class VideoEpisodeAnalysisService:
                 failed_chunk_indices.append(index)
 
         if not partials:
+            failed_label = "、".join(str(i + 1) for i in failed_chunk_indices) or "全部"
             raise ValueError(
-                "所有上传分段均未成功完成分析；已保留检查点，请稍后点击「补全未完成分析」重试"
+                "所有上传分段均未成功完成分析（失败段: "
+                f"{failed_label}）。常见原因：网关返回空响应、输出 JSON 过长被截断。"
+                "已保留检查点，请稍后点击「补全未完成分析」重试，或更换视觉模型/网关。"
             )
 
         completed_chunks = len(partials)
@@ -2228,7 +2390,11 @@ class VideoEpisodeAnalysisService:
         analysis = merge_video_episode_partial_analyses(partials)
         merged_segment_count = len(analysis.get("episodic_segments") or [])
         progress(90, f"合并完成 · 共 {merged_segment_count} 条情节片段")
-        full_schedule = build_fixed_segment_schedule(video_duration_seconds)
+        full_schedule = build_segment_schedule(
+            video_duration_seconds,
+            video_path=video_path,
+            scene_cuts=scene_cuts,
+        )
         analysis["episodic_segments"] = enforce_episodic_segment_schedule(
             analysis.get("episodic_segments") or [],
             full_schedule,
@@ -2239,11 +2405,15 @@ class VideoEpisodeAnalysisService:
         )
         analysis["episodic_segments"] = repaired_segments
         merged_segment_count = len(analysis.get("episodic_segments") or [])
-        progress(92, f"正在对齐固定 {SEGMENT_INTERVAL_SECONDS} 秒时间窗（共 {merged_segment_count} 条）...")
+        progress(
+            92,
+            f"正在对齐自适应场景时间窗（共 {merged_segment_count} 条）...",
+        )
         coverage_warnings = validate_episodic_segments(
             analysis.get("episodic_segments") or [],
             video_duration_seconds=video_duration_seconds,
             expected_time_ranges=full_schedule,
+            segment_split_policy=SEGMENT_SPLIT_POLICY,
         )
         if continuity_warnings:
             logger.warning(
@@ -2284,8 +2454,10 @@ class VideoEpisodeAnalysisService:
             "completed_chunk_count": completed_chunks,
             "failed_chunk_indices": failed_chunk_indices,
             "chunks_meta": _chunks_meta(chunks),
-            "segment_interval_seconds": SEGMENT_INTERVAL_SECONDS,
-            "segment_split_policy": f"fixed_{SEGMENT_INTERVAL_SECONDS}s",
+            "segment_min_seconds": SEGMENT_MIN_SECONDS,
+            "segment_max_seconds": SEGMENT_MAX_SECONDS,
+            "segment_split_policy": SEGMENT_SPLIT_POLICY,
+            "scene_cut_count": len(scene_cuts),
             "episodic_segment_count": len(analysis.get("episodic_segments") or []),
             "coverage_warnings": coverage_warnings,
             **analysis,

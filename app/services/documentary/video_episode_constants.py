@@ -10,6 +10,13 @@ from typing import Any, Dict
 
 import toml
 
+# 自适应场景分段：同场景 1–10 秒随机采样，切镜立即切分
+SEGMENT_SPLIT_POLICY = "adaptive_scene"
+SEGMENT_MIN_SECONDS = 1
+SEGMENT_MAX_SECONDS = 10
+SCENE_DETECT_THRESHOLD = 0.2
+
+# 兼容旧 JSON / token 估算（固定格时代为 4）
 SEGMENT_INTERVAL_SECONDS = 4
 
 # 上传给视觉模型的转码档位（宽 px · fps · CRF · 音频 · x264 preset）

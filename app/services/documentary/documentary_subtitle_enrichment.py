@@ -54,7 +54,7 @@ from app.services.documentary.video_episode_analysis import (
     summarize_video_episode_markdown,
     video_episode_summary_usable,
 )
-from app.services.documentary.video_episode_constants import SEGMENT_INTERVAL_SECONDS
+from app.services.documentary.video_episode_segment_schedule import segment_policy_summary
 from app.services.srt_utils import SrtEntry, entries_to_srt, parse_srt, _time_str_to_ms
 from app.utils import utils
 
@@ -1437,7 +1437,7 @@ def build_plot_blueprint_material_principles(
     """构思蓝图：整片视频分析或抽帧为主（画面/剧情），SRT 为辅（对白/时间戳）。"""
     if use_video_episode_analysis:
         visual_line = (
-            f"- **整片视频分析（主·画面/剧情/{SEGMENT_INTERVAL_SECONDS}秒格）**：下方 `<video_episode_analysis>` 的 "
+            f"- **整片视频分析（主·画面/剧情·{segment_policy_summary()}）**：下方 `<video_episode_analysis>` 的 "
             "`episodic_segments`（time_range / key_events / narration / environment_description）"
             "为剧情主线与画面环境第一依据"
         )
@@ -1506,10 +1506,10 @@ def build_plot_blueprint_material_principles(
 
 {build_plot_blueprint_location_naming_rules()}
 
-## 整片视频分析 {SEGMENT_INTERVAL_SECONDS} 秒格
-- **段内每格独立**：同一段约 300s 上传视频内，各 time_range 按该 5 秒窗口实际画面填写，**不要**整段机械「承接上格」
+## 整片视频分析时间格（自适应场景）
+- **段内各窗独立**：同一段约 300s 上传视频内，各 time_range 按该窗口实际画面填写，**不要**整段机械「承接上窗」
 - **上传分段边界**：约 5 分钟/300 秒切多段上传时，**仅各段连接处**须衔接；同场景误换人会自动校正，见 `continuity_note` / `coverage_warnings`
-- 蓝图场景分段应**跨多格合并**为一场戏（约 30 秒–3 分钟），勿按每 {SEGMENT_INTERVAL_SECONDS} 秒机械切场景
+- 蓝图场景分段应**跨多窗合并**为一场戏（约 30 秒–3 分钟），勿按每个短窗机械切场景
 - 读视频分析时若见边界 `continuity_note` 或 `coverage_warnings`，**以字幕与连续画面为准**
 
 {name_unification}
@@ -1720,7 +1720,7 @@ def analyze_subtitle_with_frames(
         )
         blueprint_analysis_rules = (
             f"""- **先通读 SRT 字幕**：梳理剧情主线、对白与关键台词
-- **再对照整片视频分析**：{SEGMENT_INTERVAL_SECONDS}秒格 time_range、key_events、narration、environment_description 须逐项利用
+- **再对照整片视频分析**：各 time_range 窗的 key_events、narration、environment_description 须逐项利用
 - **交叉验证**：台词/时间戳以 SRT 为准，画面/环境/旁白以整片视频分析为准"""
             if has_srt_subtitle
             else """- **先通读整片视频分析**：按 episodic_segments 时间线梳理场景、人物、动作与环境"""
@@ -2025,7 +2025,7 @@ def analyze_subtitle_with_frames(
 - 本集/本片**实际出现**的人物：规范全名 + 身份/关系 + 性别（对照人物关系表，每人一行；禁止 ASR 谐音拆成两人）
 
 ## 全片场景分段
-按**原片时间顺序**覆盖整段视频，约 **10–25 个场景**（按情节密度划分，勿按 {SEGMENT_INTERVAL_SECONDS} 秒格机械切分）。
+按**原片时间顺序**覆盖整段视频，约 **10–25 个场景**（按情节密度划分，勿按短窗机械切分）。
 
 每个场景用三级标题，格式如下（**须写满各字段**）：
 
@@ -2183,7 +2183,7 @@ def analyze_subtitle_with_frames(
 - 本集/本片**实际出现**的人物：规范全名 + 身份/关系 + 性别（对照人物关系表，每人一行）
 
 ## 全片场景分段
-按**原片时间顺序**覆盖整段视频，约 **10–25 个场景**（按情节密度划分，勿按 {SEGMENT_INTERVAL_SECONDS} 秒格机械切分）。
+按**原片时间顺序**覆盖整段视频，约 **10–25 个场景**（按情节密度划分，勿按短窗机械切分）。
 
 每个场景用三级标题，格式如下（**须写满各字段**）：
 
@@ -2465,7 +2465,7 @@ def analyze_subtitle_with_frames(
                     f"- {item}" for item in (last_validation.get("issues") or [])
                 )
                 dual_time_hint = (
-                    f"「原片时间线」须双时间轴：视频格（{SEGMENT_INTERVAL_SECONDS}秒索引表）+ 字幕窗（SRT）；"
+                    f"「原片时间线」须双时间轴：视频格（{segment_policy_summary()}索引表）+ 字幕窗（SRT）；"
                     if use_video_episode_analysis
                     else ""
                 )

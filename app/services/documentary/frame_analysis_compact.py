@@ -604,6 +604,8 @@ def normalize_analysis_artifact_storage(
     from app.services.documentary.documentary_settings import get_documentary_settings
 
     cfg = settings or get_documentary_settings()
+    if cfg.get("frame_slim_output") or str(artifact.get("output_mode") or "") == "slim_timeline":
+        return artifact
     dedupe_env = bool(cfg.get("dedupe_scene_environment", True))
 
     segments = artifact.get("scene_segments")

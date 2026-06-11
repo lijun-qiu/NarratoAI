@@ -118,8 +118,16 @@ def retry_failed_frame_analysis_docu(
         enable_knowledge_text = bool(st.session_state.get("doc_frame_enable_drama_knowledge_text"))
         enable_relationship_diagram = bool(st.session_state.get("doc_frame_enable_relationship_diagram"))
         doc_settings = dict(doc_settings)
+        use_collage = bool(
+            st.session_state.get(
+                "doc_frame_use_collage_refs",
+                doc_settings.get("frame_reference_use_collage", True),
+            )
+        )
+        doc_settings["frame_reference_use_collage"] = use_collage
+        doc_settings["frame_reference_force_individual_heads"] = not use_collage
         doc_settings["frame_reference_token_saver"] = bool(
-            st.session_state.get("doc_frame_reference_token_saver", True)
+            st.session_state.get("doc_frame_reference_token_saver", False)
         )
         doc_settings = merge_frame_analysis_settings_for_drama(
             doc_settings,

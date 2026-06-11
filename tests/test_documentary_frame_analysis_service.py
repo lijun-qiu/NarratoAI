@@ -964,7 +964,7 @@ class DocumentaryFrameGenderHintTests(unittest.TestCase):
             "app",
             "data",
             "drama_knowledge",
-            "fazu2_relationships.md",
+            "fazu2_character_graph.json",
         )
         prompt = service._build_batch_prompt(
             frame_count=2,
@@ -977,6 +977,7 @@ class DocumentaryFrameGenderHintTests(unittest.TestCase):
             time_range="00:00:00,000-00:00:06,000",
         )
         self.assertIn("剧集人物关系对照（抽帧", prompt)
+        self.assertIn("秦枫", prompt)
 
     def test_batch_prompt_skips_drama_knowledge_when_disabled(self):
         service = DocumentaryFrameAnalysisService()
@@ -2643,7 +2644,7 @@ class DramaCharacterRegistryTests(unittest.TestCase):
         self.assertEqual(1, count1)
         self.assertEqual("", carryover1)
 
-    def test_compose_batch_vision_inputs_relationship_diagram_first(self):
+    def test_compose_batch_vision_inputs_ignores_relationship_diagram(self):
         from app.services.documentary.frame_extraction_service import DocumentaryFrameExtractionService
 
         frames = ["/tmp/frame1.jpg"]
@@ -2658,12 +2659,10 @@ class DramaCharacterRegistryTests(unittest.TestCase):
             character_references=refs,
             documentary_settings=settings,
         )
-        self.assertEqual(3, len(images))
-        self.assertTrue(images[0].endswith(".jpg"))
-        self.assertTrue(os.path.isfile(images[0]))
-        self.assertEqual(frames, images[2:])
+        self.assertEqual(2, len(images))
+        self.assertEqual(frames, images[1:])
         self.assertEqual(1, len(active))
-        self.assertEqual(2, ref_count)
+        self.assertEqual(1, ref_count)
 
     def test_merge_frame_analysis_settings_disables_text_by_default(self):
         from app.services.drama_character_registry import merge_frame_analysis_settings_for_drama
@@ -2685,20 +2684,46 @@ class DramaCharacterRegistryTests(unittest.TestCase):
             should_attach_reference_images,
         )
 
-        settings = {"frame_reference_token_saver": True}
-        self.assertTrue(should_attach_reference_images(0, settings))
-        self.assertFalse(should_attach_reference_images(1, settings))
-        # 拼图/少量头像：每批附上参照图以便逐脸对照
-        self.assertTrue(
+        settings = {
+            "frame_reference_token_saver": True,
+            "frame_reference_force_individual_heads": False,
+        }
+        self.assertTrue(should_attach_reference_images(0, settings, head_count=3))
+        self.assertFalse(should_attach_reference_images(1, settings, head_count=3))
+        # 拼图模式 + token_saver：同样仅首批
+        self.assertFalse(
             should_attach_reference_images(1, settings, head_count=11, use_collage=True)
         )
+        # 逐张定妆照：每批附上（忽略 token_saver）
+        individual_settings = {
+            "frame_reference_token_saver": True,
+            "frame_reference_force_individual_heads": True,
+        }
         self.assertTrue(
-            should_attach_reference_images(2, settings, head_count=3, use_collage=False)
+            should_attach_reference_images(2, individual_settings, head_count=3, use_collage=False)
         )
-        settings_off = {"frame_reference_token_saver": False, "frame_reference_attach_mode": ATTACH_MODE_FIRST_BATCH}
+        # 逐张定妆照：即使 token_saver 也只首批，仍每批附上
+        self.assertTrue(
+            should_attach_reference_images(
+                2,
+                {"frame_reference_token_saver": True, "frame_reference_force_individual_heads": True},
+                head_count=11,
+                use_collage=False,
+            )
+        )
+        settings_off = {
+            "frame_reference_token_saver": False,
+            "frame_reference_attach_mode": ATTACH_MODE_FIRST_BATCH,
+            "frame_reference_force_individual_heads": False,
+        }
         self.assertFalse(should_attach_reference_images(1, settings_off, head_count=11, use_collage=False))
 
-        self.assertTrue(resolve_reference_collage_mode({"frame_reference_token_saver": True}, head_count=11))
+        self.assertTrue(
+            resolve_reference_collage_mode(
+                {"frame_reference_use_collage": True, "frame_reference_force_individual_heads": False},
+                head_count=11,
+            )
+        )
         self.assertFalse(
             resolve_reference_collage_mode(
                 {"frame_reference_token_saver": True, "frame_reference_force_individual_heads": True},
@@ -2706,9 +2731,15 @@ class DramaCharacterRegistryTests(unittest.TestCase):
             )
         )
         self.assertFalse(resolve_reference_collage_mode({}, head_count=1))
-        self.assertTrue(resolve_reference_collage_mode({}, head_count=4))
+        self.assertFalse(resolve_reference_collage_mode({}, head_count=4))
         self.assertFalse(
             resolve_reference_collage_mode({"frame_reference_use_collage": False}, head_count=4)
+        )
+        self.assertTrue(
+            resolve_reference_collage_mode(
+                {"frame_reference_use_collage": True, "frame_reference_force_individual_heads": False},
+                head_count=4,
+            )
         )
 
         from app.services.drama_character_registry import resolve_active_relationship_diagram_path

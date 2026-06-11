@@ -202,6 +202,100 @@ def build_frame_extraction_json_skeleton(
 - overall_activity_summary：1–2 句，供批次索引与后期快速定位"""
 
 
+def build_frame_slim_role_preamble() -> str:
+    return (
+        "你是一位资深的影视素材分析师。你的任务是为**视频分析阶段**建立每秒视觉索引："
+        "对照定妆照**逐帧识别人物**、记录场景与硬字幕 OCR；"
+        "人物姓名**仅**来自面孔与定妆照对比，**禁止**凭字幕或剧情猜人。"
+    )
+
+
+def build_frame_slim_workflow_rules(*, frame_count: int) -> str:
+    return f"""## 精简抽帧工作流（硬性 · 仅 frame_timeline）
+
+1. **逐帧扫读**全部 {frame_count} 张图：头像对比识别人物、记录场景、复制硬字幕
+2. **禁止**输出 scene_segments / frame_observations / 解说脚本 JSON
+3. **禁止**凭硬字幕、SRT、剧情或关系表猜规范姓名；`characters` **仅**来自本帧面孔与定妆照对照匹配
+4. **禁止**在本阶段写 speaker 或「谁在说」；`visual_cue` 只写本帧可见嘴型/姿态/景别线索，**不得**据字幕推断说话人
+5. **禁止脑补**画面未出现的人、地点、事件；**禁止**因剧情推断某参照人物「不应入画」而漏标"""
+
+
+def build_frame_slim_timeline_spec(*, frame_count: int) -> str:
+    return f"""## frame_timeline 逐帧规范（必须 {frame_count} 条 · 与输入帧一一对应）
+
+每条对应**一帧**，按时间顺序输出，**不得遗漏**：
+- **timestamp**：`HH:MM:SS,mmm`（须与输入帧文件名时间码一致）
+- **title**：4–8 字片段标题（如「天台对峙」「停车场追逐」）；同场景连续帧可相同
+- **scene**：15–40 字场景描述（地点+动作/氛围；**不写人名**，人名放 characters）
+- **characters**（数组）：本帧可见人物规范姓名，**仅**当面孔与定妆照对照匹配（≥75% 相似）；无匹配则留空或用未名人员
+- **burned_in_subtitle**：硬字幕原文；无则空字符串；**与 characters 无关**，不得据字幕填人名
+- **visual_cue**：本帧可见线索（如「嘴型张开」「静听」「过肩背对镜头」）；**禁止**写规范姓名，**禁止**据字幕推断谁在说话
+- 硬字幕仅 OCR 复制，**不得**用于猜 `characters`"""
+
+
+def build_frame_slim_json_skeleton(
+    *,
+    frame_count: int,
+    burned_in_subtitle_example: str = "",
+) -> str:
+    burned = burned_in_subtitle_example or ""
+    return f"""## 输出 JSON 结构（只返回 JSON，不要 markdown 包裹）
+
+**禁止**输出 scene_segments / frame_observations / 解说脚本。`frame_timeline` 条数必须 = {frame_count}。
+
+```json
+{{
+  "frame_timeline": [
+    {{
+      "timestamp": "00:05:00,000",
+      "title": "停车场追逐",
+      "scene": "废弃停车场，汽车高速行驶，夜间冷调",
+      "characters": ["角色A"],
+      "burned_in_subtitle": "",
+      "visual_cue": "远景定场"
+    }},
+    {{
+      "timestamp": "00:05:02,000",
+      "title": "车顶趴伏",
+      "scene": "车顶，趴伏抓边，夜/室外/冷调",
+      "characters": ["角色A"],
+      "burned_in_subtitle": "你以为你赢了吗？",
+      "visual_cue": "特写，嘴型未张开，静听"
+    }}
+  ],
+  "overall_activity_summary": "本批次：5:00 停车场行驶 → 5:02 车顶角色A趴伏{burned}"
+}}
+```
+
+- frame_timeline：**必须** {frame_count} 条
+- overall_activity_summary：1–2 句事件链（可选）"""
+
+
+def build_frame_slim_extraction_prompt_body(
+    *,
+    frame_count: int,
+    burned_in_subtitle_example: str = "",
+    settings: dict | None = None,
+) -> str:
+    """精简模式：仅输出 frame_timeline（供视频分析推断说话人）。"""
+    from app.services.documentary.frame_dialogue_alignment import build_frame_dialogue_speaker_rules
+
+    sections = [
+        build_frame_slim_role_preamble(),
+        build_frame_slim_workflow_rules(frame_count=frame_count),
+        build_frame_timestamp_rules(),
+        build_frame_spatial_accuracy_rules(),
+        build_frame_dialogue_speaker_rules(),
+        build_frame_slim_timeline_spec(frame_count=frame_count),
+        build_frame_slim_json_skeleton(
+            frame_count=frame_count,
+            burned_in_subtitle_example=burned_in_subtitle_example,
+        ),
+        "请只返回 JSON 字符串，不要附加解释文字。",
+    ]
+    return "\n\n".join(sections)
+
+
 def build_frame_extraction_prompt_body(
     *,
     frame_count: int,
@@ -210,6 +304,12 @@ def build_frame_extraction_prompt_body(
 ) -> str:
     """组装视觉模型主 prompt（不含批次字幕摘录等动态补充）。"""
     cfg = settings or get_documentary_settings()
+    if cfg.get("frame_slim_output"):
+        return build_frame_slim_extraction_prompt_body(
+            frame_count=frame_count,
+            burned_in_subtitle_example=burned_in_subtitle_example,
+            settings=cfg,
+        )
     max_seg_sec = resolve_frame_max_segment_duration_sec(cfg)
     from app.services.documentary.frame_dialogue_alignment import build_frame_dialogue_speaker_rules
 

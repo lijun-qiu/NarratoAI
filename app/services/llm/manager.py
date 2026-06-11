@@ -43,6 +43,15 @@ class LLMServiceManager:
 
 
     @classmethod
+    def _ensure_providers_registered(cls) -> None:
+        """首次获取 provider 时自动注册（兼容非 WebUI 入口与线程池调用）。"""
+        if cls.is_registered():
+            return
+        from .providers import register_all_providers
+
+        register_all_providers()
+
+    @classmethod
     def is_registered(cls) -> bool:
         """
         检查是否已注册提供商
@@ -103,7 +112,8 @@ class LLMServiceManager:
             ProviderNotFoundError: 提供商未找到
             ConfigurationError: 配置错误
         """
-        # 检查提供商是否已注册
+        # 检查提供商是否已注册（未注册则懒加载）
+        cls._ensure_providers_registered()
         if not cls.is_registered():
             raise ConfigurationError(
                 "LLM 提供商未注册。请确保在应用启动时调用了 register_all_providers()。"
@@ -168,7 +178,8 @@ class LLMServiceManager:
             ProviderNotFoundError: 提供商未找到
             ConfigurationError: 配置错误
         """
-        # 检查提供商是否已注册
+        # 检查提供商是否已注册（未注册则懒加载）
+        cls._ensure_providers_registered()
         if not cls.is_registered():
             raise ConfigurationError(
                 "LLM 提供商未注册。请确保在应用启动时调用了 register_all_providers()。"

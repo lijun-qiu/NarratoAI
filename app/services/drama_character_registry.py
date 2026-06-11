@@ -113,20 +113,30 @@ def get_drama(drama_id: str) -> dict[str, str] | None:
 
 
 def resolve_knowledge_path_for_drama(drama_id: str) -> str:
+    drama_id = (drama_id or "").strip()
     meta = get_drama(drama_id)
-    if not meta:
-        return ""
-    rel_path = str(meta.get("knowledge_file") or "").strip()
-    if rel_path:
-        if os.path.isabs(rel_path):
-            return rel_path
-        return os.path.join(_PROJECT_ROOT, rel_path.replace("/", os.sep))
+    if meta:
+        rel_path = str(meta.get("knowledge_file") or "").strip()
+        if rel_path:
+            if os.path.isabs(rel_path):
+                return rel_path
+            return os.path.join(_PROJECT_ROOT, rel_path.replace("/", os.sep))
 
-    directory = head_img_dir(drama_id)
-    for filename in _KNOWLEDGE_FILENAMES:
-        candidate = os.path.join(directory, filename)
-        if os.path.isfile(candidate):
-            return candidate
+        directory = head_img_dir(drama_id)
+        for filename in _KNOWLEDGE_FILENAMES:
+            candidate = os.path.join(directory, filename)
+            if os.path.isfile(candidate):
+                return candidate
+
+    from app.data.drama_knowledge.fazu2_speaker_knowledge import (
+        bundled_fazu2_character_graph_path,
+        is_fazu2_drama,
+    )
+
+    if is_fazu2_drama(drama_id=drama_id):
+        bundled = bundled_fazu2_character_graph_path()
+        if bundled:
+            return bundled
     return ""
 
 
@@ -532,7 +542,7 @@ def build_batch_vision_reference_prompt_section(
             f"关键帧中**脸/侧脸清晰**且与定妆照逐脸对照、{FRAME_FACE_MATCH_SIMILARITY_HINT} → 写规范姓名 `姓名(男/女)`，禁止便衣男/年轻男子/警员等代称；",
             "**每一张关键帧须独立识脸**，禁止把上一帧人物照抄到下一帧；",
             "仅脸不可辨、背对、远景模糊或确实无法匹配时，才用未名人员或带服装特征的暂称；",
-            "**禁止**因关系表/定妆照列表而默认全员在场；**禁止**凭字幕称呼猜人。",
+            "匹配成功即在 **characters** 写规范姓名；**禁止**凭硬字幕/对白/关系表/剧情猜人。",
         ]
     )
     return "\n".join(lines)

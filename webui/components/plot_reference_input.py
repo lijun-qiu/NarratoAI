@@ -1,4 +1,4 @@
-"""剧情参考输入（抽帧分析 / 整片视频分析共用）。"""
+"""剧情参考输入（抽帧 / 蓝图 / 剧情解剖共用；不含默认人物关系）。"""
 
 from __future__ import annotations
 
@@ -12,17 +12,14 @@ def get_plot_reference() -> str:
 
 
 def render_plot_reference_input(*, key: str = PLOT_REFERENCE_SESSION_KEY) -> str:
-    """渲染剧情参考文本框，返回当前输入内容。"""
     st.text_area(
         "剧情参考",
-        height=120,
+        height=160,
         key=key,
         placeholder=(
-            "可选。填写本集/本片剧情背景，帮助模型理解画面，例如：\n"
-            "· 本集主线：主角追查失踪案，与搭档在审讯室对峙\n"
-            "· 人物：张三（刑警）、李四（嫌疑人）\n"
-            "· 前情：上一集结尾张三在停车场发现线索"
+            "本集主线、情节背景、名场面说明等（可选）。\n"
+            "示例：本集主线为胡小跃坠楼案调查，开篇为楼顶对峙。"
         ),
-        help="仅作理解辅助，不会替代画面分析；留空则不注入。",
+        help="理解辅助；留空则不注入。人物关系请填上方「人物关系」框。",
     )
     return get_plot_reference()

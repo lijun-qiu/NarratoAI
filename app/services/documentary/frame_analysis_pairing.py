@@ -104,6 +104,8 @@ def is_valid_analysis_artifact(payload: Any) -> bool:
         return False
     if payload.get("scene_segments"):
         return True
+    if payload.get("frame_timeline"):
+        return True
     if payload.get("batches"):
         return True
     if payload.get("frame_observations"):

@@ -651,7 +651,7 @@ def _render_documentary_material_status(tr) -> None:
             st.warning("视频分析: 未就绪")
 
     st.caption(
-        f"视频分析 JSON 会按当前视频自动配对；在「{tr('Material Preprocess')}」中生成或补全。"
+        "也可在下方从默认目录选用或上传；未选用时会按当前视频自动配对同名文件。"
     )
 
 
@@ -667,11 +667,9 @@ def render_documentary_subtitle_options(tr, doc_settings, *, compact: bool = Fal
 
 
 def _render_short_drama_video_analysis_block(tr) -> None:
-    """短剧解说：整片视频分析 JSON 状态（自动配对当前视频）。"""
-    from app.services.documentary.documentary_material_resolver import (
-        resolve_video_episode_analysis_path_for_documentary,
-    )
+    """短剧解说：整片视频分析 JSON 选用/上传。"""
     from webui.components.video_episode_analysis_settings import (
+        render_documentary_video_episode_analysis_file_picker,
         sync_video_episode_analysis_with_video,
     )
 
@@ -679,22 +677,15 @@ def _render_short_drama_video_analysis_block(tr) -> None:
     if video_path:
         sync_video_episode_analysis_with_video(video_path)
 
-    material_source = (st.session_state.get("doc_material_source_video_path") or "").strip()
-    video_episode_explicit = (
-        st.session_state.get("video_episode_analysis_json_path") or ""
-    ).strip() or None
-    video_episode_resolved = resolve_video_episode_analysis_path_for_documentary(
+    render_documentary_video_episode_analysis_file_picker(
+        tr,
         video_path,
-        material_source_video_path=material_source,
-        explicit_path=video_episode_explicit,
+        path_input_key="sd_summary_video_episode_path_input",
+        pick_key="sd_summary_video_episode_saved_pick",
+        confirm_button_key="sd_summary_confirm_video_episode_path",
+        clear_button_key="sd_summary_clear_video_episode",
+        import_key="sd_summary_video_episode_uploader",
     )
-    st.markdown("**整片视频分析 JSON**（构思蓝图与脚本选材依据）")
-    if video_episode_resolved and os.path.isfile(video_episode_resolved):
-        source = "已确认选用" if video_episode_explicit else "自动配对"
-        st.success(f"{source}: `{os.path.basename(video_episode_resolved)}`")
-        st.session_state["video_episode_analysis_json_path"] = video_episode_resolved
-    else:
-        st.info("请先在「素材预处理 → 整片视频分析」生成 JSON，生成后将自动配对当前视频。")
 
 
 def _render_short_drama_ost_settings(tr) -> None:
@@ -737,34 +728,37 @@ def short_drama_summary(tr):
     st.session_state.setdefault("narration_workflow_mode", "summary")
     config.app.setdefault("narration_workflow_mode", "summary")
     st.caption(
-        "推荐流程：完成字幕转录与「整片视频分析」→ 下方选用字幕 → "
+        "推荐流程：在「素材预处理」完成字幕转录与整片视频分析 → 下方选用 SRT 与分析 JSON → "
         "**① 自动生成** 或 **手动填写/修正** 剧情构思方案 → **② 生成 JSON 脚本**（有方案后无需重复分析）。"
     )
-    _render_short_drama_video_analysis_block(tr)
     _render_short_drama_ost_settings(tr)
     st.divider()
     _render_documentary_material_status(tr)
-    with st.expander("字幕（从默认目录选择）", expanded=False):
-        render_documentary_subtitle_file_picker(
-            tr,
-            path_input_key="sd_summary_subtitle_path_input",
-            pick_key="sd_summary_subtitle_saved_pick",
-            confirm_button_key="sd_summary_confirm_subtitle_path",
-            clear_button_key="sd_summary_clear_subtitle",
-            import_key="sd_summary_subtitle_uploader",
-        )
+    st.markdown("**字幕 SRT**（从默认目录选择或上传）")
+    render_documentary_subtitle_file_picker(
+        tr,
+        path_input_key="sd_summary_subtitle_path_input",
+        pick_key="sd_summary_subtitle_saved_pick",
+        confirm_button_key="sd_summary_confirm_subtitle_path",
+        clear_button_key="sd_summary_clear_subtitle",
+        import_key="sd_summary_subtitle_uploader",
+    )
+    with st.expander("整片视频分析 JSON（从默认目录选择或上传）", expanded=False):
+        _render_short_drama_video_analysis_block(tr)
     doc_settings = get_documentary_settings()
     default_enabled = bool(doc_settings.get("enable_subtitle_enrichment", True))
     st.checkbox(
         "结合整片视频分析（与字幕交叉验证，生成构思蓝图）",
         value=st.session_state.get("sd_enable_video_episode_analysis", default_enabled),
         key="sd_enable_video_episode_analysis",
-        help="勾选后须先完成「素材预处理 → 整片视频分析」；取消勾选则构思蓝图仅用字幕",
+        help="勾选后须先选用整片视频分析 JSON；取消勾选则构思蓝图仅用字幕",
     )
     return render_subtitle_narration_panel(
         tr,
         work_name_label="短剧名称",
         uploader_key="subtitle_file_uploader",
+        show_transcription=False,
+        show_subtitle_uploader=False,
         temperature_default=float(
             get_short_drama_settings().get("narration_script_temperature", 0.4)
         ),
@@ -1099,6 +1093,8 @@ def render_subtitle_narration_panel(
     *,
     show_work_name: bool = True,
     show_temperature: bool = True,
+    show_transcription: bool = True,
+    show_subtitle_uploader: bool = True,
     temperature_default: float = 0.7,
 ):
     """字幕解说类模式共用面板（短剧解说 / 影视解说）"""
@@ -1106,72 +1102,74 @@ def render_subtitle_narration_panel(
     if 'subtitle_file_processed' not in st.session_state:
         st.session_state['subtitle_file_processed'] = False
 
-    with st.expander("字幕转录（三种方式 + 自动回退）", expanded=False):
-        render_fun_asr_transcription(tr)
-    
-    subtitle_file = st.file_uploader(
-        tr("上传字幕文件"),
-        type=["srt"],
-        accept_multiple_files=False,
-        key=uploader_key
-    )
-    
-    # 显示当前已上传的字幕文件路径
-    if 'subtitle_path' in st.session_state and st.session_state['subtitle_path']:
-        st.info(f"已上传字幕: {os.path.basename(st.session_state['subtitle_path'])}")
-        if st.button(tr("清除已上传字幕")):
-            st.session_state['subtitle_path'] = None
-            st.session_state['subtitle_content'] = None
-            st.session_state['subtitle_file_processed'] = False
-            st.rerun()
-    
-    # 只有当有文件上传且尚未处理时才执行处理逻辑
-    if subtitle_file is not None and not st.session_state['subtitle_file_processed']:
-        try:
-            # 清理文件名，防止路径污染和路径遍历攻击
-            safe_filename = os.path.basename(subtitle_file.name)
+    if show_transcription:
+        with st.expander("字幕转录（三种方式 + 自动回退）", expanded=False):
+            render_fun_asr_transcription(tr)
 
-            decoded = decode_subtitle_bytes(subtitle_file.getvalue())
-            script_content = decoded.text
-            detected_encoding = decoded.encoding
+    if show_subtitle_uploader:
+        subtitle_file = st.file_uploader(
+            tr("上传字幕文件"),
+            type=["srt"],
+            accept_multiple_files=False,
+            key=uploader_key
+        )
 
-            if not script_content:
-                st.error(tr("无法读取字幕文件，请检查文件编码（支持 UTF-8、UTF-16、GBK、GB2312）"))
-                st.stop()
+        # 显示当前已上传的字幕文件路径
+        if 'subtitle_path' in st.session_state and st.session_state['subtitle_path']:
+            st.info(f"已上传字幕: {os.path.basename(st.session_state['subtitle_path'])}")
+            if st.button(tr("清除已上传字幕")):
+                st.session_state['subtitle_path'] = None
+                st.session_state['subtitle_content'] = None
+                st.session_state['subtitle_file_processed'] = False
+                st.rerun()
 
-            # 验证字幕内容（简单检查）
-            if len(script_content.strip()) < 10:
-                st.warning(tr("字幕文件内容似乎为空，请检查文件"))
+        # 只有当有文件上传且尚未处理时才执行处理逻辑
+        if subtitle_file is not None and not st.session_state['subtitle_file_processed']:
+            try:
+                # 清理文件名，防止路径污染和路径遍历攻击
+                safe_filename = os.path.basename(subtitle_file.name)
 
-            # 保存到字幕目录
-            script_file_path = os.path.join(utils.subtitle_dir(), safe_filename)
-            file_name, file_extension = os.path.splitext(safe_filename)
+                decoded = decode_subtitle_bytes(subtitle_file.getvalue())
+                script_content = decoded.text
+                detected_encoding = decoded.encoding
 
-            # 如果文件已存在,添加时间戳
-            if os.path.exists(script_file_path):
-                timestamp = time.strftime("%Y%m%d%H%M%S")
-                file_name_with_timestamp = f"{file_name}_{timestamp}"
-                script_file_path = os.path.join(utils.subtitle_dir(), file_name_with_timestamp + file_extension)
+                if not script_content:
+                    st.error(tr("无法读取字幕文件，请检查文件编码（支持 UTF-8、UTF-16、GBK、GB2312）"))
+                    st.stop()
 
-            # 直接写入SRT内容（统一使用 UTF-8）
-            with open(script_file_path, "w", encoding='utf-8') as f:
-                f.write(script_content)
+                # 验证字幕内容（简单检查）
+                if len(script_content.strip()) < 10:
+                    st.warning(tr("字幕文件内容似乎为空，请检查文件"))
 
-            # 更新状态
-            st.success(
-                f"{tr('字幕上传成功')} "
-                f"(编码: {detected_encoding.upper()}, "
-                f"大小: {len(script_content)} 字符)"
-            )
-            st.session_state['subtitle_path'] = script_file_path
-            st.session_state['subtitle_content'] = script_content
-            st.session_state['subtitle_file_processed'] = True  # 标记已处理
+                # 保存到字幕目录
+                script_file_path = os.path.join(utils.subtitle_dir(), safe_filename)
+                file_name, file_extension = os.path.splitext(safe_filename)
 
-            # 避免使用rerun，使用更新状态的方式
-            # st.rerun()
+                # 如果文件已存在,添加时间戳
+                if os.path.exists(script_file_path):
+                    timestamp = time.strftime("%Y%m%d%H%M%S")
+                    file_name_with_timestamp = f"{file_name}_{timestamp}"
+                    script_file_path = os.path.join(utils.subtitle_dir(), file_name_with_timestamp + file_extension)
 
-        except Exception as e:
-            st.error(f"{tr('Upload failed')}: {str(e)}")
+                # 直接写入SRT内容（统一使用 UTF-8）
+                with open(script_file_path, "w", encoding='utf-8') as f:
+                    f.write(script_content)
+
+                # 更新状态
+                st.success(
+                    f"{tr('字幕上传成功')} "
+                    f"(编码: {detected_encoding.upper()}, "
+                    f"大小: {len(script_content)} 字符)"
+                )
+                st.session_state['subtitle_path'] = script_file_path
+                st.session_state['subtitle_content'] = script_content
+                st.session_state['subtitle_file_processed'] = True  # 标记已处理
+
+                # 避免使用rerun，使用更新状态的方式
+                # st.rerun()
+
+            except Exception as e:
+                st.error(f"{tr('Upload failed')}: {str(e)}")
 
     # 名称输入框
     video_theme = ""

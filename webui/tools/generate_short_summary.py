@@ -380,6 +380,7 @@ def generate_plot_blueprint_short(
                     source_duration_sec=source_duration_sec or None,
                     video_episode_json_path=video_episode_json_path,
                     video_episode_markdown=video_markdown,
+                    character_relationship=str(st.session_state.get("doc_character_relationship") or ""),
                 )
             else:
                 subtitle_content = ""

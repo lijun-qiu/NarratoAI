@@ -100,7 +100,7 @@ def _render_single_head_upload_slot(
             st.session_state[select_key] = True
             del st.session_state[pending_select_key]
         elif select_key not in st.session_state:
-            st.session_state[select_key] = True
+            st.session_state[select_key] = False
         if st.checkbox("用于分析", key=select_key, help="勾选后头像将发送给抽帧与整片视频分析的视觉模型"):
             selected_names.append(name)
     else:
@@ -160,17 +160,24 @@ def render_drama_character_input() -> str:
         )
     with opt_cols[1]:
         st.checkbox(
-            "分析时使用关系图",
+            "视频分析时使用关系图",
             value=False,
             key="doc_frame_enable_relationship_diagram",
-            help="勾选且已上传关系图时，每批将关系图作为图 #1 发送给视觉模型",
+            help="勾选且已上传关系图时，**视频分析**每批附关系图；**抽帧分析不使用关系图**",
         )
 
     st.checkbox(
-        "参照图省 token（推荐：仅首批发送 + 缩小 + 多头像合成一张）",
+        "定妆照拼图（2人/张，推荐 · 省 token）",
         value=True,
+        key="doc_frame_use_collage_refs",
+        help="开启：每 2 张头像拼成 1 张并标注姓名，每批仍附参照图，识脸准确率接近分张。"
+        " 关闭：每人单独 1 张，token 最高。",
+    )
+    st.checkbox(
+        "参照图仅首批（更省 token，后续批次无图对照，准确率下降）",
+        value=False,
         key="doc_frame_reference_token_saver",
-        help="关闭后每批都会重复发送全部参照图，token 消耗更高",
+        help="仅第 1 批发送定妆照，后续靠文字提示。拼图模式下建议保持关闭。",
     )
 
     relationship_path = find_relationship_diagram_path(drama_id)
@@ -180,11 +187,11 @@ def render_drama_character_input() -> str:
         if relationship_path and os.path.isfile(relationship_path):
             st.image(relationship_path, caption="当前关系图", use_container_width=True)
         else:
-            st.caption("未上传 · 勾选「使用关系图」且上传后才会参与分析")
+            st.caption("未上传 · 勾选「视频分析时使用关系图」且上传后，仅**视频分析**阶段会附关系图")
     with rel_cols[1]:
         st.caption(
             f"保存为 `{os.path.join(head_img_dir(drama_id), '_relationship.png/jpg')}` · "
-            "仅上传不勾选不会消耗 token"
+            "抽帧分析不使用；仅视频分析勾选后才会附关系图"
         )
         rel_uploaded = st.file_uploader(
             "上传人物关系图",
@@ -210,7 +217,7 @@ def render_drama_character_input() -> str:
     st.caption(
         f"人物头像目录：`{head_dir}`（已上传 {uploaded_count}/{len(slots)} 人）"
         " · 请用下方上传框保存，文件会自动命名为「人物名.jpg/png」"
-        " · 已上传默认勾选用于分析"
+        " · **默认不勾选**；请手动勾选本场需要参与面孔匹配的人物"
     )
     orphan_files = list_unrecognized_head_images(drama_id)
     if orphan_files:
@@ -223,8 +230,8 @@ def render_drama_character_input() -> str:
 
     with st.expander("人物头像上传", expanded=uploaded_count == 0):
         st.caption(
-            "上传正面/半身照后默认勾选参与分析；取消勾选则该人物头像不发送给视觉模型。"
-            " 建议先完成「高频」分组，再按需补充中等/低频角色。"
+            "上传后**仅该人物**会临时自动勾选；其余人物请手动勾选「用于分析」。"
+            " 建议只选本场 4–6 个高频角色，识别更准、token 更省。"
             " 请勿手动把截图丢进文件夹（需按人物名命名才能被识别）。"
         )
         if not slots:

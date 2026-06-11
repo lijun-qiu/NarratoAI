@@ -1630,6 +1630,7 @@ def analyze_subtitle_with_frames(
     source_duration_sec: float | None = None,
     video_episode_json_path: str | None = None,
     video_episode_markdown: str = "",
+    character_relationship: str = "",
 ) -> str:
     """文本模型：结合字幕与整片视频分析/抽帧摘要做对照分析。
 
@@ -1794,13 +1795,13 @@ def analyze_subtitle_with_frames(
                 int(cfg.get("subtitle_analysis_short_drama_max_tokens", 8192) or 8192),
             )
         if for_plot_blueprint:
-            drama_knowledge_block, drama_known_names = (
-                build_plot_blueprint_character_relationship_table_section(
-                    theme,
-                    cfg,
-                    use_video_episode_analysis=use_video_episode_analysis,
-                )
+            from app.services.documentary.character_relationship import (
+                build_character_relationship_prompt_section,
             )
+
+            rel_body = build_character_relationship_prompt_section(character_relationship)
+            drama_knowledge_block = rel_body
+            drama_known_names = set()
         else:
             drama_knowledge_block, drama_known_names = build_short_drama_drama_knowledge_section(
                 theme,

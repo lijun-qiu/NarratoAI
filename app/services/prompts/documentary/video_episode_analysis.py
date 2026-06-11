@@ -9,6 +9,7 @@ from typing import Any
 
 from app.services.documentary.documentary_settings import (
     FRAME_FACE_MATCH_SIMILARITY_HINT,
+    FRAME_FACE_MATCH_SIMILARITY_MIN_PERCENT,
     FRAME_UNKNOWN_CHARACTER_FEMALE,
     FRAME_UNKNOWN_CHARACTER_MALE,
 )
@@ -131,6 +132,21 @@ def build_video_episode_vision_reference_prompt_section(
     return "\n".join(lines)
 
 
+def build_video_speaker_inference_rules() -> str:
+    return """## 说话人归属（硬性 · 仅依据本段视频画面）
+
+- `important_dialogues.speaker` 须为**该台词时间窗内可见**且与定妆照匹配（≥75% 相似）的人物
+- 结合画面嘴型/手势：嘴型张开或明显发言姿态 → 候选说话人；静听/反应镜 → **不是**说话人
+- 过肩镜头：台词常属**背对镜头者**，勿把对脸聆听者标为 speaker
+- 多人同屏时结合用户提供的人物关系消歧；仍须面孔匹配，**禁止**听声猜人
+- 无法确认时写「剧中未明确交代」；**禁止**写未入画或未匹配成功的人物规范名"""
+
+
+def build_frame_timeline_speaker_inference_rules() -> str:
+    """兼容旧引用；视频分析已不再注入 frame_timeline。"""
+    return build_video_speaker_inference_rules()
+
+
 def build_character_naming_guidance_block(*, has_references: bool = False) -> str:
     if not has_references:
         return (
@@ -144,7 +160,7 @@ def build_character_naming_guidance_block(*, has_references: bool = False) -> st
         "## 人物命名规则（须对照上传头像 · 严格）\n"
         f"- **每个时间窗独立识脸**（{policy_label}）：每条 `episodic_segments` 须对照该 `time_range` 窗口内**实际可见面孔**与定妆照匹配后再写 `involved_characters`\n"
         f"- 仅当脸/侧脸清晰且与定妆照匹配（{FRAME_FACE_MATCH_SIMILARITY_HINT}）"
-        " → 写规范姓名；**未达 90% 相似度禁止写规范名**\n"
+        f" → 写规范姓名；**未达 {FRAME_FACE_MATCH_SIMILARITY_MIN_PERCENT}% 相似度禁止写规范名**\n"
         f"- 该窗口内**无清晰人脸 / 无法匹配 / 相似度不足** → 写「{FRAME_UNKNOWN_CHARACTER_MALE}」「{FRAME_UNKNOWN_CHARACTER_FEMALE}」"
         " 或「剧中未明确交代」，**禁止**便衣男/年轻警员/警服男子等泛称，**禁止**凭剧情印象猜名\n"
         "- **禁止**仅凭字幕称呼、对白内容、上下格人物、服装等猜规范姓名\n"
@@ -158,8 +174,8 @@ def build_per_grid_face_identification_rules() -> str:
     return (
         f"## 逐窗面孔识别（硬性 · {policy_label}）\n"
         "- 每条 `episodic_segments` = 一个预计算 time_range → **必须**基于该窗口画面独立填写 `involved_characters`\n"
-        "- 窗口内有多张清晰人脸 → **逐脸**对照定妆照（拼图每张最多 4 人，须逐张放大对照），匹配者全部写入数组\n"
-        "- 仅写**该窗口内确实可见**且相似度 **≥90%** 匹配成功的人物；人物离场/未入画/无法确认则不要写入\n"
+        "- 窗口内有多张清晰人脸 → **逐脸**对照定妆照（拼图按标注序号+姓名逐张对照），匹配者全部写入数组\n"
+        f"- 仅写**该窗口内确实可见**且相似度 **≥{FRAME_FACE_MATCH_SIMILARITY_MIN_PERCENT}%** 匹配成功的人物；人物离场/未入画/无法确认则不要写入\n"
         "- 禁止把上一窗或下一窗的人物照抄到本窗；**禁止**凭对白、剧情、警服等猜不在画面中的人"
     )
 

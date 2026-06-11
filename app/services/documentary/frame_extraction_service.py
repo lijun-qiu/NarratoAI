@@ -34,6 +34,14 @@ from app.services.documentary.frame_extraction_rules import (
     build_frame_extraction_prompt_body,
     enrich_scene_segment_from_editor_fields,
 )
+from app.services.documentary.frame_timeline import (
+    attach_frame_timeline_to_artifact,
+    build_timeline_batch_summary,
+    finalize_slim_timeline_artifact,
+    frame_observation_to_timeline_entry,
+    normalize_frame_timeline_entry,
+    timeline_entry_to_frame_observation,
+)
 from app.services.documentary.frame_timeline_refinement import (
     build_scene_segments_from_frame_observations,
     refine_batch_from_frame_observations,
@@ -76,6 +84,11 @@ from app.services.documentary.vision_model_rotation import (
     resolve_vision_model_chain,
 )
 from app.utils import utils, video_processor
+
+
+def _frame_extraction_relationship_path() -> str:
+    """抽帧分析不使用人物关系图，仅通过定妆照面孔对照识别人物。"""
+    return ""
 
 
 class DocumentaryFrameExtractionService:
@@ -124,11 +137,7 @@ class DocumentaryFrameExtractionService:
         progress = progress_callback or (lambda _p, _m: None)
         resolved_max_duration = self._resolve_max_duration_seconds(max_duration_seconds, test_mode=test_mode)
         resolved_start_time = self._resolve_start_time_seconds(start_time_seconds, test_mode=test_mode)
-        resolved_relationship = (
-            resolve_media_path(relationship_diagram_path)
-            if frame_relationship_diagram_enabled
-            else ""
-        )
+        resolved_relationship = _frame_extraction_relationship_path()
         doc_settings = merge_frame_analysis_settings_for_drama(
             documentary_settings or get_documentary_settings(),
             drama_id,
@@ -291,13 +300,7 @@ class DocumentaryFrameExtractionService:
         resolved_plot_reference = (plot_reference or str(artifact.get("plot_reference") or "")).strip()
         resolved_drama_id = (drama_id or str(artifact.get("drama_id") or "")).strip()
         enable_knowledge_text = frame_drama_knowledge_text_enabled
-        rel_enabled = frame_relationship_diagram_enabled
-        resolved_relationship = ""
-        if rel_enabled:
-            resolved_relationship = (
-                resolve_media_path(relationship_diagram_path)
-                or resolve_media_path(str(artifact.get("relationship_diagram_path") or ""))
-            )
+        resolved_relationship = _frame_extraction_relationship_path()
         doc_settings = merge_frame_analysis_settings_for_drama(
             documentary_settings or get_documentary_settings(),
             resolved_drama_id,
@@ -439,7 +442,7 @@ class DocumentaryFrameExtractionService:
             character_references=character_references,
             relationship_diagram_path=resolved_relationship,
             frame_drama_knowledge_text_enabled=enable_knowledge_text,
-            frame_relationship_diagram_enabled=rel_enabled,
+            frame_relationship_diagram_enabled=False,
             plot_reference=resolved_plot_reference,
             test_mode=test_mode,
             test_max_duration_seconds=test_max_duration,
@@ -705,7 +708,7 @@ class DocumentaryFrameExtractionService:
     ) -> list[FrameBatchResult]:
         doc_settings = documentary_settings or get_documentary_settings()
         resolved_refs = self._resolve_character_references(character_references)
-        resolved_relationship = resolve_media_path(relationship_diagram_path)
+        resolved_relationship = _frame_extraction_relationship_path()
         semaphore = asyncio.Semaphore(max(1, max_concurrency))
         total = len(items)
         done = 0
@@ -772,6 +775,7 @@ class DocumentaryFrameExtractionService:
                     vision_model_used=model_used,
                     character_references=active_refs,
                     reference_images_attached=ref_image_count > 0,
+                    frame_slim_output=bool(doc_settings.get("frame_slim_output")),
                 )
             except Exception as exc:
                 return self._build_failed_batch_result(
@@ -1051,7 +1055,7 @@ class DocumentaryFrameExtractionService:
         refs = DocumentaryFrameExtractionService._resolve_character_references(character_references)
         prefix_paths, carryover = prepare_reference_prefix_images(
             batch_index=batch_index,
-            relationship_diagram_path=relationship_diagram_path,
+            relationship_diagram_path=_frame_extraction_relationship_path(),
             character_references=refs,
             settings=documentary_settings,
         )
@@ -1076,7 +1080,7 @@ class DocumentaryFrameExtractionService:
     ) -> list[FrameBatchResult]:
         doc_settings = documentary_settings or get_documentary_settings()
         resolved_refs = self._resolve_character_references(character_references)
-        resolved_relationship = resolve_media_path(relationship_diagram_path)
+        resolved_relationship = _frame_extraction_relationship_path()
         semaphore = asyncio.Semaphore(max(1, max_concurrency))
         total = len(batches)
         done = 0
@@ -1150,6 +1154,7 @@ class DocumentaryFrameExtractionService:
                     vision_model_used=model_used,
                     character_references=active_refs,
                     reference_images_attached=ref_image_count > 0,
+                    frame_slim_output=bool(doc_settings.get("frame_slim_output")),
                 )
             except Exception as exc:
                 return self._build_failed_batch_result(
@@ -1194,6 +1199,7 @@ class DocumentaryFrameExtractionService:
         reference_image_count: int = 0,
     ) -> str:
         cfg = documentary_settings or get_documentary_settings()
+        slim_mode = bool(cfg.get("frame_slim_output"))
         prompt = self._build_analysis_prompt(
             frame_count=frame_count,
             include_burned_in_subtitle=bool(cfg.get("enable_hard_subtitle_ocr", True)),
@@ -1217,7 +1223,7 @@ class DocumentaryFrameExtractionService:
             extra_lines.append(reference_carryover_prompt.strip())
         else:
             ref_section = build_batch_vision_reference_prompt_section(
-                relationship_diagram_path=relationship_diagram_path,
+                relationship_diagram_path=_frame_extraction_relationship_path(),
                 character_references=character_references or [],
                 video_frame_count=frame_count,
                 drama_label=drama_label or (video_theme or cfg.get("default_video_theme") or "").strip(),
@@ -1228,63 +1234,70 @@ class DocumentaryFrameExtractionService:
             if ref_section.strip():
                 extra_lines.append(ref_section.strip())
                 extra_lines.append(
-                    "定妆照仅在本批可见面孔匹配时可写规范姓名；关系图仅作谐音/关系校正，不可猜人。"
+                    "规范姓名仅在本帧可见面孔与定妆照匹配时写入 characters；"
+                    "硬字幕/SRT/剧情不得用于猜人。"
                 )
-        has_drama = bool(cfg.get("enable_frame_analysis_drama_knowledge"))
-        has_refs = bool(character_references) or bool(resolve_media_path(relationship_diagram_path))
+        has_refs = bool(character_references)
         priority_rules = build_frame_naming_priority_rules(
-            has_drama_knowledge=has_drama,
+            has_drama_knowledge=bool(cfg.get("enable_frame_analysis_drama_knowledge")),
             has_character_references=has_refs,
             is_carryover_batch=bool(reference_carryover_prompt.strip()),
         )
         extra_lines.append(priority_rules)
-        dialogue_hint = build_frame_dialogue_speaker_rules()
-        if dialogue_hint.strip():
-            extra_lines.append(dialogue_hint.strip())
+        if not slim_mode:
+            dialogue_hint = build_frame_dialogue_speaker_rules()
+            if dialogue_hint.strip():
+                extra_lines.append(dialogue_hint.strip())
         face_match_hint = build_frame_face_match_batch_hint(character_references, frame_count=frame_count)
         if face_match_hint.strip():
             extra_lines.append(face_match_hint.strip())
         visible_hint = build_frame_visible_content_hint(cfg, frame_count=frame_count)
         if visible_hint:
             extra_lines.append(visible_hint)
-        theme_text = (video_theme or cfg.get("default_video_theme") or "").strip()
-        drama_block, _ = build_frame_analysis_drama_knowledge_section(theme_text, cfg)
-        if drama_block.strip():
-            extra_lines.append(drama_block.strip())
-        relationship_hint = build_frame_obvious_relationship_hint(
-            (drama_label or video_theme or "").strip()
-        )
-        if relationship_hint.strip():
-            extra_lines.append(relationship_hint.strip())
-        naming_hint = build_frame_character_naming_hint(cfg)
-        if naming_hint:
-            extra_lines.append(naming_hint)
-        gender_hint = build_frame_gender_hint(cfg)
-        if gender_hint:
-            extra_lines.append(gender_hint)
-        highlight_hint = build_frame_highlight_hint(cfg)
-        if highlight_hint:
-            extra_lines.append(highlight_hint)
-        if cfg.get("enable_subtitle_enrichment", True) and (subtitle_content or "").strip() and time_range:
-            pad_sec = int(cfg.get("subtitle_batch_pad_sec", 5))
-            dialogue = subtitle_excerpt_for_time_range(
-                subtitle_content,
-                time_range,
-                pad_ms=pad_sec * 1000,
+        if not slim_mode:
+            theme_text = (video_theme or cfg.get("default_video_theme") or "").strip()
+            drama_block, _ = build_frame_analysis_drama_knowledge_section(theme_text, cfg)
+            if drama_block.strip():
+                extra_lines.append(drama_block.strip())
+            relationship_hint = build_frame_obvious_relationship_hint(
+                (drama_label or video_theme or "").strip()
             )
-            if dialogue:
-                extra_lines.append(
-                    f"本批次时间范围 {time_range} 附近字幕对白（分析画面时请对照，不要虚构台词；"
-                    f"出现的小名/昵称/关系称呼须原样使用）：{dialogue}"
+            if relationship_hint.strip():
+                extra_lines.append(relationship_hint.strip())
+            naming_hint = build_frame_character_naming_hint(cfg)
+            if naming_hint:
+                extra_lines.append(naming_hint)
+            gender_hint = build_frame_gender_hint(cfg)
+            if gender_hint:
+                extra_lines.append(gender_hint)
+            highlight_hint = build_frame_highlight_hint(cfg)
+            if highlight_hint:
+                extra_lines.append(highlight_hint)
+            if cfg.get("enable_subtitle_enrichment", True) and (subtitle_content or "").strip() and time_range:
+                pad_sec = int(cfg.get("subtitle_batch_pad_sec", 5))
+                dialogue = subtitle_excerpt_for_time_range(
+                    subtitle_content,
+                    time_range,
+                    pad_ms=pad_sec * 1000,
                 )
-        extra_lines.append(
-            "scene_segments 若含 subtitle_entries（每项 start/end/text），其中 text 为**原片字幕逐条原文**；"
-            "characters 中的人名须由本批可见面孔与定妆照匹配；observation/action 禁止写人名；"
-            "硬字幕对白与面孔匹配的人名可同时成立；勿改写 subtitle_entries 原文。"
-        )
-        plot_section = build_plot_reference_prompt_section(plot_reference)
-        if plot_section.strip():
-            extra_lines.append(plot_section.strip())
+                if dialogue:
+                    extra_lines.append(
+                        f"本批次时间范围 {time_range} 附近字幕对白（分析画面时请对照，不要虚构台词；"
+                        f"出现的小名/昵称/关系称呼须原样使用）：{dialogue}"
+                    )
+            extra_lines.append(
+                "scene_segments 若含 subtitle_entries（每项 start/end/text），其中 text 为**原片字幕逐条原文**；"
+                "characters 中的人名须由本批可见面孔与定妆照匹配；observation/action 禁止写人名；"
+                "勿改写 subtitle_entries 原文。"
+            )
+            plot_section = build_plot_reference_prompt_section(plot_reference)
+            if plot_section.strip():
+                extra_lines.append(plot_section.strip())
+        else:
+            extra_lines.append(
+                "精简模式：`characters` 仅来自本批关键帧面孔与定妆照对照；"
+                "硬字幕只填 burned_in_subtitle，**禁止**据字幕或剧情猜人。"
+            )
         if (video_theme or "").strip():
             extra_lines.append(f"视频主题：{video_theme.strip()}")
         if (custom_prompt or "").strip():
@@ -1369,6 +1382,7 @@ class DocumentaryFrameExtractionService:
 
         batch_dicts: list[dict[str, Any]] = []
         frame_observations: list[dict[str, Any]] = []
+        frame_timeline: list[dict[str, Any]] = []
         scene_segments: list[dict[str, Any]] = []
 
         for batch in sorted_batches:
@@ -1382,6 +1396,7 @@ class DocumentaryFrameExtractionService:
                 ]
                 scene_segments.extend(slim_batch_segments)
 
+            batch_timeline = list(batch.frame_timeline) if is_success else []
             batch_payload = {
                 "batch_index": batch.batch_index,
                 "status": batch.status,
@@ -1393,6 +1408,7 @@ class DocumentaryFrameExtractionService:
                     if name
                 ],
                 "scene_segments": slim_batch_segments,
+                "frame_timeline": batch_timeline,
                 "frame_observations": list(batch.frame_observations) if is_success else [],
                 "overall_activity_summary": batch.overall_activity_summary if is_success else "",
                 "fallback_summary": batch.fallback_summary if not is_success else "",
@@ -1403,6 +1419,14 @@ class DocumentaryFrameExtractionService:
 
             if not is_success:
                 continue
+
+            for timeline_entry in batch_timeline:
+                if not isinstance(timeline_entry, dict):
+                    continue
+                timeline_payload = dict(timeline_entry)
+                timeline_payload["batch_index"] = batch.batch_index
+                timeline_payload["time_range"] = batch.time_range
+                frame_timeline.append(timeline_payload)
 
             for observation in batch.frame_observations:
                 observation_payload = dict(observation)
@@ -1429,14 +1453,18 @@ class DocumentaryFrameExtractionService:
             "vision_max_concurrency": max_concurrency,
             "scene_segments": scene_segments,
             "batches": batch_dicts,
+            "frame_timeline": frame_timeline,
             "frame_observations": frame_observations,
         }
+        cfg = documentary_settings or get_documentary_settings()
+        if cfg.get("frame_slim_output"):
+            artifact["frame_output_mode"] = "slim_timeline"
         if drama_id:
             artifact["drama_id"] = drama_id
         if (plot_reference or "").strip():
             artifact["plot_reference"] = (plot_reference or "").strip()
         artifact["frame_drama_knowledge_text_enabled"] = bool(frame_drama_knowledge_text_enabled)
-        artifact["frame_relationship_diagram_enabled"] = bool(frame_relationship_diagram_enabled)
+        artifact["frame_relationship_diagram_enabled"] = False
         cfg = documentary_settings or get_documentary_settings()
         artifact["frame_reference_token_saver"] = bool(cfg.get("frame_reference_token_saver", True))
         if test_mode:
@@ -1445,12 +1473,6 @@ class DocumentaryFrameExtractionService:
                 artifact["test_max_duration_seconds"] = float(test_max_duration_seconds)
             if test_start_time_seconds > 0:
                 artifact["test_start_time_seconds"] = float(test_start_time_seconds)
-        resolved_relationship = resolve_media_path(relationship_diagram_path)
-        if resolved_relationship:
-            artifact["relationship_diagram_path"] = os.path.relpath(
-                resolved_relationship,
-                start=project_root(),
-            ).replace("\\", "/")
         resolved_refs = self._resolve_character_references(character_references)
         if resolved_refs:
             artifact["character_references"] = [
@@ -1462,8 +1484,11 @@ class DocumentaryFrameExtractionService:
                 }
                 for item in resolved_refs
             ]
-        self._finalize_scene_segments_in_artifact(artifact)
         cfg = documentary_settings or get_documentary_settings()
+        if cfg.get("frame_slim_output"):
+            self._finalize_slim_timeline_artifact(artifact)
+        else:
+            self._finalize_scene_segments_in_artifact(artifact)
         attach_subtitles_to_frame_analysis_artifact(
             artifact,
             subtitle_content or "",
@@ -1474,10 +1499,20 @@ class DocumentaryFrameExtractionService:
             normalize_analysis_artifact_storage,
         )
 
-        normalize_analysis_artifact_storage(artifact, settings=cfg)
-        if cfg.get("compress_frame_analysis_on_save", False):
-            compress_analysis_artifact(artifact, settings=cfg, strip_debug=True)
+        if cfg.get("frame_slim_output"):
+            finalize_slim_timeline_artifact(artifact, settings=cfg)
+        else:
+            normalize_analysis_artifact_storage(artifact, settings=cfg)
+            if cfg.get("compress_frame_analysis_on_save", False):
+                compress_analysis_artifact(artifact, settings=cfg, strip_debug=True)
         return artifact
+
+    @staticmethod
+    def _finalize_slim_timeline_artifact(artifact: dict[str, Any]) -> None:
+        """Slim 模式：跳过 scene 合并/压缩，仅整理 frame_timeline。"""
+        attach_frame_timeline_to_artifact(artifact)
+        apply_name_corrections_to_frame_analysis_artifact(artifact)
+        apply_obvious_character_relationships_to_artifact(artifact)
 
     @staticmethod
     def _finalize_scene_segments_in_artifact(artifact: dict[str, Any]) -> None:
@@ -1533,6 +1568,7 @@ class DocumentaryFrameExtractionService:
         apply_face_gated_names_to_artifact(artifact)
         apply_dialogue_alignment_to_artifact(artifact)
         apply_obvious_character_relationships_to_artifact(artifact)
+        attach_frame_timeline_to_artifact(artifact)
 
     @staticmethod
     def analysis_artifact_dir() -> str:
@@ -1987,7 +2023,7 @@ class DocumentaryFrameExtractionService:
         """视觉模型误返回解说脚本 JSON（非抽帧 frame_observations）。"""
 
         def _looks_like_script_clip(item: dict[str, Any]) -> bool:
-            if item.get("frame_observations") or item.get("scene_segments"):
+            if item.get("frame_observations") or item.get("scene_segments") or item.get("frame_timeline"):
                 return False
             has_picture = bool(str(item.get("picture") or "").strip())
             has_narration = bool(str(item.get("narration") or "").strip())
@@ -2012,7 +2048,7 @@ class DocumentaryFrameExtractionService:
             return {}
 
         if isinstance(payload, dict):
-            if payload.get("scene_segments") or payload.get("frame_observations"):
+            if payload.get("scene_segments") or payload.get("frame_observations") or payload.get("frame_timeline"):
                 return payload
             if any(payload.get(key) for key in ("timestamp", "action", "scene")):
                 segment = self._normalize_scene_segment(payload)
@@ -2058,6 +2094,7 @@ class DocumentaryFrameExtractionService:
         vision_model_used: str = "",
         character_references: list[dict[str, str]] | None = None,
         reference_images_attached: bool = False,
+        frame_slim_output: bool = False,
     ) -> FrameBatchResult:
         try:
             payload_raw = self._load_batch_payload_json(raw_response)
@@ -2101,6 +2138,68 @@ class DocumentaryFrameExtractionService:
             )
 
         scene_segments = self._parse_scene_segments(payload)
+        raw_timeline = payload.get("frame_timeline")
+        if isinstance(raw_timeline, list) and len(raw_timeline) >= len(frame_paths):
+            frame_timeline: list[dict[str, Any]] = []
+            frame_observations: list[dict[str, Any]] = []
+            for index, frame_path in enumerate(frame_paths):
+                entry = raw_timeline[index] if index < len(raw_timeline) else {}
+                if not isinstance(entry, dict):
+                    entry = {}
+                normalized = normalize_frame_timeline_entry(
+                    entry,
+                    default_timestamp=self._timestamp_from_keyframe_name(frame_path),
+                )
+                normalized["timestamp"] = self._timestamp_from_keyframe_name(frame_path)
+                frame_timeline.append(normalized)
+                frame_observations.append(timeline_entry_to_frame_observation(normalized))
+
+            raw_summary = payload.get("overall_activity_summary", "")
+            if isinstance(raw_summary, str):
+                summary = raw_summary.strip()
+            elif raw_summary is None:
+                summary = ""
+            else:
+                summary = str(raw_summary).strip()
+            if not summary:
+                summary = build_timeline_batch_summary(frame_timeline)
+
+            warn_frame_analysis_gender_mismatch(
+                scene_segments=[],
+                frame_observations=frame_observations,
+                batch_index=batch_index,
+                time_range=time_range,
+            )
+            naming_error = validate_face_naming_when_references_attached(
+                frame_observations=frame_observations,
+                scene_segments=[],
+                character_references=character_references,
+                reference_images_attached=reference_images_attached,
+                frame_slim_output=frame_slim_output,
+            )
+            if naming_error:
+                return self._build_failed_batch_result(
+                    batch_index=batch_index,
+                    raw_response=raw_response,
+                    error_message=naming_error,
+                    frame_paths=frame_paths,
+                    time_range=time_range,
+                    vision_model_used=vision_model_used,
+                )
+
+            return FrameBatchResult(
+                batch_index=batch_index,
+                status="success",
+                time_range=time_range,
+                raw_response=raw_response,
+                frame_paths=list(frame_paths),
+                frame_timeline=frame_timeline,
+                frame_observations=frame_observations,
+                scene_segments=[],
+                overall_activity_summary=summary,
+                vision_model_used=vision_model_used,
+            )
+
         raw_observations = payload.get("frame_observations")
         if not isinstance(raw_observations, list):
             raw_observations = []
@@ -2125,21 +2224,24 @@ class DocumentaryFrameExtractionService:
                         has_burned_in_subtitle = bool(burned_in_subtitle)
                     else:
                         has_burned_in_subtitle = bool(has_burned_raw) and bool(burned_in_subtitle)
+                    characters = entry.get("characters")
                 else:
                     observation = str(entry or "")
                     timestamp = ""
                     burned_in_subtitle = ""
                     has_burned_in_subtitle = False
+                    characters = None
                 # 时间码以关键帧文件名为准，避免模型在测试片段中从 00:00:00 重计
                 timestamp = self._timestamp_from_keyframe_name(frame_path)
-                frame_observations.append(
-                    {
-                        "timestamp": timestamp,
-                        "observation": observation,
-                        "burned_in_subtitle": burned_in_subtitle if has_burned_in_subtitle else "",
-                        "has_burned_in_subtitle": has_burned_in_subtitle,
-                    }
-                )
+                frame_payload: dict[str, Any] = {
+                    "timestamp": timestamp,
+                    "observation": observation,
+                    "burned_in_subtitle": burned_in_subtitle if has_burned_in_subtitle else "",
+                    "has_burned_in_subtitle": has_burned_in_subtitle,
+                }
+                if isinstance(characters, list) and characters:
+                    frame_payload["characters"] = list(characters)
+                frame_observations.append(frame_payload)
         elif scene_segments:
             frame_observations = self._synthesize_frame_observations_from_scenes(
                 scene_segments,
@@ -2153,6 +2255,60 @@ class DocumentaryFrameExtractionService:
             summary = ""
         else:
             summary = str(raw_summary)
+
+        if frame_slim_output:
+            if not frame_observations and scene_segments:
+                frame_observations = self._synthesize_frame_observations_from_scenes(
+                    scene_segments,
+                    frame_paths,
+                )
+            frame_timeline = [
+                frame_observation_to_timeline_entry(observation)
+                for observation in frame_observations
+                if isinstance(observation, dict)
+            ]
+            for index, frame_path in enumerate(frame_paths):
+                if index < len(frame_timeline):
+                    frame_timeline[index]["timestamp"] = self._timestamp_from_keyframe_name(frame_path)
+            if not summary:
+                summary = build_timeline_batch_summary(frame_timeline)
+            scene_segments = []
+
+            warn_frame_analysis_gender_mismatch(
+                scene_segments=[],
+                frame_observations=frame_observations,
+                batch_index=batch_index,
+                time_range=time_range,
+            )
+            naming_error = validate_face_naming_when_references_attached(
+                frame_observations=frame_observations,
+                scene_segments=[],
+                character_references=character_references,
+                reference_images_attached=reference_images_attached,
+                frame_slim_output=frame_slim_output,
+            )
+            if naming_error:
+                return self._build_failed_batch_result(
+                    batch_index=batch_index,
+                    raw_response=raw_response,
+                    error_message=naming_error,
+                    frame_paths=frame_paths,
+                    time_range=time_range,
+                    vision_model_used=vision_model_used,
+                )
+
+            return FrameBatchResult(
+                batch_index=batch_index,
+                status="success",
+                time_range=time_range,
+                raw_response=raw_response,
+                frame_paths=list(frame_paths),
+                frame_timeline=frame_timeline,
+                frame_observations=frame_observations,
+                scene_segments=[],
+                overall_activity_summary=summary,
+                vision_model_used=vision_model_used,
+            )
 
         if not scene_segments and frame_observations:
             scene_segments = self._synthesize_scene_segments_from_frames(
@@ -2182,6 +2338,7 @@ class DocumentaryFrameExtractionService:
             scene_segments=scene_segments,
             character_references=character_references,
             reference_images_attached=reference_images_attached,
+            frame_slim_output=frame_slim_output,
         )
         if naming_error:
             return self._build_failed_batch_result(
@@ -2215,8 +2372,17 @@ class DocumentaryFrameExtractionService:
         frame_observations = payload.get("frame_observations")
         has_frames = isinstance(frame_observations, list) and len(frame_observations) >= expected_frame_count
 
-        if has_scenes or has_frames:
+        frame_timeline = payload.get("frame_timeline")
+        has_timeline = isinstance(frame_timeline, list) and len(frame_timeline) >= expected_frame_count
+
+        if has_scenes or has_frames or has_timeline:
             return ""
+
+        if isinstance(frame_timeline, list) and frame_timeline:
+            return (
+                "Batch response frame_timeline length is shorter than provided frame_paths: "
+                f"{len(frame_timeline)} < {expected_frame_count}"
+            )
 
         if isinstance(frame_observations, list) and frame_observations:
             return (
@@ -2224,4 +2390,4 @@ class DocumentaryFrameExtractionService:
                 f"{len(frame_observations)} < {expected_frame_count}"
             )
 
-        return "Batch response must include scene_segments or frame_observations"
+        return "Batch response must include scene_segments, frame_observations, or frame_timeline"

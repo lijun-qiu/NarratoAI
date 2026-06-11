@@ -381,14 +381,17 @@ def main():
     init_global_state()
 
     # ===== 显式注册 LLM 提供商（最佳实践）=====
-    # 在应用启动时立即注册，确保所有 LLM 功能可用
-    if 'llm_providers_registered' not in st.session_state:
+    # 热重载会清空 LLMServiceManager 类变量，须以 is_registered() 为准而非仅 session 标记
+    from app.services.llm.manager import LLMServiceManager
+    from app.services.llm.providers import register_all_providers
+
+    if not LLMServiceManager.is_registered():
         try:
-            from app.services.llm.providers import register_all_providers
             register_all_providers()
             st.session_state['llm_providers_registered'] = True
             logger.info("✅ LLM 提供商注册成功")
         except Exception as e:
+            st.session_state.pop('llm_providers_registered', None)
             logger.error(f"❌ LLM 提供商注册失败: {str(e)}")
             import traceback
             logger.error(traceback.format_exc())

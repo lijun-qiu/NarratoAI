@@ -36,7 +36,7 @@
     #   - OpenAI: gpt-4o, gpt-4o-mini
     #   - Qwen: qwen/qwen2.5-vl-32b-instruct
     #   - SiliconFlow: siliconflow/Qwen/Qwen2.5-VL-32B-Instruct
-    vision_openai_model_name = "gemini-3.1-flash-lite"
+    vision_openai_model_name = "gemini-3-flash-preview"
     vision_openai_api_key = ""  # 备用网关 Key（Gemini 等非 Qwen 模型）
     vision_openai_base_url = "https://api.4022543.xyz/v1"
 
@@ -315,6 +315,22 @@ picture_wrap_double_quotes = true
     subtitle_ocr_min_similarity = 0.5
     subtitle_ocr_max_length_ratio_delta = 0.35
     frame_interval_input = 3
+    # 精简抽帧：仅输出 frame_timeline（供视频分析推断说话人）
+    frame_slim_output = false
+    # 头像参照（token 与识脸平衡）：
+    # - 推荐：拼图 2 人/张 + labeled_collage + max_edge 384（每批仍附图，token 约为逐张 512 的 ~1/3）
+    # - 最高准确率：force_individual_heads=true，max_edge 512（token 最高）
+    # - 最省 token：token_saver=true（仅首批附图，后续批次准确率下降）
+    frame_reference_use_collage = true
+    frame_reference_force_individual_heads = false
+    frame_reference_labeled_collage = true
+    frame_reference_token_saver = false
+    frame_reference_attach_mode = "every_batch"
+    frame_reference_collage_max_heads = 2
+    frame_reference_individual_max_heads = 2
+    frame_reference_max_edge = 384
+    frame_reference_head_max_edge = 384
+    # frame_reference_reattach_interval = 0   # 0=每批附图；3=第0/3/6…批附图（介于两者之间）
     # 解说生成上下文控制（长视频自动分块）
     narration_input_max_chars = 65000
     narration_input_max_tokens = 85000
@@ -430,10 +446,16 @@ picture_wrap_double_quotes = true
     original_subtitle_color = "#FFE066"
 
 [video_episode_analysis]
-# 整片视频分析：先整片压缩为 720p 母版，再按切镜逐镜截取上传
+# 整片视频分析：先整片压缩为 720p 母版，再按时间或切镜截取上传
 max_upload_mb = 24.0
 upload_transcode_profile = "high"
-# 切段：environment_change=仅场景/布景明显变化；edit_cut=每个硬切都切
+# 上传切段：time_chunk=按固定时长（默认）；scene_cut=按切镜/场景
+segment_split_policy = "time_chunk"
+# 按时间切段时每段时长（秒）；900 = 15 分钟
+chunk_seconds = 900.0
+# 单次 API 最多输出多少条 5–10 秒情节窗；96 时 15 分钟段通常一批出完（0=不拆分）
+max_segments_per_api_call = 96
+# 切段：environment_change=仅场景/布景明显变化；edit_cut=每个硬切都切（scene_cut 时生效）
 # 硬切检测：PySceneDetect ContentDetector（未安装或失败时回退 FFmpeg scenecut）
 scene_cut_mode = "environment_change"
 scene_candidate_threshold = 0.25
@@ -445,9 +467,11 @@ scene_min_segment_seconds = 5.0
 scene_max_seconds = 180.0
 # edit_cut 模式才使用
 scene_detect_threshold = 0.35
-# 以下两项保留兼容旧配置，分镜模式下不再按固定时长切段
-chunk_seconds = 300.0
+# 以下保留兼容旧配置
 short_video_high_profile_sec = 300.0
+# 注入配对抽帧 frame_timeline（默认关闭）
+enable_frame_timeline_reference = false
+frame_timeline_reference_max_chars = 14000
 
 [transcription]
     enable_fallback = true

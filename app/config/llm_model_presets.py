@@ -9,6 +9,7 @@ DEFAULT_DASHSCOPE_BASE_URL = "https://dashscope.aliyuncs.com/compatible-mode/v1"
 # (显示名称, 模型 ID)
 VISION_MODEL_PRESETS: list[tuple[str, str]] = [
     ("Gemini 3.1 Flash Lite（推荐）", "gemini-3.1-flash-lite"),
+    ("Gemini 3 Flash Preview", "gemini-3-flash-preview"),
     ("Qwen-VL-Max", "qwen-vl-max"),
     ("Qwen-VL-Plus", "qwen-vl-plus"),
     ("Qwen2.5-VL-72B-Instruct", "qwen2.5-vl-72b-instruct"),

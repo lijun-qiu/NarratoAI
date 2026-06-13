@@ -52,6 +52,36 @@ UPLOAD_TRANSCODE_PROFILES: Dict[str, Dict[str, Any]] = {
         "audio_bitrate": "32k",
         "preset": "veryfast",
     },
+    # 整片网格快扫：优先体积，便于单次上传
+    "grid_whole": {
+        "width": 480,
+        "fps": 10,
+        "crf": 32,
+        "audio_bitrate": "32k",
+        "preset": "veryfast",
+    },
+    "grid_whole_compact": {
+        "width": 360,
+        "fps": 8,
+        "crf": 34,
+        "audio_bitrate": "24k",
+        "preset": "veryfast",
+    },
+    "grid_whole_tiny": {
+        "width": 320,
+        "fps": 6,
+        "crf": 36,
+        "audio_bitrate": "16k",
+        "preset": "veryfast",
+    },
+    "grid_whole_ultra": {
+        "width": 240,
+        "fps": 5,
+        "crf": 38,
+        "audio_bitrate": "0",
+        "preset": "veryfast",
+        "no_audio": True,
+    },
 }
 
 VIDEO_EPISODE_UPLOAD_DEFAULTS: Dict[str, Any] = {

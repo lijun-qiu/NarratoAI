@@ -449,6 +449,21 @@ scene_detect_threshold = 0.35
 chunk_seconds = 300.0
 short_video_high_profile_sec = 300.0
 
+[video_whole_grid_analysis]
+# 整片网格快扫：整片压缩为单个文件一次上传，按固定时间格输出简化 JSON（实验功能）
+# 默认：整片上传 + 20 秒/格 + 时间轴均分 2 段 API（force_one_shot=false, batch_count=2）
+# force_one_shot=true 则改为 API 1 次生成全部网格
+force_one_shot = false
+max_upload_mb = 24.0
+grid_interval_seconds = 20
+# 分批段数：>1 按时间轴均分（默认 2 段）；0 = 按模型每批格数自动切分
+batch_count = 2
+# max_segments_per_api_call：batch_count=0 时生效；0 = 按模型自动折中
+max_segments_per_api_call = 0
+max_output_tokens = 0
+auto_batch_by_model = true
+upload_transcode_profile = "grid_whole"
+
 [transcription]
     enable_fallback = true
     fallback_order = ["gemini_asr", "fun_asr", "whisper_api"]

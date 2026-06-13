@@ -10,6 +10,8 @@ import streamlit as st
 from app.services.documentary.documentary_material_resolver import (
     resolve_video_episode_analysis_path_for_documentary,
 )
+from app.config import config
+from app.config.llm_model_presets import CUSTOM_MODEL_OPTION, VISION_MODEL_PRESETS, match_preset_index
 from app.services.documentary.video_episode_analysis import (
     checkpoint_needs_resume,
     default_checkpoint_path,
@@ -19,7 +21,19 @@ from app.services.documentary.video_episode_analysis import (
     parse_video_episode_analysis_payload,
     summarize_checkpoint_progress,
 )
+from app.services.documentary.video_episode_analysis import _probe_duration_seconds
+from app.services.documentary.video_whole_grid_analysis import (
+    WHOLE_GRID_DEFAULT_BATCH_COUNT,
+    WHOLE_GRID_DEFAULT_INTERVAL,
+    WHOLE_GRID_MAX_INTERVAL,
+    WHOLE_GRID_MIN_INTERVAL,
+    default_video_whole_grid_analysis_path,
+    estimate_grid_run_plan,
+    get_video_whole_grid_settings,
+    load_video_whole_grid_artifact,
+)
 from webui.tools.analyze_video_episode_docu import analyze_video_episode_docu
+from webui.tools.analyze_video_whole_grid_docu import analyze_video_whole_grid_docu
 
 
 def sync_video_episode_analysis_with_video(video_path: str) -> None:
@@ -148,3 +162,109 @@ def render_video_episode_analysis_panel(tr, params) -> None:
                 resume=True,
                 output_path=active_path if active_path else default_path,
             )
+
+    st.divider()
+    st.markdown("### 整片网格快扫（实验）")
+    st.caption(
+        "将整集视频压缩为 **单个文件一次上传**，默认 **20 秒/格、分 2 段 API** 解析全片。"
+        "也可勾选「单次生成」改为 API 1 次。"
+        "人物命名复用上方「作品名称 / 头像参照」勾选的人物头像（拼图对照识脸）。"
+        "剧情参考建议只写本集前情 3–5 句，勿粘贴整份关系网 JSON。"
+        "格距可选 5–30 秒；单次生成建议加大格距 + gemini-3-flash-preview。"
+        "适合快速浏览时间轴；精细剧情仍建议用上方「分镜分析」或「抽帧分析」。"
+    )
+
+    grid_default_path = default_video_whole_grid_analysis_path(video_path)
+    grid_active_path = (st.session_state.get("video_whole_grid_analysis_json_path") or "").strip()
+    if not grid_active_path or not os.path.isfile(grid_active_path):
+        grid_active_path = grid_default_path if os.path.isfile(grid_default_path) else ""
+
+    if grid_active_path and os.path.isfile(grid_active_path):
+        st.success(f"已有网格快扫结果: {grid_active_path}")
+        try:
+            grid_payload = load_video_whole_grid_artifact(grid_active_path)
+            st.write(grid_payload.get("overall_summary") or "")
+            st.caption(
+                f"格距 {grid_payload.get('grid_interval_seconds')}s · "
+                f"共 {grid_payload.get('grid_segment_count', len(grid_payload.get('grid_segments') or []))} 格 · "
+                f"模型 {grid_payload.get('vision_model_name', '')}"
+            )
+        except Exception as err:
+            st.caption(f"无法预览: {err}")
+    else:
+        st.caption(f"默认输出路径: {grid_default_path}")
+
+    default_model = config.app.get("vision_openai_model_name") or ""
+    preset_labels = [label for label, _ in VISION_MODEL_PRESETS]
+    preset_models = [model_id for _, model_id in VISION_MODEL_PRESETS]
+    preset_index = match_preset_index(VISION_MODEL_PRESETS, default_model)
+    grid_model_label = st.selectbox(
+        "网格快扫视觉模型",
+        options=preset_labels,
+        index=preset_index,
+        key="doc_whole_grid_model_preset",
+    )
+    grid_model_index = preset_labels.index(grid_model_label)
+    grid_model_id = preset_models[grid_model_index]
+    if grid_model_id == CUSTOM_MODEL_OPTION:
+        grid_model_id = st.text_input(
+            "自定义视觉模型",
+            value=default_model,
+            key="doc_whole_grid_custom_model",
+        ).strip()
+
+    grid_interval = st.slider(
+        "网格间隔（秒）",
+        min_value=WHOLE_GRID_MIN_INTERVAL,
+        max_value=WHOLE_GRID_MAX_INTERVAL,
+        value=WHOLE_GRID_DEFAULT_INTERVAL,
+        key="doc_whole_grid_interval",
+    )
+
+    grid_cfg = get_video_whole_grid_settings()
+    one_shot_key = "doc_whole_grid_force_single_api"
+    if one_shot_key not in st.session_state:
+        st.session_state[one_shot_key] = bool(grid_cfg.get("force_one_shot", False))
+    force_one_shot = st.checkbox(
+        "单次生成（API 1 次）",
+        key=one_shot_key,
+        help=(
+            f"勾选后整片一次 API 返回全部 grid_segments；"
+            f"默认不勾选，按时间轴均分 {int(grid_cfg.get('batch_count') or WHOLE_GRID_DEFAULT_BATCH_COUNT)} 段"
+        ),
+    )
+
+    try:
+        video_duration = _probe_duration_seconds(video_path)
+        run_plan = estimate_grid_run_plan(
+            video_duration,
+            grid_interval_seconds=grid_interval,
+            model_name=grid_model_id or default_model,
+            force_one_shot=force_one_shot,
+        )
+        duration_min = max(1, int(round(video_duration / 60)))
+        interval_hint = f"{run_plan['grid_interval_effective']}s"
+        if run_plan.get("grid_interval_auto_adjusted"):
+            interval_hint = (
+                f"{run_plan['grid_interval_requested']}s→{run_plan['grid_interval_effective']}s（自动加粗）"
+            )
+        if run_plan.get("one_shot"):
+            api_hint = "API 1 次"
+        else:
+            batch_n = int(run_plan["api_call_count"])
+            api_hint = f"API {batch_n} 批（均分 {batch_n} 段）"
+        st.caption(
+            f"预估：约 {duration_min} 分钟 → {run_plan['grid_segment_count']} 格 · "
+            f"格距 {interval_hint} · {api_hint}"
+        )
+    except Exception:
+        pass
+
+    if st.button("整片网格快扫", key="doc_analyze_video_whole_grid_btn", use_container_width=True):
+        analyze_video_whole_grid_docu(
+            params,
+            vision_model_name=grid_model_id,
+            grid_interval_seconds=grid_interval,
+            force_one_shot=force_one_shot,
+            output_path=grid_active_path if grid_active_path else grid_default_path,
+        )

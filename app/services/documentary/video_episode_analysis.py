@@ -18,13 +18,38 @@ from loguru import logger
 
 from app.config import config
 from app.config.llm_gateway_router import describe_llm_route, resolve_llm_credentials
-from app.services.documentary.frame_analysis_pairing import analysis_artifact_dir, sanitize_video_stem
+from app.services.documentary.frame_analysis_pairing import (
+    analysis_artifact_dir,
+    sanitize_video_stem,
+)
+from app.services.documentary.video_episode_segment_schedule import (
+    average_segment_seconds,
+    build_episodic_subsegment_schedule,
+    build_segment_schedule,
+    build_subsegment_schedule_for_range,
+    detect_edit_cut_seconds,
+    detect_scene_cut_seconds,
+    segment_policy_summary,
+)
+from app.services.documentary.character_relationship import (
+    build_character_relationship_prompt_section,
+)
+from app.services.documentary.plot_reference import build_plot_reference_prompt_section
+from app.services.prompts.documentary.video_episode_analysis import (
+    build_reference_carryover_naming_block,
+    build_video_episode_analysis_prompt,
+    build_video_episode_chunk_prompt,
+    build_video_episode_vision_reference_prompt_section,
+    build_video_speaker_inference_rules,
+)
 from app.services.documentary.frame_reference_images import (
+    ATTACH_MODE_EVERY_BATCH,
     prepare_reference_prefix_images,
     resolve_reference_collage_mode,
     split_character_references_into_collage_sheets,
     collage_max_heads_per_sheet,
 )
+from app.services.documentary.documentary_settings import get_documentary_settings
 from app.services.drama_character_registry import resolve_media_path
 from app.services.documentary.video_episode_constants import (
     SCENE_CANDIDATE_THRESHOLD,
@@ -39,24 +64,15 @@ from app.services.documentary.video_episode_constants import (
     SEGMENT_MAX_SECONDS,
     SEGMENT_MIN_SECONDS,
     SEGMENT_SPLIT_POLICY,
+    VIDEO_ANALYSIS_SUBSEGMENT_MAX_SECONDS,
+    VIDEO_ANALYSIS_SUBSEGMENT_MIN_SECONDS,
     get_upload_transcode_profile,
     get_video_episode_scene_settings,
     get_video_episode_upload_settings,
+    resolve_max_segments_per_api_call,
+    resolve_segment_split_policy,
+    resolve_upload_chunk_seconds,
     resolve_upload_transcode_profile_name,
-)
-from app.services.documentary.video_episode_segment_schedule import (
-    average_segment_seconds,
-    build_segment_schedule,
-    detect_edit_cut_seconds,
-    detect_scene_cut_seconds,
-    segment_policy_summary,
-)
-from app.services.documentary.plot_reference import build_plot_reference_prompt_section
-from app.services.prompts.documentary.video_episode_analysis import (
-    build_reference_carryover_naming_block,
-    build_video_episode_analysis_prompt,
-    build_video_episode_chunk_prompt,
-    build_video_episode_vision_reference_prompt_section,
 )
 from app.utils import utils
 
@@ -64,8 +80,8 @@ VIDEO_EPISODE_ANALYSIS_ARTIFACT_VERSION = "documentary-video-episode-analysis-v1
 _MIN_SCENE_SECONDS = 0.5
 _VIDEO_ANALYSIS_TIMEOUT = 900.0
 _MAX_CHUNK_RETRIES = 3
-# 单次 API 最多输出的情节窗条数，超出则对同一上传段分批调用
-_MAX_SEGMENTS_PER_API_CALL = 32
+# 单次 API 最多输出的情节窗条数默认值（可被 config max_segments_per_api_call 覆盖）
+_MAX_SEGMENTS_PER_API_CALL = 96
 
 VIDEO_EPISODE_FIELD_COMMENTS: dict[str, str] = {
     "_readme": "JSON 不支持 // 注释；本 field_comments 对象置于文件最前，说明各字段含义，不参与业务逻辑。",
@@ -283,9 +299,11 @@ def estimate_video_episode_chunk_max_tokens(segment_count: int) -> int:
 def split_schedule_for_api_batches(
     schedule: list[str],
     *,
-    max_per_batch: int = _MAX_SEGMENTS_PER_API_CALL,
+    max_per_batch: int | None = None,
 ) -> list[list[str]]:
-    if len(schedule) <= max(1, max_per_batch):
+    if max_per_batch is None:
+        max_per_batch = resolve_max_segments_per_api_call()
+    if max_per_batch <= 0 or len(schedule) <= max_per_batch:
         return [schedule]
     batches: list[list[str]] = []
     cursor = 0
@@ -450,6 +468,19 @@ def _parse_time_range_bounds(value: str) -> tuple[int, int]:
     return start, end
 
 
+def _video_episode_reference_settings(drama_title: str) -> dict[str, Any]:
+    """整片视频分析参照图：与抽帧共用 documentary 配置，默认拼图 2 人/张。"""
+    cfg = dict(get_documentary_settings())
+    cfg["default_video_theme"] = drama_title
+    cfg.setdefault("frame_reference_use_collage", True)
+    cfg.setdefault("frame_reference_force_individual_heads", False)
+    cfg.setdefault("frame_reference_labeled_collage", True)
+    cfg.setdefault("frame_reference_collage_max_heads", 2)
+    cfg["frame_reference_token_saver"] = False
+    cfg["frame_reference_attach_mode"] = ATTACH_MODE_EVERY_BATCH
+    return cfg
+
+
 def _prepare_chunk_reference_context(
     *,
     chunk_index: int,
@@ -457,7 +488,7 @@ def _prepare_chunk_reference_context(
     character_references: list[dict[str, str]] | None,
     relationship_diagram_path: str,
 ) -> tuple[list[str], str]:
-    """每段上传均附带头像/关系图（拼图每张最多 4 人），便于逐格识脸。"""
+    """每段上传均附带头像/关系图（拼图张数见 frame_reference_collage_max_heads）。"""
     refs = [
         {"name": str(item.get("name") or "").strip(), "path": str(item.get("path") or "").strip()}
         for item in (character_references or [])
@@ -467,15 +498,7 @@ def _prepare_chunk_reference_context(
     if not refs and not rel_path:
         return [], ""
 
-    settings = {
-        "frame_reference_use_collage": True,
-        "frame_reference_token_saver": False,
-        "frame_reference_attach_mode": "every_batch",
-        "frame_reference_max_edge": 384,
-        "frame_reference_individual_max_heads": 4,
-        "frame_reference_collage_max_heads": 4,
-        "default_video_theme": drama_title,
-    }
+    settings = _video_episode_reference_settings(drama_title)
     head_paths = [item["path"] for item in refs if os.path.isfile(item["path"])]
     use_collage = resolve_reference_collage_mode(settings, head_count=len(head_paths))
     max_per_sheet = collage_max_heads_per_sheet(settings)
@@ -531,11 +554,8 @@ def build_segment_schedule_prompt_block(time_ranges: list[str]) -> str:
         return "\n".join(
             [
                 "## 本分镜时间窗（硬性要求 · 已预计算）",
-                f"上传视频即 **一个完整分镜镜头**；你必须输出 **恰好 1 条** `episodic_segments`。",
-                f"`time_range` 必须为 **`{time_range}`**（全片绝对时间，字符级一致）。",
-                "- 分析本镜画面、对白与人物；`key_events` 写该镜关键事件。",
-                "- 若本镜为硬切/换场开头，可在 `key_events` 写「场景切换至…」。",
-                "- 须填写 `title`（4-6字）、`narration`、`environment_description`、`involved_characters`。",
+                f"本上传视频为**同一切镜内的一个分析窗**；`time_range` 必须为 **`{time_range}`**（全片绝对时间）。",
+                "- 分析该窗画面、对白与人物；须填写 `title`、`narration`、`environment_description`、`involved_characters`。",
             ]
         )
     lines = [
@@ -692,10 +712,16 @@ def validate_episodic_segments(
                     f"片段 {time_range} 时长 {duration}s，短于同场景下限 {SEGMENT_MIN_SECONDS}s"
                     "（切镜格除外）"
                 )
-        elif segment_split_policy == "scene_cut":
-            if not is_tail and duration > SCENE_MAX_SECONDS + 0.5:
+        elif segment_split_policy in ("time_chunk", "scene_cut"):
+            min_sub = VIDEO_ANALYSIS_SUBSEGMENT_MIN_SECONDS
+            max_sub = VIDEO_ANALYSIS_SUBSEGMENT_MAX_SECONDS
+            if not is_tail and duration > max_sub + 0.5:
                 warnings.append(
-                    f"片段 {time_range} 时长 {duration}s，超过分镜上限 {SCENE_MAX_SECONDS}s"
+                    f"片段 {time_range} 时长 {duration}s，超过情节窗上限 {max_sub}s"
+                )
+            elif not is_tail and duration + 0.05 < min_sub:
+                warnings.append(
+                    f"片段 {time_range} 时长 {duration}s，短于情节窗下限 {min_sub}s"
                 )
         else:
             legacy_interval = SEGMENT_INTERVAL_SECONDS
@@ -885,7 +911,7 @@ def infer_chunks_meta_from_artifact(
     """旧 JSON 无 chunks_meta 时，按上传策略估算分段边界。"""
     if chunk_seconds is None:
         chunk_seconds = float(
-            get_video_episode_upload_settings().get("chunk_seconds", 300.0)
+            get_video_episode_upload_settings().get("chunk_seconds", 900.0)
         )
     if chunk_count <= 1 or video_duration_seconds <= 0:
         return []
@@ -1241,6 +1267,26 @@ def merge_video_episode_partial_analyses(partials: list[dict[str, Any]]) -> dict
     )
 
 
+def apply_important_dialogues_srt_enrichment(
+    analysis: dict[str, Any],
+    *,
+    video_path: str,
+    subtitle_path: str = "",
+    enabled: bool = True,
+) -> list[str]:
+    """SRT 作参照对齐时间轴；important_dialogues.quote 以视频分析为准。"""
+    from app.services.documentary.video_episode_dialogue_srt import (
+        apply_important_dialogues_srt_enrichment as _apply,
+    )
+
+    return _apply(
+        analysis,
+        video_path=video_path,
+        subtitle_path=subtitle_path,
+        enabled=enabled,
+    )
+
+
 def load_video_episode_analysis_artifact(path: str) -> dict[str, Any]:
     """读取整片视频分析 JSON（忽略 field_comments）。"""
     if not path or not os.path.isfile(path):
@@ -1286,6 +1332,21 @@ def load_video_episode_analysis_artifact(path: str) -> dict[str, Any]:
     ):
         if key in raw:
             analysis[key] = raw.get(key)
+
+    video_path = str(analysis.get("video_path") or raw.get("video_path") or "").strip()
+    if video_path and analysis.get("important_dialogues"):
+        srt_warnings = apply_important_dialogues_srt_enrichment(
+            analysis,
+            video_path=video_path,
+            subtitle_path=str(raw.get("important_dialogues_srt_path") or "").strip(),
+        )
+        if srt_warnings:
+            existing = list(analysis.get("coverage_warnings") or [])
+            for item in srt_warnings:
+                if item not in existing:
+                    existing.append(item)
+            analysis["coverage_warnings"] = existing
+
     return analysis
 
 
@@ -1974,23 +2035,18 @@ class VideoEpisodeAnalysisService:
         source_video_path: str = "",
         scene_cuts: list[float] | None = None,
         plot_reference: str = "",
+        character_relationship: str = "",
+        segment_split_policy: str = SEGMENT_SPLIT_POLICY,
     ) -> tuple[dict[str, Any], int]:
         chunk_duration_seconds = float(chunk.get("duration_seconds") or 0)
         chunk_offset_seconds = float(chunk.get("offset_seconds") or 0)
         preset_range = str(chunk.get("time_range") or "").strip()
         if preset_range:
-            chunk_schedule = [preset_range]
-        elif SEGMENT_SPLIT_POLICY == "scene_cut":
-            chunk_schedule = [
+            chunk_schedule = build_subsegment_schedule_for_range(preset_range)
+        else:
+            chunk_schedule = build_subsegment_schedule_for_range(
                 f"{_format_timestamp(chunk_offset_seconds)}-"
                 f"{_format_timestamp(chunk_offset_seconds + chunk_duration_seconds)}"
-            ]
-        else:
-            chunk_schedule = build_segment_schedule(
-                chunk_duration_seconds,
-                start_offset_seconds=chunk_offset_seconds,
-                video_path=source_video_path,
-                scene_cuts=scene_cuts,
             )
         schedule_batches = split_schedule_for_api_batches(chunk_schedule)
         reference_paths, naming_block = _prepare_chunk_reference_context(
@@ -2028,18 +2084,24 @@ class VideoEpisodeAnalysisService:
                     character_naming_block=naming_block,
                     previous_chunk_partial=previous_chunk_partial,
                 )
-                if SEGMENT_SPLIT_POLICY == "scene_cut":
+                if total_chunks > 1 or segment_split_policy in ("scene_cut", "time_chunk"):
                     prompt = (
                         f"{prompt}\n\n"
-                        "## 分镜说明\n"
-                        "本请求上传的视频文件 **仅包含一个分镜镜头**；"
-                        "请只分析该镜画面，输出 1 条 `episodic_segments`。"
+                        "## 分段说明\n"
+                        "本请求为整片中的一段上传视频；"
+                        f"须按下方 {len(batch_schedule)} 个 **5–10 秒** time_range 逐窗输出 `episodic_segments`。"
                     )
             if batch_addon:
                 prompt = f"{prompt}\n\n{batch_addon}"
+            rel_section = build_character_relationship_prompt_section(character_relationship)
+            if rel_section.strip():
+                prompt = f"{prompt}\n\n{rel_section.strip()}"
             plot_section = build_plot_reference_prompt_section(plot_reference)
             if plot_section.strip():
                 prompt = f"{prompt}\n\n{plot_section.strip()}"
+            speaker_rules = build_video_speaker_inference_rules()
+            if speaker_rules.strip():
+                prompt = f"{prompt}\n\n{speaker_rules.strip()}"
 
             chunk_max_tokens = estimate_video_episode_chunk_max_tokens(len(batch_schedule))
             require_summary = batch_index == 0 and chunk_index == 0
@@ -2142,11 +2204,17 @@ class VideoEpisodeAnalysisService:
         output_path: str | None = None,
         resume: bool = True,
         plot_reference: str = "",
+        character_relationship: str = "",
+        subtitle_path: str = "",
+        align_dialogues_with_srt: bool = True,
+        segment_split_policy: str | None = None,
+        upload_chunk_seconds: float | None = None,
     ) -> dict[str, Any]:
         progress = progress_callback or (lambda _p, _m: None)
         if not video_path or not os.path.isfile(video_path):
             raise FileNotFoundError(f"视频文件不存在: {video_path}")
         resolved_plot_reference = (plot_reference or "").strip()
+        resolved_character_relationship = (character_relationship or "").strip()
 
         model_name, api_key, base_url = self._resolve_model_settings(
             vision_model_name=vision_model_name,
@@ -2165,77 +2233,122 @@ class VideoEpisodeAnalysisService:
 
         video_duration_seconds = _probe_duration_seconds(video_path)
         duration_label = _format_timestamp(video_duration_seconds)
-        progress(4, f"视频时长 {duration_label}，准备按分镜切段...")
 
-        progress(6, "正在检测场景切换并生成分段时间窗...")
-        scene_settings = get_video_episode_scene_settings()
-        scene_cut_mode = str(scene_settings.get("scene_cut_mode") or "environment_change").strip()
-        edit_cuts = detect_edit_cut_seconds(
-            video_path,
-            duration_seconds=video_duration_seconds,
-            threshold=float(
-                scene_settings.get("scene_candidate_threshold")
-                or scene_settings.get("scene_detect_threshold")
-                or SCENE_DETECT_THRESHOLD
-            ),
-        )
-        scene_cuts = detect_scene_cut_seconds(
-            video_path,
-            duration_seconds=video_duration_seconds,
-            threshold=float(scene_settings.get("scene_detect_threshold") or SCENE_DETECT_THRESHOLD),
-            scene_cut_mode=scene_cut_mode,
-            candidate_threshold=float(
-                scene_settings.get("scene_candidate_threshold") or SCENE_CANDIDATE_THRESHOLD
-            ),
-            environment_diff_threshold=float(
-                scene_settings.get("scene_environment_diff_threshold")
-                or SCENE_ENVIRONMENT_DIFF_THRESHOLD
-            ),
-            sample_before_seconds=float(
-                scene_settings.get("scene_frame_sample_before_seconds")
-                or SCENE_FRAME_SAMPLE_BEFORE_SECONDS
-            ),
-            sample_after_seconds=float(
-                scene_settings.get("scene_frame_sample_after_seconds")
-                or SCENE_FRAME_SAMPLE_AFTER_SECONDS
-            ),
-        )
-        full_schedule = build_segment_schedule(
-            video_duration_seconds,
-            video_path=video_path,
-            scene_cuts=scene_cuts,
-            min_merge_seconds=float(scene_settings.get("scene_min_merge_seconds") or SCENE_MIN_MERGE_SECONDS),
-            min_segment_seconds=float(
-                scene_settings.get("scene_min_segment_seconds") or SCENE_MIN_SEGMENT_SECONDS
-            ),
-            max_scene_seconds=float(scene_settings.get("scene_max_seconds") or SCENE_MAX_SECONDS),
-            scene_detect_threshold=float(
-                scene_settings.get("scene_candidate_threshold")
-                or scene_settings.get("scene_detect_threshold")
-                or SCENE_DETECT_THRESHOLD
-            ),
-        )
-        if scene_cut_mode == "environment_change":
-            progress(
-                8,
-                f"硬切 {len(edit_cuts)} 处 · 场景切换 {len(scene_cuts)} 处 · "
-                f"共 {len(full_schedule)} 段（{segment_policy_summary()}）",
+        upload_overrides: dict[str, Any] = {}
+        if segment_split_policy:
+            upload_overrides["segment_split_policy"] = segment_split_policy
+        if upload_chunk_seconds is not None:
+            upload_overrides["chunk_seconds"] = upload_chunk_seconds
+        upload_cfg = get_video_episode_upload_settings(upload_overrides or None)
+        resolved_policy = resolve_segment_split_policy(upload_overrides or None)
+        chunk_seconds = resolve_upload_chunk_seconds(upload_overrides or None)
+        policy_payload = {
+            "segment_split_policy": resolved_policy,
+            "upload_chunk_seconds": chunk_seconds,
+        }
+
+        if resolved_policy == "scene_cut":
+            progress(4, f"视频时长 {duration_label}，准备按分镜切段...")
+            progress(6, "正在检测场景切换并生成上传分段时间窗...")
+            scene_settings = get_video_episode_scene_settings()
+            scene_cut_mode = str(scene_settings.get("scene_cut_mode") or "environment_change").strip()
+            edit_cuts = detect_edit_cut_seconds(
+                video_path,
+                duration_seconds=video_duration_seconds,
+                threshold=float(
+                    scene_settings.get("scene_candidate_threshold")
+                    or scene_settings.get("scene_detect_threshold")
+                    or SCENE_DETECT_THRESHOLD
+                ),
             )
+            scene_cuts = detect_scene_cut_seconds(
+                video_path,
+                duration_seconds=video_duration_seconds,
+                threshold=float(scene_settings.get("scene_detect_threshold") or SCENE_DETECT_THRESHOLD),
+                scene_cut_mode=scene_cut_mode,
+                candidate_threshold=float(
+                    scene_settings.get("scene_candidate_threshold") or SCENE_CANDIDATE_THRESHOLD
+                ),
+                environment_diff_threshold=float(
+                    scene_settings.get("scene_environment_diff_threshold")
+                    or SCENE_ENVIRONMENT_DIFF_THRESHOLD
+                ),
+                sample_before_seconds=float(
+                    scene_settings.get("scene_frame_sample_before_seconds")
+                    or SCENE_FRAME_SAMPLE_BEFORE_SECONDS
+                ),
+                sample_after_seconds=float(
+                    scene_settings.get("scene_frame_sample_after_seconds")
+                    or SCENE_FRAME_SAMPLE_AFTER_SECONDS
+                ),
+            )
+            full_schedule = build_segment_schedule(
+                video_duration_seconds,
+                video_path=video_path,
+                scene_cuts=scene_cuts,
+                segment_split_policy=resolved_policy,
+                chunk_seconds=chunk_seconds,
+                min_merge_seconds=float(scene_settings.get("scene_min_merge_seconds") or SCENE_MIN_MERGE_SECONDS),
+                min_segment_seconds=float(
+                    scene_settings.get("scene_min_segment_seconds") or SCENE_MIN_SEGMENT_SECONDS
+                ),
+                max_scene_seconds=float(scene_settings.get("scene_max_seconds") or SCENE_MAX_SECONDS),
+                scene_detect_threshold=float(
+                    scene_settings.get("scene_candidate_threshold")
+                    or scene_settings.get("scene_detect_threshold")
+                    or SCENE_DETECT_THRESHOLD
+                ),
+            )
+            if scene_cut_mode == "environment_change":
+                progress(
+                    8,
+                    f"硬切 {len(edit_cuts)} 处 · 场景切换 {len(scene_cuts)} 处 · "
+                    f"共 {len(full_schedule)} 段（{segment_policy_summary(payload=policy_payload)}）",
+                )
+            else:
+                progress(
+                    8,
+                    f"切镜 {len(scene_cuts)} 处 · 共 {len(full_schedule)} 段"
+                    f"（{segment_policy_summary(payload=policy_payload)}）",
+                )
         else:
+            scene_cuts = []
+            edit_cuts = []
+            chunk_minutes = chunk_seconds / 60.0
+            progress(
+                4,
+                f"视频时长 {duration_label}，按固定时长切段（每 {chunk_minutes:g} 分钟）...",
+            )
+            progress(6, f"正在生成上传分段时间窗（每 {chunk_minutes:g} 分钟一段）...")
+            full_schedule = build_segment_schedule(
+                video_duration_seconds,
+                video_path=video_path,
+                segment_split_policy=resolved_policy,
+                chunk_seconds=chunk_seconds,
+            )
             progress(
                 8,
-                f"切镜 {len(scene_cuts)} 处 · 共 {len(full_schedule)} 段"
-                f"（{segment_policy_summary()}）",
+                f"共 {len(full_schedule)} 段上传"
+                f"（{segment_policy_summary(payload=policy_payload)}）",
             )
 
-        upload_cfg = get_video_episode_upload_settings()
+        episodic_schedule = build_episodic_subsegment_schedule(
+            full_schedule,
+            segment_split_policy=resolved_policy,
+        )
+        logger.info(
+            f"整片视频情节窗：上传 {len(full_schedule)} 段 · "
+            f"episodic_segments 预计算 {len(episodic_schedule)} 窗"
+        )
+
+        upload_cfg = get_video_episode_upload_settings(upload_overrides or None)
         if max_upload_mb is None:
             max_upload_mb = float(upload_cfg.get("max_upload_mb", 24.0))
         upload_profile = resolve_upload_transcode_profile_name(upload_cfg)
         upload_prof = get_upload_transcode_profile(upload_profile)
         logger.info(
             f"整片视频分镜上传：{upload_prof.get('width')}p · max_upload_mb={max_upload_mb} · "
-            f"分镜数={len(full_schedule)} · policy={SEGMENT_SPLIT_POLICY}"
+            f"上传分段数={len(full_schedule)} · policy={resolved_policy} · chunk={chunk_seconds:.0f}s"
         )
 
         checkpoint: dict[str, Any] | None = None
@@ -2429,6 +2542,8 @@ class VideoEpisodeAnalysisService:
                     source_video_path=video_path,
                     scene_cuts=scene_cuts,
                     plot_reference=resolved_plot_reference,
+                    character_relationship=resolved_character_relationship,
+                    segment_split_policy=resolved_policy,
                 )
                 chunk_results[chunk_key] = {
                     "status": "completed",
@@ -2497,7 +2612,7 @@ class VideoEpisodeAnalysisService:
         progress(90, f"合并完成 · 共 {merged_segment_count} 条情节片段")
         analysis["episodic_segments"] = enforce_episodic_segment_schedule(
             analysis.get("episodic_segments") or [],
-            full_schedule,
+            episodic_schedule,
         )
         repaired_segments, continuity_warnings = repair_upload_chunk_boundary_continuity(
             analysis.get("episodic_segments") or [],
@@ -2507,13 +2622,13 @@ class VideoEpisodeAnalysisService:
         merged_segment_count = len(analysis.get("episodic_segments") or [])
         progress(
             92,
-            f"正在对齐分镜时间窗（共 {merged_segment_count} 条）...",
+            f"正在对齐 5–10 秒情节窗（共 {merged_segment_count} 条）...",
         )
         coverage_warnings = validate_episodic_segments(
             analysis.get("episodic_segments") or [],
             video_duration_seconds=video_duration_seconds,
-            expected_time_ranges=full_schedule,
-            segment_split_policy=SEGMENT_SPLIT_POLICY,
+            expected_time_ranges=episodic_schedule,
+            segment_split_policy=resolved_policy,
         )
         if continuity_warnings:
             logger.warning(
@@ -2533,6 +2648,33 @@ class VideoEpisodeAnalysisService:
         else:
             progress(94, "校验完成 · 片段时长符合约束")
 
+        srt_dialogue_warnings = apply_important_dialogues_srt_enrichment(
+            analysis,
+            video_path=video_path,
+            subtitle_path=subtitle_path,
+            enabled=align_dialogues_with_srt,
+        )
+        if srt_dialogue_warnings:
+            for item in srt_dialogue_warnings:
+                if item not in coverage_warnings:
+                    coverage_warnings.append(item)
+            progress(
+                95,
+                f"SRT 台词校正完成 · {len(analysis.get('important_dialogues') or [])} 条"
+                f" · {len(srt_dialogue_warnings)} 条提示",
+            )
+        elif analysis.get("important_dialogues_source") in (
+            "srt_aligned",
+            "video_quote_srt_reference",
+        ):
+            progress(95, "SRT 参照对齐完成（台词以视频为准）")
+        elif align_dialogues_with_srt and subtitle_path:
+            progress(95, "未找到可用 SRT，台词仍来自视觉模型")
+        elif align_dialogues_with_srt:
+            progress(95, "未选用 SRT，台词仍来自视觉模型")
+        else:
+            progress(95, "已跳过 SRT 台词校正")
+
         analysis_status = "complete" if not failed_chunk_indices else "incomplete"
         artifact = {
             "artifact_version": VIDEO_EPISODE_ANALYSIS_ARTIFACT_VERSION,
@@ -2542,6 +2684,7 @@ class VideoEpisodeAnalysisService:
             "drama_title": drama_title,
             "drama_id": (drama_id or drama_title).strip(),
             "plot_reference": resolved_plot_reference,
+            "character_relationship": resolved_character_relationship,
             "character_references": [
                 {"name": str(item.get("name") or "").strip(), "path": str(item.get("path") or "").strip()}
                 for item in (character_references or [])
@@ -2557,8 +2700,9 @@ class VideoEpisodeAnalysisService:
             "chunks_meta": _chunks_meta(chunks),
             "segment_min_seconds": SCENE_MIN_SEGMENT_SECONDS,
             "segment_max_seconds": SCENE_MAX_SECONDS,
-            "segment_split_policy": SEGMENT_SPLIT_POLICY,
-            "scene_cut_count": len(scene_cuts),
+            "segment_split_policy": resolved_policy,
+            "upload_chunk_seconds": chunk_seconds,
+            "scene_cut_count": len(scene_cuts) if resolved_policy == "scene_cut" else 0,
             "episodic_segment_count": len(analysis.get("episodic_segments") or []),
             "coverage_warnings": coverage_warnings,
             **analysis,

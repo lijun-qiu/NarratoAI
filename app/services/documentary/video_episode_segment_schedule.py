@@ -27,6 +27,8 @@ from app.services.documentary.video_episode_constants import (
     SEGMENT_MAX_SECONDS,
     SEGMENT_MIN_SECONDS,
     SEGMENT_SPLIT_POLICY,
+    VIDEO_ANALYSIS_SUBSEGMENT_MAX_SECONDS,
+    VIDEO_ANALYSIS_SUBSEGMENT_MIN_SECONDS,
 )
 
 _SCENE_CUT_RE = re.compile(r"pts_time:([\d.]+)")
@@ -314,6 +316,123 @@ def _coalesce_segments_to_min_duration(
     return merged
 
 
+def split_interval_into_subwindows(
+    start: float,
+    end: float,
+    *,
+    min_seconds: float = VIDEO_ANALYSIS_SUBSEGMENT_MIN_SECONDS,
+    max_seconds: float = VIDEO_ANALYSIS_SUBSEGMENT_MAX_SECONDS,
+) -> list[tuple[float, float]]:
+    """将一段时间区间切为 5–10 秒分析窗（最后一段可短于 min_seconds）。"""
+    min_sec = max(1.0, float(min_seconds))
+    max_sec = max(min_sec, float(max_seconds))
+    start = float(start)
+    end = float(end)
+    if end <= start + 0.01:
+        return [(start, end)]
+
+    windows: list[tuple[float, float]] = []
+    cursor = start
+    while cursor < end - 0.01:
+        remaining = end - cursor
+        if remaining <= max_sec:
+            windows.append((cursor, end))
+            break
+        chunk = min(max_sec, max(min_sec, remaining))
+        if remaining - chunk < min_sec and remaining > max_sec:
+            chunk = max(min_sec, remaining - min_sec)
+        seg_end = min(cursor + chunk, end)
+        if seg_end <= cursor + 0.01:
+            break
+        windows.append((cursor, seg_end))
+        cursor = seg_end
+    return windows
+
+
+def build_subsegment_schedule_for_range(
+    time_range: str,
+    *,
+    min_seconds: float | None = None,
+    max_seconds: float | None = None,
+) -> list[str]:
+    """单个切镜段 time_range → 5–10 秒子窗口列表（绝对时间）。"""
+    from app.services.documentary.video_episode_constants import (
+        VIDEO_ANALYSIS_SUBSEGMENT_MAX_SECONDS,
+        VIDEO_ANALYSIS_SUBSEGMENT_MIN_SECONDS,
+    )
+
+    cleaned = (time_range or "").strip()
+    if not cleaned or "-" not in cleaned:
+        return [cleaned] if cleaned else []
+    parts = re.split(r"[-—]", cleaned, maxsplit=1)
+    start_label = parts[0].strip()
+    end_label = (parts[1] if len(parts) > 1 else parts[0]).strip()
+
+    def _parse_hms(label: str) -> float:
+        bits = label.replace(",", ".").split(":")
+        try:
+            if len(bits) == 3:
+                return int(bits[0]) * 3600 + int(bits[1]) * 60 + float(bits[2])
+            if len(bits) == 2:
+                return int(bits[0]) * 60 + float(bits[1])
+            return float(bits[0])
+        except (TypeError, ValueError):
+            return 0.0
+
+    start = _parse_hms(start_label)
+    end = _parse_hms(end_label)
+    if end < start:
+        end = start
+    min_sec = float(min_seconds or VIDEO_ANALYSIS_SUBSEGMENT_MIN_SECONDS)
+    max_sec = float(max_seconds or VIDEO_ANALYSIS_SUBSEGMENT_MAX_SECONDS)
+    windows = split_interval_into_subwindows(start, end, min_seconds=min_sec, max_seconds=max_sec)
+    return [f"{_format_timestamp(s)}-{_format_timestamp(e)}" for s, e in windows]
+
+
+def build_episodic_subsegment_schedule(
+    upload_ranges: list[str],
+    *,
+    segment_split_policy: str | None = None,
+) -> list[str]:
+    """上传段/切镜段 time_range 列表 → 全片 5–10 秒 episodic_segments 时间窗。"""
+    policy = (segment_split_policy or SEGMENT_SPLIT_POLICY).strip()
+    if policy == "adaptive_scene":
+        return [str(item).strip() for item in upload_ranges if str(item).strip()]
+    schedule: list[str] = []
+    for time_range in upload_ranges:
+        cleaned = str(time_range or "").strip()
+        if not cleaned:
+            continue
+        sub = build_subsegment_schedule_for_range(cleaned)
+        schedule.extend(sub if sub else [cleaned])
+    return schedule
+
+
+def build_time_chunk_segment_schedule(
+    duration_seconds: float,
+    *,
+    start_offset_seconds: float = 0.0,
+    chunk_seconds: float = 900.0,
+) -> list[str]:
+    """按固定时长切段上传（不做切镜检测）。"""
+    duration = max(0.0, float(duration_seconds))
+    start_base = max(0.0, float(start_offset_seconds))
+    end_limit = start_base + duration
+    step = max(60.0, float(chunk_seconds))
+    if duration <= 0.01:
+        return []
+
+    ranges: list[str] = []
+    cursor = start_base
+    while cursor < end_limit - 0.01:
+        seg_end = min(cursor + step, end_limit)
+        if seg_end <= cursor + 0.01:
+            break
+        ranges.append(f"{_format_timestamp(cursor)}-{_format_timestamp(seg_end)}")
+        cursor = seg_end
+    return ranges
+
+
 def build_scene_cut_segment_schedule(
     duration_seconds: float,
     *,
@@ -475,9 +594,16 @@ def build_segment_schedule(
     min_segment_seconds: float = SCENE_MIN_SEGMENT_SECONDS,
     max_scene_seconds: float = SCENE_MAX_SECONDS,
     scene_detect_threshold: float = SCENE_DETECT_THRESHOLD,
+    chunk_seconds: float = 900.0,
 ) -> list[str]:
     """按策略生成分段时间窗列表。"""
     policy = (segment_split_policy or SEGMENT_SPLIT_POLICY).strip()
+    if policy == "time_chunk":
+        return build_time_chunk_segment_schedule(
+            duration_seconds,
+            start_offset_seconds=start_offset_seconds,
+            chunk_seconds=chunk_seconds,
+        )
     if policy == "adaptive_scene":
         return build_adaptive_segment_schedule(
             duration_seconds,
@@ -500,10 +626,22 @@ def build_segment_schedule(
 
 def segment_policy_summary(*, payload: dict[str, Any] | None = None) -> str:
     policy = str((payload or {}).get("segment_split_policy") or SEGMENT_SPLIT_POLICY)
+    if policy == "time_chunk":
+        try:
+            chunk_sec = float((payload or {}).get("upload_chunk_seconds") or 900.0)
+        except (TypeError, ValueError):
+            chunk_sec = 900.0
+        minutes = chunk_sec / 60.0
+        label = f"{minutes:g} 分钟" if minutes >= 1 else f"{chunk_sec:g} 秒"
+        return (
+            f"按时间切段（每 {label} 上传）+ 段内 "
+            f"{VIDEO_ANALYSIS_SUBSEGMENT_MIN_SECONDS:g}–"
+            f"{VIDEO_ANALYSIS_SUBSEGMENT_MAX_SECONDS:g}s 分析窗"
+        )
     if policy == "scene_cut":
         return (
-            f"场景切换切段（环境/布景明显变化才切，最短 {SCENE_MIN_SEGMENT_SECONDS:g}s，"
-            f"长场景≤{SCENE_MAX_SECONDS:g}s）"
+            f"切镜切段 + 镜内 {VIDEO_ANALYSIS_SUBSEGMENT_MIN_SECONDS:g}–"
+            f"{VIDEO_ANALYSIS_SUBSEGMENT_MAX_SECONDS:g}s 分析窗"
         )
     if policy == "adaptive_scene":
         return (
@@ -517,6 +655,11 @@ def segment_policy_summary(*, payload: dict[str, Any] | None = None) -> str:
 
 def average_segment_seconds(*, payload: dict[str, Any] | None = None) -> float:
     policy = str((payload or {}).get("segment_split_policy") or SEGMENT_SPLIT_POLICY)
+    if policy == "time_chunk":
+        try:
+            return float((payload or {}).get("upload_chunk_seconds") or 900.0)
+        except (TypeError, ValueError):
+            return 900.0
     if policy == "scene_cut":
         return 8.0
     if policy == "adaptive_scene":
@@ -533,6 +676,11 @@ def average_segment_seconds(*, payload: dict[str, Any] | None = None) -> float:
 def is_adaptive_segment_policy(payload: dict[str, Any] | None = None) -> bool:
     policy = str((payload or {}).get("segment_split_policy") or SEGMENT_SPLIT_POLICY)
     return policy == "adaptive_scene"
+
+
+def is_time_chunk_segment_policy(payload: dict[str, Any] | None = None) -> bool:
+    policy = str((payload or {}).get("segment_split_policy") or SEGMENT_SPLIT_POLICY)
+    return policy == "time_chunk"
 
 
 def is_scene_cut_segment_policy(payload: dict[str, Any] | None = None) -> bool:

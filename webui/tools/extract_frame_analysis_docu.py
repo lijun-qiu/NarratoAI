@@ -137,8 +137,16 @@ def extract_frame_analysis_docu(
             enable_knowledge_text = bool(st.session_state.get("doc_frame_enable_drama_knowledge_text"))
             enable_relationship_diagram = bool(st.session_state.get("doc_frame_enable_relationship_diagram"))
             doc_settings = dict(doc_settings)
+            use_collage = bool(
+                st.session_state.get(
+                    "doc_frame_use_collage_refs",
+                    doc_settings.get("frame_reference_use_collage", True),
+                )
+            )
+            doc_settings["frame_reference_use_collage"] = use_collage
+            doc_settings["frame_reference_force_individual_heads"] = not use_collage
             doc_settings["frame_reference_token_saver"] = bool(
-                st.session_state.get("doc_frame_reference_token_saver", True)
+                st.session_state.get("doc_frame_reference_token_saver", False)
             )
             doc_settings = merge_frame_analysis_settings_for_drama(
                 doc_settings,
@@ -154,6 +162,11 @@ def extract_frame_analysis_docu(
                 st.session_state.get("doc_frame_character_references")
                 or resolve_character_references(drama_id, selected_names=selected_names)
             )
+            if not character_references:
+                st.warning(
+                    "未勾选任何「用于分析」的人物头像，抽帧将不进行面孔对照匹配。"
+                    " 请在素材预处理 → 人物头像中手动勾选本场角色后再分析。"
+                )
             video_theme = str(st.session_state.get("video_theme") or drama_id).strip()
 
             subtitle_path = resolve_subtitle_path_for_video(
@@ -186,7 +199,6 @@ def extract_frame_analysis_docu(
                     test_duration,
                     start_time_seconds=test_start,
                 )
-                doc_settings["frame_reference_force_individual_heads"] = True
                 doc_settings["frame_reference_max_edge"] = max(
                     int(doc_settings.get("frame_reference_max_edge", 384) or 384),
                     512,

@@ -223,3 +223,23 @@ def clear_frame_analysis_path(
     st.session_state["doc_frame_analysis_upload_explicit"] = False
     st.session_state.pop(path_input_key, None)
     st.session_state.pop(pick_key, None)
+
+
+def apply_video_episode_analysis_path(path: str) -> None:
+    from app.services.documentary.video_episode_analysis import load_video_episode_analysis_artifact
+
+    load_video_episode_analysis_artifact(path)
+    st.session_state["video_episode_analysis_json_path"] = path
+    st.session_state["doc_video_episode_analysis_file_processed"] = True
+
+
+def clear_video_episode_analysis_path(
+    *,
+    path_input_key: str = "doc_video_episode_path_input",
+    pick_key: str = "doc_video_episode_saved_pick",
+) -> None:
+    st.session_state["video_episode_analysis_json_path"] = None
+    st.session_state["doc_video_episode_analysis_file_processed"] = False
+    st.session_state.pop("_video_episode_analysis_synced_video_path", None)
+    st.session_state.pop(path_input_key, None)
+    st.session_state.pop(pick_key, None)

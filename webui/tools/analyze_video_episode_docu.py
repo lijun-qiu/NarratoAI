@@ -7,6 +7,8 @@ import traceback
 import streamlit as st
 from loguru import logger
 
+from app.config import config
+from app.config.defaults import DEFAULT_VISION_OPENAI_MODEL_NAME
 from app.services.documentary.video_episode_analysis import (
     VideoEpisodeAnalysisService,
     default_video_episode_analysis_path,
@@ -16,6 +18,8 @@ from app.services.drama_character_registry import (
     resolve_active_relationship_diagram_path,
     resolve_character_references,
 )
+from app.services.documentary.video_episode_constants import SEGMENT_POLICY_TIME_CHUNK
+from app.services.subtitle_video_pairing import resolve_subtitle_path_for_video
 
 
 def _normalize_progress_value(progress: float | int) -> int:
@@ -85,6 +89,24 @@ def analyze_video_episode_docu(params, *, resume: bool = True, output_path: str 
             f"{os.path.basename(video_path)}{ref_hint}",
         )
 
+        vision_model_name = (
+            st.session_state.get("doc_video_episode_vision_model")
+            or config.app.get("vision_openai_model_name")
+            or DEFAULT_VISION_OPENAI_MODEL_NAME
+        ).strip()
+        subtitle_path = resolve_subtitle_path_for_video(
+            video_path,
+            explicit_path=st.session_state.get("subtitle_path"),
+        )
+        align_dialogues_with_srt = bool(
+            st.session_state.get("doc_video_episode_align_dialogues_with_srt")
+        )
+        split_policy = str(
+            st.session_state.get("doc_video_episode_split_policy") or SEGMENT_POLICY_TIME_CHUNK
+        ).strip()
+        chunk_minutes = float(st.session_state.get("doc_video_episode_chunk_minutes") or 15.0)
+        upload_chunk_seconds = max(60.0, chunk_minutes * 60.0)
+
         service = VideoEpisodeAnalysisService()
         artifact = asyncio.run(
             service.analyze_episode(
@@ -97,6 +119,12 @@ def analyze_video_episode_docu(params, *, resume: bool = True, output_path: str 
                 output_path=(output_path or "").strip() or None,
                 resume=resume,
                 plot_reference=st.session_state.get("doc_plot_reference", ""),
+                character_relationship=st.session_state.get("doc_character_relationship", ""),
+                vision_model_name=vision_model_name or None,
+                subtitle_path=subtitle_path,
+                align_dialogues_with_srt=align_dialogues_with_srt,
+                segment_split_policy=split_policy,
+                upload_chunk_seconds=upload_chunk_seconds,
             )
         )
 
@@ -120,6 +148,12 @@ def analyze_video_episode_docu(params, *, resume: bool = True, output_path: str 
             f"上传分段: {artifact.get('chunk_count', 1)} · "
             f"情节片段: {artifact.get('episodic_segment_count', 0)} · "
             f"台词: {len(artifact.get('important_dialogues') or [])}"
+            + (
+                " · SRT 参照"
+                if artifact.get("important_dialogues_source")
+                in ("srt_aligned", "video_quote_srt_reference")
+                else ""
+            )
             + (f" · 告警: {warning_count}" if warning_count else "")
             + (
                 f" · 状态: {analysis_status}"

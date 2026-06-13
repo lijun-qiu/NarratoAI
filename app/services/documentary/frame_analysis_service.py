@@ -228,6 +228,7 @@ class DocumentaryFrameAnalysisService(DocumentaryFrameExtractionService):
         analysis_json_path: str | None = None,
         material_source_video_path: str = "",
         reuse_frame_analysis: bool = True,
+        character_relationship: str = "",
     ) -> str:
         """抽帧画面 + SRT 字幕联合分析，产出供写脚本的「完美剧情构思方案」Markdown。"""
         progress = progress_callback or (lambda _p, _m: None)
@@ -271,6 +272,7 @@ class DocumentaryFrameAnalysisService(DocumentaryFrameExtractionService):
             frame_json_path=analysis_json_path,
             for_plot_blueprint=True,
             source_duration_sec=self._get_video_duration_sec(video_path),
+            character_relationship=character_relationship,
         )
         if len((subtitle_analysis or "").strip()) < 200:
             raise ValueError(

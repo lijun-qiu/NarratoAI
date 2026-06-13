@@ -148,6 +148,7 @@ def generate_plot_blueprint_docu(params, *, compact: bool = False, fingerprint: 
                     analysis_json_path=ctx["analysis_path"],
                     material_source_video_path=ctx["material_source"],
                     reuse_frame_analysis=ctx["reuse_frame_analysis"],
+                    character_relationship=st.session_state.get("doc_character_relationship", ""),
                 )
             )
             mode = "auto_compact" if compact else "auto"

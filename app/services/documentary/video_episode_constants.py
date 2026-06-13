@@ -10,8 +10,10 @@ from typing import Any, Dict
 
 import toml
 
-# 分镜切段：按切镜点切分，每段单独上传分析（不再 1–10 秒随机采样）
-SEGMENT_SPLIT_POLICY = "scene_cut"
+# 上传切段策略：time_chunk=按固定时长；scene_cut=按切镜/场景
+SEGMENT_SPLIT_POLICY = "time_chunk"
+SEGMENT_POLICY_TIME_CHUNK = "time_chunk"
+SEGMENT_POLICY_SCENE_CUT = "scene_cut"
 SCENE_MIN_MERGE_SECONDS = 3.0
 SCENE_MIN_SEGMENT_SECONDS = 5.0
 SCENE_MAX_SECONDS = 180.0
@@ -23,8 +25,12 @@ SCENE_FRAME_SAMPLE_BEFORE_SECONDS = 3.0
 SCENE_FRAME_SAMPLE_AFTER_SECONDS = 1.0
 
 # 兼容旧 adaptive_scene 策略与 JSON 字段
-SEGMENT_MIN_SECONDS = 1
+SEGMENT_MIN_SECONDS = 5
 SEGMENT_MAX_SECONDS = 10
+
+# 视频分析：切镜段内再按 5–10 秒窗口输出 episodic_segments
+VIDEO_ANALYSIS_SUBSEGMENT_MIN_SECONDS = 5.0
+VIDEO_ANALYSIS_SUBSEGMENT_MAX_SECONDS = 10.0
 
 # 兼容旧 JSON / token 估算（固定格时代为 4）
 SEGMENT_INTERVAL_SECONDS = 4
@@ -85,12 +91,19 @@ UPLOAD_TRANSCODE_PROFILES: Dict[str, Dict[str, Any]] = {
 }
 
 VIDEO_EPISODE_UPLOAD_DEFAULTS: Dict[str, Any] = {
-    # 单镜上传体积上限（MB）
+    # 单段上传体积上限（MB）
     "max_upload_mb": 24.0,
     # 分镜截取前整片压缩档位：high=720p（默认）
     "upload_transcode_profile": "high",
-    # 兼容旧配置（分镜模式下不再按固定时长切段）
-    "chunk_seconds": 300.0,
+    # 上传切段：time_chunk | scene_cut
+    "segment_split_policy": SEGMENT_SPLIT_POLICY,
+    # 按时间切段时，每段时长（秒）；默认 15 分钟
+    "chunk_seconds": 900.0,
+    # 单次 API 最多输出的 5–10 秒情节窗条数；≥96 时 15 分钟上传段通常一批出完
+    "max_segments_per_api_call": 96,
+    # 整片视频分析时注入配对抽帧 frame_timeline（默认关闭，说话人由视频画面推断）
+    "enable_frame_timeline_reference": False,
+    "frame_timeline_reference_max_chars": 14000,
     "short_video_high_profile_sec": 300.0,
 }
 
@@ -122,6 +135,41 @@ def _config_file_path() -> str:
     from app.config import config
 
     return config.config_file
+
+
+def resolve_segment_split_policy(
+    overrides: Dict[str, Any] | None = None,
+) -> str:
+    settings = get_video_episode_upload_settings(overrides)
+    policy = str(settings.get("segment_split_policy") or SEGMENT_SPLIT_POLICY).strip().lower()
+    if policy in ("time_chunk", "time", "fixed_time", "chunk"):
+        return SEGMENT_POLICY_TIME_CHUNK
+    if policy in ("scene_cut", "scene"):
+        return SEGMENT_POLICY_SCENE_CUT
+    if policy == "adaptive_scene":
+        return "adaptive_scene"
+    return SEGMENT_POLICY_TIME_CHUNK
+
+
+def resolve_upload_chunk_seconds(
+    overrides: Dict[str, Any] | None = None,
+) -> float:
+    settings = get_video_episode_upload_settings(overrides)
+    try:
+        return max(60.0, float(settings.get("chunk_seconds") or 900.0))
+    except (TypeError, ValueError):
+        return 900.0
+
+
+def resolve_max_segments_per_api_call(
+    overrides: Dict[str, Any] | None = None,
+) -> int:
+    """单次模型调用最多输出多少条 episodic_segments 时间窗；0 表示不拆分。"""
+    settings = get_video_episode_upload_settings(overrides)
+    try:
+        return max(0, int(settings.get("max_segments_per_api_call") or 96))
+    except (TypeError, ValueError):
+        return 96
 
 
 def get_video_episode_upload_settings(

@@ -60,6 +60,8 @@ DOCUMENTARY_DEFAULTS: Dict[str, Any] = {
     "subtitle_ocr_min_confidence_frames": 1,
     # 逐帧解说/精剪默认抽帧间隔（秒）
     "frame_interval_input": 3,
+    # 抽帧精简输出：仅 frame_timeline（时间戳/标题/场景/人物/硬字幕/视觉线索），供视频分析推断说话人
+    "frame_slim_output": False,
     # 解说生成：超长输入自动分块（避免超出文本模型上下文）
     "narration_input_max_chars": 65000,
     "narration_input_max_tokens": 85000,
@@ -72,13 +74,17 @@ DOCUMENTARY_DEFAULTS: Dict[str, Any] = {
     "compact_analysis_json": False,
     # 抽帧落盘时是否剥离 frame_observations.observation / batches 调试字段（默认保留完整 JSON）
     "compress_frame_analysis_on_save": False,
-    # 抽帧参照图 token 优化：仅首批发送、缩小、多头像拼图
-    "frame_reference_token_saver": True,
-    "frame_reference_attach_mode": "first_batch",
+    # 抽帧参照图：拼图 2 人/张 + 384px 在识脸准确率与 token 间较均衡
+    "frame_reference_token_saver": False,
+    "frame_reference_attach_mode": "every_batch",
     "frame_reference_max_edge": 384,
+    "frame_reference_head_max_edge": 384,
     "frame_reference_use_collage": True,
+    "frame_reference_force_individual_heads": False,
+    "frame_reference_labeled_collage": True,
+    "frame_reference_reattach_interval": 0,
     "frame_reference_individual_max_heads": 4,
-    "frame_reference_collage_max_heads": 4,
+    "frame_reference_collage_max_heads": 2,
     # 抽帧视觉分析：默认不注入剧集人物关系知识库（避免脑补全剧名场面）
     "enable_frame_analysis_drama_knowledge": False,
     # 抽帧 scene_segments 硬性规则：仅可见画面、同批同景合并、跨场景重叠剔除
@@ -113,8 +119,9 @@ FAZU2_WRONG_CHARACTER_NAMES: tuple[tuple[str, str], ...] = (
 FRAME_UNKNOWN_CHARACTER_MALE = "未名人员(男)"
 FRAME_UNKNOWN_CHARACTER_FEMALE = "未名人员(女)"
 FRAME_UNKNOWN_CHARACTER_UNKNOWN = "未名人员(不明)"
+FRAME_FACE_MATCH_SIMILARITY_MIN_PERCENT = 75
 FRAME_FACE_MATCH_SIMILARITY_HINT = (
-    "须逐脸对照定妆照，五官轮廓高度一致（约90%以上）方可写规范姓名；"
+    f"须逐脸对照定妆照，五官轮廓高度一致（约{FRAME_FACE_MATCH_SIMILARITY_MIN_PERCENT}%以上）方可写规范姓名；"
     "未达阈值或仅侧背/模糊/夜景压缩时禁止猜名"
 )
 
@@ -211,6 +218,7 @@ DOCUMENTARY_SETTING_KEYS = frozenset(
         "subtitle_ocr_min_similarity",
         "subtitle_ocr_max_length_ratio_delta",
         "frame_interval_input",
+        "frame_slim_output",
         "min_total_segments",
         "max_total_segments",
         "enable_picture_narration",
@@ -253,7 +261,13 @@ DOCUMENTARY_SETTING_KEYS = frozenset(
         "frame_reference_token_saver",
         "frame_reference_attach_mode",
         "frame_reference_max_edge",
+        "frame_reference_head_max_edge",
         "frame_reference_use_collage",
+        "frame_reference_force_individual_heads",
+        "frame_reference_labeled_collage",
+        "frame_reference_reattach_interval",
+        "frame_reference_individual_max_heads",
+        "frame_reference_collage_max_heads",
     }
 )
 

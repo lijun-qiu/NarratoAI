@@ -1,7 +1,7 @@
 #!/usr/bin/env python
 # -*- coding: UTF-8 -*-
 
-"""抽帧人名：定妆照/头像面孔对照匹配（约70%相似）可写规范姓名，禁止凭字幕猜人。"""
+"""抽帧人名：定妆照/头像面孔对照匹配（约75%相似）可写规范姓名，禁止凭字幕猜人。"""
 
 from __future__ import annotations
 
@@ -52,10 +52,9 @@ def build_frame_naming_priority_rules(
         " → **必须**在 **characters** 字段写规范姓名，"
         "**禁止**在 observation/action 写人名，**禁止**用便衣男/年轻男子/警员等代称代替；",
         "2. **硬字幕/SRT/subtitle_entries 中的姓名、称呼、关系词、对白内容**"
-        "**不得**用于推断画面人物身份，仅作对白摘录；**禁止**听声/剧情猜说话人；",
-        "3. **人物关系表** 仅用于已写入姓名的**写法校正**，"
-        "以及**两人姓名均已由面孔匹配写入后**补写明显关系（师徒/父子）；"
-        "**禁止**凭职级词、对白内容、关系表名单猜人；",
+        "**不得**用于推断 `characters` 或画面人物身份；硬字幕仅作 `burned_in_subtitle` 原文摘录；",
+        "3. **人物关系表** 仅用于面孔匹配**之后**的姓名写法校正（谐音/错字），"
+        "**不得**凭关系表、剧情、职级词或对白猜人；",
         f"4. 脸不可辨、仅有背影/侧背、或无法与任一头像匹配 → "
         f"写「{FRAME_UNKNOWN_CHARACTER_MALE}」「{FRAME_UNKNOWN_CHARACTER_FEMALE}」或带**可见特征**的暂称"
         f"（如「深色夹克便衣男」），禁止臆测姓名；",
@@ -63,13 +62,10 @@ def build_frame_naming_priority_rules(
         "仅当**前序帧可见同一身形+同一服装/发型**且能合理判定为同一人，才可将该前序帧暂称改为 A(性别)；"
         "**禁止**把本批所有「便衣男」一律改成 A；不同身形/不同服装的便衣须分开保留暂称。",
     ]
-    if has_drama_knowledge:
-        lines.append(
-            "- 关系表**不是**出场名单：未在本批画面中完成头像匹配的人物，**不得**写入 observation/action/characters。"
-        )
     if has_character_references:
         lines.append(
-            f"- 勾选头像**不是**默认全员在场：每一规范姓名须对应本批某帧可见面孔与参照图达到相似度阈值（{FRAME_FACE_MATCH_SIMILARITY_HINT}）。"
+            f"- 每一规范姓名须对应**本帧**可见面孔与参照图达到相似度阈值（{FRAME_FACE_MATCH_SIMILARITY_HINT}）；"
+            "匹配到谁就写谁，**不因**剧情、关系表或字幕推断某人「不应出现」。"
         )
     if is_carryover_batch:
         lines.append(
@@ -172,16 +168,43 @@ def _frame_likely_needs_face_match(text: str) -> bool:
     return False
 
 
+def _frame_mentions_ref_characters(
+    frame: dict[str, Any],
+    ref_names: set[str],
+) -> bool:
+    chars = frame.get("characters")
+    if not isinstance(chars, list):
+        return False
+    for item in chars:
+        text = str(item or "").strip()
+        if not text:
+            continue
+        canonical = _canonical_for_name(_strip_character_gender_suffix(text))
+        if canonical and canonical in ref_names:
+            return True
+        if _batch_text_mentions_ref_name(text, ref_names):
+            return True
+    return False
+
+
+def _strip_character_gender_suffix(name: str) -> str:
+    return re.sub(r"[\(（][男女][\)）]$", "", (name or "").strip()).strip()
+
+
 def validate_face_naming_when_references_attached(
     *,
     frame_observations: list[dict[str, Any]],
     scene_segments: list[dict[str, Any]],
     character_references: list[dict[str, str]] | None,
     reference_images_attached: bool,
+    frame_slim_output: bool = False,
 ) -> str:
     """
     本批已附定妆照时：逐帧校验——脸/人物可见的帧须写参照图匹配后的规范姓名。
+    slim 模式仅作视觉索引，不因命名不完整拒批（由视频分析阶段结合剧情参考推断说话人）。
     """
+    if frame_slim_output:
+        return ""
     if not reference_images_attached:
         return ""
 
@@ -198,6 +221,10 @@ def validate_face_naming_when_references_attached(
         if not isinstance(frame, dict):
             continue
         obs = str(frame.get("observation") or "").strip()
+        if _frame_mentions_ref_characters(frame, ref_names):
+            continue
+        if _frame_has_unknown_character_placeholder(frame):
+            continue
         if not obs or not _frame_likely_needs_face_match(obs):
             continue
         if _batch_text_mentions_ref_name(obs, ref_names):
@@ -216,7 +243,14 @@ def validate_face_naming_when_references_attached(
             "each frame with a visible face must independently match reference photos"
         )
 
-    # 整批无人写规范名且出现模糊代称
+    # 整批无人写规范名且出现模糊代称（须同时检查 characters 字段，不能只看 observation 文本）
+    if any(
+        _frame_mentions_ref_characters(frame, ref_names)
+        for frame in frame_observations
+        if isinstance(frame, dict)
+    ):
+        return ""
+
     parts = [str(f.get("observation") or "") for f in frame_observations if isinstance(f, dict)]
     combined = "\n".join(parts)
     if combined and _batch_text_uses_generic_face_role_labels(combined):
@@ -227,6 +261,22 @@ def validate_face_naming_when_references_attached(
             )
 
     return ""
+
+
+def _frame_has_unknown_character_placeholder(frame: dict[str, Any]) -> bool:
+    """characters 已标未名/暂称时，不要求本帧必须写出定妆照规范名。"""
+    chars = frame.get("characters")
+    if not isinstance(chars, list):
+        return False
+    for item in chars:
+        text = str(item or "").strip()
+        if not text:
+            continue
+        if "未名" in text:
+            return True
+        if text in _GENERIC_FACE_ROLE_LABELS:
+            return True
+    return False
 
 
 def collect_face_identified_names_from_frames(

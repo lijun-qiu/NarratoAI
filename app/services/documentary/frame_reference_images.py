@@ -9,6 +9,8 @@ import os
 from typing import Any
 
 import PIL.Image
+import PIL.ImageDraw
+import PIL.ImageFont
 from loguru import logger
 
 from app.services.documentary.documentary_settings import (
@@ -31,26 +33,15 @@ def resolve_reference_collage_mode(
 ) -> bool:
     """
     是否将多头像合成拼图。
-    token_saver 仅在头像数量超过 individual_max_heads 时强制拼图；
-    少量头像用分张发送，便于面孔匹配。
+    默认每人一张分开发送（识别率更高）；仅 frame_reference_use_collage=true 且未强制分张时拼图。
     """
     cfg = settings or {}
     head_count = max(0, int(head_count))
     if head_count <= 1:
         return False
-    if cfg.get("frame_reference_force_individual_heads"):
+    if cfg.get("frame_reference_force_individual_heads", True):
         return False
-
-    max_individual = max(1, int(cfg.get("frame_reference_individual_max_heads", REFERENCE_COLLAGE_MAX_HEADS_PER_SHEET) or REFERENCE_COLLAGE_MAX_HEADS_PER_SHEET))
-    prefer_collage = bool(cfg.get("frame_reference_use_collage", True))
-    token_saver = bool(cfg.get("frame_reference_token_saver", True))
-
-    if head_count <= max_individual:
-        return prefer_collage
-
-    if token_saver:
-        return True
-    return prefer_collage
+    return bool(cfg.get("frame_reference_use_collage", False))
 
 
 def resolve_reference_attach_mode(settings: dict[str, Any] | None) -> str:
@@ -63,6 +54,23 @@ def resolve_reference_attach_mode(settings: dict[str, Any] | None) -> str:
     return mode
 
 
+def resolve_head_max_edge(settings: dict[str, Any] | None) -> int:
+    """定妆照最长边；默认同 frame_reference_max_edge（不再强制 512）。"""
+    cfg = settings or {}
+    base = max(128, int(cfg.get("frame_reference_max_edge", 384) or 384))
+    head_edge = int(cfg.get("frame_reference_head_max_edge", 0) or 0)
+    if head_edge > 0:
+        return max(128, head_edge)
+    return base
+
+
+def should_use_labeled_collage(settings: dict[str, Any] | None, *, use_collage: bool) -> bool:
+    cfg = settings or {}
+    if not use_collage:
+        return False
+    return bool(cfg.get("frame_reference_labeled_collage", True))
+
+
 def should_attach_reference_images(
     batch_index: int,
     settings: dict[str, Any] | None,
@@ -71,15 +79,18 @@ def should_attach_reference_images(
     use_collage: bool = False,
 ) -> bool:
     cfg = settings or {}
-    mode = resolve_reference_attach_mode(cfg)
-    if mode == ATTACH_MODE_EVERY_BATCH:
+    if head_count <= 0:
+        return False
+    force_individual = bool(cfg.get("frame_reference_force_individual_heads", True))
+    if force_individual and not use_collage:
         return True
-    # 拼图仅多 1 张图；少量分张也负担可控 → 每批附上以保证逐脸对照
-    if head_count > 0:
-        max_individual = max(1, int(cfg.get("frame_reference_individual_max_heads", REFERENCE_COLLAGE_MAX_HEADS_PER_SHEET) or REFERENCE_COLLAGE_MAX_HEADS_PER_SHEET))
-        if use_collage or head_count <= max_individual:
-            return True
-    return batch_index == 0
+    mode = resolve_reference_attach_mode(cfg)
+    if mode == ATTACH_MODE_FIRST_BATCH:
+        return batch_index == 0
+    interval = max(0, int(cfg.get("frame_reference_reattach_interval", 0) or 0))
+    if interval <= 0:
+        return True
+    return batch_index == 0 or batch_index % interval == 0
 
 
 def collage_max_heads_per_sheet(settings: dict[str, Any] | None) -> int:
@@ -160,6 +171,37 @@ def _load_resized_rgb(path: str, max_edge: int) -> PIL.Image.Image:
         return image.copy()
 
 
+def _load_label_font(size: int = 16) -> PIL.ImageFont.FreeTypeFont | PIL.ImageFont.ImageFont:
+    size = max(10, int(size))
+    for candidate in (
+        os.path.join(os.environ.get("WINDIR", "C:/Windows"), "Fonts", "msyh.ttc"),
+        os.path.join(os.environ.get("WINDIR", "C:/Windows"), "Fonts", "msyhbd.ttc"),
+        os.path.join(os.environ.get("WINDIR", "C:/Windows"), "Fonts", "simhei.ttf"),
+        "/usr/share/fonts/truetype/noto/NotoSansCJK-Regular.ttc",
+        "/System/Library/Fonts/PingFang.ttc",
+    ):
+        if candidate and os.path.isfile(candidate):
+            try:
+                return PIL.ImageFont.truetype(candidate, size=size)
+            except OSError:
+                continue
+    return PIL.ImageFont.load_default()
+
+
+def _annotate_reference_label(image: PIL.Image.Image, label: str) -> PIL.Image.Image:
+    """在参照图底部标注姓名，拼图模式下便于逐格识脸。"""
+    text = (label or "").strip()
+    if not text:
+        return image
+    bar_h = max(22, min(36, image.height // 8))
+    canvas = PIL.Image.new("RGB", (image.width, image.height + bar_h), (16, 16, 16))
+    canvas.paste(image, (0, 0))
+    draw = PIL.ImageDraw.Draw(canvas)
+    font = _load_label_font(size=max(12, bar_h - 8))
+    draw.text((6, image.height + 2), text, fill=(255, 220, 120), font=font)
+    return canvas
+
+
 def _save_jpeg(image: PIL.Image.Image, output_path: str) -> str:
     os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
     image.save(output_path, format="JPEG", quality=85, optimize=True)
@@ -171,6 +213,7 @@ def _build_horizontal_collage(
     *,
     max_cell_edge: int,
     padding: int = 8,
+    labels: list[str] | None = None,
 ) -> PIL.Image.Image:
     if not images:
         raise ValueError("collage 需要至少一张图")
@@ -183,12 +226,15 @@ def _build_horizontal_collage(
     cell_h = min(cell_h, max_cell_edge)
 
     normalized: list[PIL.Image.Image] = []
-    for img in images:
+    label_list = labels or []
+    for index, img in enumerate(images):
         fitted = img.copy()
         fitted.thumbnail((cell_w, cell_h), PIL.Image.Resampling.LANCZOS)
         canvas = PIL.Image.new("RGB", (cell_w, cell_h), (24, 24, 24))
         offset = ((cell_w - fitted.width) // 2, (cell_h - fitted.height) // 2)
         canvas.paste(fitted, offset)
+        if index < len(label_list) and label_list[index]:
+            canvas = _annotate_reference_label(canvas, label_list[index])
         normalized.append(canvas)
 
     width = len(normalized) * cell_w + padding * (len(normalized) + 1)
@@ -207,6 +253,8 @@ def _prepare_collage_path(
     source_paths: list[str],
     max_edge: int,
     cache_key: str,
+    name_labels: list[str] | None = None,
+    labeled_collage: bool = False,
 ) -> str:
     if not source_paths:
         return ""
@@ -215,10 +263,17 @@ def _prepare_collage_path(
         return output_path
 
     images = [_load_resized_rgb(path, max_edge) for path in source_paths]
+    labels = name_labels if labeled_collage else None
     if len(images) == 1:
         collage = images[0]
+        if labeled_collage and labels:
+            collage = _annotate_reference_label(collage, labels[0])
     else:
-        collage = _build_horizontal_collage(images, max_cell_edge=max_edge)
+        collage = _build_horizontal_collage(
+            images,
+            max_cell_edge=max_edge,
+            labels=labels,
+        )
     _save_jpeg(collage, output_path)
     logger.debug(f"已生成参照拼图: {output_path}（{len(source_paths)} 张源图）")
     return output_path
@@ -248,8 +303,10 @@ def prepare_reference_prefix_images(
         return [], ""
 
     max_edge = max(128, int(cfg.get("frame_reference_max_edge", 384) or 384))
+    head_max_edge = resolve_head_max_edge(cfg)
     head_paths = [item["path"] for item in refs if os.path.isfile(item["path"])]
     use_collage = resolve_reference_collage_mode(cfg, head_count=len(head_paths))
+    labeled_collage = should_use_labeled_collage(cfg, use_collage=use_collage)
 
     if not should_attach_reference_images(
         batch_index,
@@ -272,7 +329,9 @@ def prepare_reference_prefix_images(
             [
                 "frame-ref-v3",
                 str(max_edge),
+                str(head_max_edge),
                 str(use_collage),
+                str(labeled_collage),
                 str(len(head_paths)),
                 *fingerprints,
             ]
@@ -296,11 +355,10 @@ def prepare_reference_prefix_images(
     if refs:
         max_per_sheet = collage_max_heads_per_sheet(cfg)
         head_sheets = split_character_references_into_collage_sheets(refs, max_per_sheet=max_per_sheet)
-        head_max_edge = max(max_edge, 512) if use_collage else max(max_edge, 512)
-
         if use_collage and head_sheets:
             for sheet_index, sheet_refs in enumerate(head_sheets):
                 sheet_paths = [item["path"] for item in sheet_refs]
+                sheet_labels = [str(item.get("name") or "").strip() for item in sheet_refs]
                 sheet_names = "_".join(
                     utils.md5(item["name"])[:6] for item in sheet_refs[:max_per_sheet]
                 )
@@ -312,15 +370,18 @@ def prepare_reference_prefix_images(
                     if os.path.isfile(single_cache):
                         prefix_paths.append(single_cache)
                     else:
-                        prefix_paths.append(
-                            _save_jpeg(_load_resized_rgb(sheet_paths[0], head_max_edge), single_cache)
-                        )
+                        image = _load_resized_rgb(sheet_paths[0], head_max_edge)
+                        if labeled_collage and sheet_labels[0]:
+                            image = _annotate_reference_label(image, sheet_labels[0])
+                        prefix_paths.append(_save_jpeg(image, single_cache))
                 else:
                     collage_path = _prepare_collage_path(
                         label=f"heads_sheet_{sheet_index}_{sheet_names}",
                         source_paths=sheet_paths,
                         max_edge=head_max_edge,
                         cache_key=f"{cache_key}_s{sheet_index}",
+                        name_labels=sheet_labels,
+                        labeled_collage=labeled_collage,
                     )
                     if collage_path:
                         prefix_paths.append(collage_path)
@@ -330,6 +391,9 @@ def prepare_reference_prefix_images(
                 if os.path.isfile(single_cache):
                     prefix_paths.append(single_cache)
                 else:
-                    prefix_paths.append(_save_jpeg(_load_resized_rgb(path, head_max_edge), single_cache))
+                    image = _load_resized_rgb(path, head_max_edge)
+                    if index < len(refs) and str(refs[index].get("name") or "").strip():
+                        image = _annotate_reference_label(image, str(refs[index]["name"]))
+                    prefix_paths.append(_save_jpeg(image, single_cache))
 
     return prefix_paths, ""

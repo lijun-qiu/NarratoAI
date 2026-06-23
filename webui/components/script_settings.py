@@ -13,6 +13,7 @@ from app.utils import utils, check_script
 from webui.tools.generate_script_docu import generate_script_docu
 from webui.tools.generate_script_short import generate_script_short
 from webui.tools.generate_short_summary import generate_script_short_sunmmary
+from webui.utils.script_duration_preview import render_script_duration_preview
 
 
 def render_script_panel(tr):
@@ -525,6 +526,10 @@ def render_script_buttons(tr, params):
             generate_script_short_sunmmary(params, subtitle_path, video_theme, temperature)
         else:
             load_script(tr, script_path)
+
+    script_items = st.session_state.get("video_clip_json") or []
+    if script_items:
+        render_script_duration_preview(script_items)
 
     # 视频脚本编辑区
     video_clip_json_details = st.text_area(

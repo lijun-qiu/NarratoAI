@@ -15,6 +15,7 @@ from .exceptions import LLMServiceError
 from .manager import LLMServiceManager
 # 导入新的提示词管理系统
 from app.services.prompts import PromptManager
+from app.config import config
 
 # 提供商注册由 webui.py:main() 显式调用（见 LLM 提供商注册机制重构）
 # 这样更可靠，错误也更容易调试
@@ -103,11 +104,19 @@ class LegacyLLMAdapter:
             )
 
             # 使用统一服务生成文案
+            documentary_settings = dict(getattr(config, "documentary", {}) or {})
+            compact_settings = dict(getattr(config, "documentary_compact", {}) or {})
+            if compact_settings.get("documentary_compact_mode"):
+                documentary_settings.update(
+                    {key: value for key, value in compact_settings.items() if key != "documentary_compact_mode"}
+                )
+            temperature = float(documentary_settings.get("narration_script_temperature", 0.4))
+
             result = _run_async_safely(
                 UnifiedLLMService.generate_text,
                 prompt=prompt,
                 system_prompt="你是一名专业的短视频解说文案撰写专家。",
-                temperature=1.5,
+                temperature=temperature,
                 response_format="json"
             )
             return result if isinstance(result, str) else str(result)

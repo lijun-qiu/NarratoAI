@@ -273,3 +273,36 @@ class DocumentaryAnalysisConfigTests(unittest.TestCase):
                 vision_model_name="gpt-4o-mini",
                 max_concurrency=0,
             )
+
+
+class DocumentaryScriptOstFinalizationTests(unittest.TestCase):
+    def test_finalize_defaults_missing_ost_to_zero(self):
+        service = DocumentaryFrameAnalysisService()
+        result = service._finalize_script_items(
+            [{"timestamp": "00:00:00,000-00:00:03,000", "picture": "测试", "narration": "解说"}]
+        )
+        self.assertEqual(0, result[0]["OST"])
+        self.assertEqual(1, result[0]["_id"])
+
+    def test_finalize_preserves_explicit_ost1_and_sets_playback_label(self):
+        service = DocumentaryFrameAnalysisService()
+        result = service._finalize_script_items(
+            [
+                {
+                    "_id": 3,
+                    "timestamp": "00:00:10,000-00:00:15,000",
+                    "picture": "对峙",
+                    "narration": "",
+                    "OST": 1,
+                }
+            ]
+        )
+        self.assertEqual(1, result[0]["OST"])
+        self.assertEqual("播放原片3", result[0]["narration"])
+
+    def test_finalize_converts_legacy_ost2_to_default_zero(self):
+        service = DocumentaryFrameAnalysisService()
+        result = service._finalize_script_items(
+            [{"timestamp": "00:00:00,000-00:00:03,000", "picture": "测试", "narration": "解说", "OST": 2}]
+        )
+        self.assertEqual(0, result[0]["OST"])

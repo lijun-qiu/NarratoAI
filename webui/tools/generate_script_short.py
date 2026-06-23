@@ -8,6 +8,7 @@ from loguru import logger
 from app.config import config
 from app.services.upload_validation import ensure_existing_file, InputValidationError
 from app.utils import utils
+from webui.utils.script_duration_preview import store_generated_script
 
 
 def generate_script_short(tr, params, custom_clips=5):
@@ -110,9 +111,9 @@ def generate_script_short(tr, params, custom_clips=5):
             logger.info(f"脚本生成完成 {json.dumps(script, ensure_ascii=False, indent=4)}")
 
             if isinstance(script, list):
-                st.session_state['video_clip_json'] = script
+                store_generated_script(script)
             elif isinstance(script, str):
-                st.session_state['video_clip_json'] = json.loads(script)
+                store_generated_script(json.loads(script))
 
             update_progress(80, "脚本生成完成")
 

@@ -90,7 +90,7 @@ JSON 必须包含以下键：
         )
         narration_items = self._parse_narration_items(narration_raw)
 
-        final_script = [{**item, "OST": 2} for item in narration_items]
+        final_script = self._finalize_script_items(narration_items)
         progress(100, "脚本生成完成")
         return final_script
 
@@ -177,6 +177,62 @@ JSON 必须包含以下键：
             "video_clip_json": video_clip_json,
             "keyframe_files": keyframe_files,
         }
+
+    def _get_documentary_settings(self) -> dict[str, Any]:
+        base = dict(getattr(config, "documentary", {}) or {})
+        compact = dict(getattr(config, "documentary_compact", {}) or {})
+        if compact.get("documentary_compact_mode"):
+            base.update({key: value for key, value in compact.items() if key != "documentary_compact_mode"})
+        return base
+
+    def _finalize_script_items(self, items: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        settings = self._get_documentary_settings()
+        default_ost = int(settings.get("default_narration_ost", 0))
+        every_n = int(settings.get("ost1_every_n_segments", 0) or 0)
+        min_ost1 = int(settings.get("min_ost1_segments", 0) or 0)
+        max_ost1 = int(settings.get("max_ost1_segments", 0) or 0)
+
+        finalized: list[dict[str, Any]] = []
+        for index, item in enumerate(items, start=1):
+            row = dict(item)
+            row["_id"] = row.get("_id", index)
+
+            ost = row.get("OST")
+            if ost in (0, 1, 2):
+                row["OST"] = int(ost)
+            else:
+                row["OST"] = default_ost
+
+            if row["OST"] == 2:
+                row["OST"] = default_ost
+
+            if row["OST"] == 1:
+                narration = str(row.get("narration", "") or "").strip()
+                if not narration or narration.startswith("播放原片"):
+                    row["narration"] = f"播放原片{row['_id']}"
+
+            finalized.append(row)
+
+        if every_n <= 0:
+            return finalized
+
+        ost1_count = sum(1 for row in finalized if row.get("OST") == 1)
+        target_min = min_ost1 if min_ost1 > 0 else max(1, len(finalized) // every_n)
+        if max_ost1 > 0:
+            target_min = min(target_min, max_ost1)
+
+        for index, row in enumerate(finalized):
+            if ost1_count >= target_min:
+                break
+            if row.get("OST") == 1:
+                continue
+            if (index + 1) % every_n != 0:
+                continue
+            row["OST"] = 1
+            row["narration"] = f"播放原片{row['_id']}"
+            ost1_count += 1
+
+        return finalized
 
     def _parse_narration_items(self, narration_raw: str) -> list[dict[str, Any]]:
         parsed = self._repair_narration_payload(narration_raw)

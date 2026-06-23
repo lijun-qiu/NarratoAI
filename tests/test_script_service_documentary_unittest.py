@@ -139,7 +139,7 @@ class DocumentaryFrameAnalysisServiceScriptGenerationTests(unittest.IsolatedAsyn
         self.assertEqual("00:00:00,000-00:00:03,000", result[0]["timestamp"])
         self.assertEqual("镜头里有一只猫", result[0]["picture"])
         self.assertEqual("一只猫警觉地望向镜头。", result[0]["narration"])
-        self.assertEqual(2, result[0]["OST"])
+        self.assertEqual(0, result[0]["OST"])
 
     async def test_generate_documentary_script_raises_when_narration_json_is_malformed(self):
         service = DocumentaryFrameAnalysisService()

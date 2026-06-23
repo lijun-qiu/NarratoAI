@@ -1,6 +1,5 @@
 # 纪录片脚本生成
 import asyncio
-import json
 import time
 import traceback
 
@@ -9,6 +8,7 @@ from loguru import logger
 
 from app.config import config
 from app.services.documentary.frame_analysis_service import DocumentaryFrameAnalysisService
+from webui.utils.script_duration_preview import store_generated_script
 
 
 def _normalize_progress_value(progress: float | int) -> int:
@@ -95,11 +95,7 @@ def generate_script_docu(params):
             )
 
             logger.info(f"纪录片解说脚本生成完成，共 {len(script_items)} 个片段")
-            script = json.dumps(script_items, ensure_ascii=False, indent=2)
-            if isinstance(script, list):
-                st.session_state["video_clip_json"] = script
-            elif isinstance(script, str):
-                st.session_state["video_clip_json"] = json.loads(script)
+            store_generated_script(script_items)
             update_progress(100, "脚本生成完成")
 
         time.sleep(0.1)
